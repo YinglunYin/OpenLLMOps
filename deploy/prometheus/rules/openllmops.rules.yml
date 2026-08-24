@@ -1,0 +1,49 @@
+groups:
+  - name: openllmops-control-plane
+    rules:
+      - alert: OpenLLMOpsApiUnavailable
+        expr: up{job="openllmops-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenLLMOps API 不可用"
+          description: "Prometheus 连续 2 分钟无法抓取 FastAPI 指标。"
+
+      - alert: OpenLLMOpsNodeAgentUnavailable
+        expr: up{job="openllmops-node-agent"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU node-agent 不可用"
+          description: "停止新的推理/训练调度，并检查 Docker socket proxy 与 node-agent 日志。"
+
+      - alert: NvidiaMetricsUnavailable
+        expr: up{job="nvidia-dcgm"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NVIDIA DCGM 指标不可用"
+          description: "GPU 驱动、NVIDIA Container Toolkit 或 dcgm-exporter 可能异常。"
+
+  - name: openllmops-gpu
+    rules:
+      - alert: NvidiaGpuTemperatureHigh
+        expr: DCGM_FI_DEV_GPU_TEMP >= 88
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU 温度持续过高"
+          description: "GPU {{ $labels.gpu }} 温度连续 5 分钟达到 {{ $value }}°C。"
+
+      - alert: NvidiaGpuMemoryNearlyFull
+        expr: 100 * DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) >= 97
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU 显存接近耗尽"
+          description: "GPU {{ $labels.gpu }} 显存占用已连续 10 分钟超过 97%。"

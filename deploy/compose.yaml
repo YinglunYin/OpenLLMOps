@@ -1,0 +1,354 @@
+name: openllmops
+
+x-logging: &default-logging
+  driver: local
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-service-security: &service-security
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    restart: unless-stopped
+    # 直接以镜像内 postgres 用户运行，避免入口脚本依赖已被丢弃的 SETUID/SETGID 能力。
+    user: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-openllmops}
+      POSTGRES_USER: ${POSTGRES_USER:-openllmops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 deploy/.env 中设置 POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    shm_size: 1g
+    networks:
+      - control
+    logging: *default-logging
+    <<: *service-security
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/docker/backend.Dockerfile
+    image: ${API_IMAGE:-openllmops/api:local}
+    restart: unless-stopped
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DEBUG: ${DEBUG:-false}
+      AUTO_CREATE_TABLES: ${AUTO_CREATE_TABLES:-false}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-openllmops}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openllmops}
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?请在 deploy/.env 中设置 Argon2 ADMIN_PASSWORD_HASH}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?请在 deploy/.env 中设置 ADMIN_API_KEY}
+      API_KEY_HEADER: ${API_KEY_HEADER:-X-API-Key}
+      API_KEY_PEPPER: ${API_KEY_PEPPER:?请在 deploy/.env 中设置 API_KEY_PEPPER}
+      SESSION_SIGNING_KEY: ${SESSION_SIGNING_KEY:?请在 deploy/.env 中设置 SESSION_SIGNING_KEY}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
+      SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-28800}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.30.10.10/32}
+      NODE_AGENT_URL: http://node-agent:9000
+      NODE_AGENT_TOKEN: ${NODE_AGENT_TOKEN:?请在 deploy/.env 中设置 NODE_AGENT_TOKEN}
+      NODE_AGENT_CLOCK_SKEW_SECONDS: ${NODE_AGENT_CLOCK_SKEW_SECONDS:-30}
+      NODE_AGENT_TIMEOUT_SECONDS: ${NODE_AGENT_TIMEOUT_SECONDS:-10}
+      RECONCILER_ENABLED: ${RECONCILER_ENABLED:-true}
+      RECONCILER_INTERVAL_SECONDS: ${RECONCILER_INTERVAL_SECONDS:-2}
+      GPU_LEASE_TTL_SECONDS: ${GPU_LEASE_TTL_SECONDS:-30}
+      MODEL_ROOT: /srv/openllmops/models
+      MODEL_INBOX_ROOT: /srv/openllmops/inbox
+      MODEL_STAGING_ROOT: /srv/openllmops/model-staging
+      MODEL_IMPORT_COORDINATOR_ENABLED: ${MODEL_IMPORT_COORDINATOR_ENABLED:-true}
+      MODEL_IMPORT_POLL_INTERVAL_SECONDS: ${MODEL_IMPORT_POLL_INTERVAL_SECONDS:-1}
+      MODEL_IMPORT_CONCURRENCY: ${MODEL_IMPORT_CONCURRENCY:-1}
+      HUGGINGFACE_TOKEN_FILE: ${HUGGINGFACE_TOKEN_FILE:-}
+      MODELSCOPE_TOKEN_FILE: ${MODELSCOPE_TOKEN_FILE:-}
+      DATASET_ROOT: /srv/openllmops/datasets
+      CHECKPOINT_ROOT: /srv/openllmops/checkpoints
+      GPU_COUNT: ${GPU_COUNT:-4}
+      CORS_ORIGINS: '${CORS_ORIGINS:-["https://localhost"]}'
+      PROMETHEUS_URL: http://prometheus:9090
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - type: bind
+        source: ${OPENLLMOPS_STORAGE_ROOT:-/srv/openllmops}
+        target: /srv/openllmops
+      - type: bind
+        source: ${MODEL_SOURCE_SECRETS_DIR:-./secrets/model-sources}
+        target: /run/secrets/model-sources
+        read_only: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      node-agent:
+        condition: service_healthy
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    networks:
+      control:
+      runtime:
+      # 仅 API 需要访问 Hugging Face / ModelScope；人工 SFTP 只负责把文件放入宿主机受控目录。
+      egress:
+        # 多网络容器必须显式选择非 internal 网络作为默认网关（Compose >= 2.33.1）。
+        gw_priority: 1
+    logging: *default-logging
+    <<: *service-security
+
+  node-agent:
+    build:
+      context: ../agent
+      dockerfile: Dockerfile
+    image: ${NODE_AGENT_IMAGE:-openllmops/node-agent:local}
+    restart: unless-stopped
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    environment:
+      NODE_AGENT_TOKEN: ${NODE_AGENT_TOKEN}
+      NODE_AGENT_CLOCK_SKEW_SECONDS: ${NODE_AGENT_CLOCK_SKEW_SECONDS:-30}
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      GPU_COUNT: ${GPU_COUNT:-4}
+      MODEL_ROOT: /srv/openllmops/models
+      DATASET_ROOT: /srv/openllmops/datasets
+      CHECKPOINT_ROOT: /srv/openllmops/checkpoints
+      TRAINING_CONFIG_ROOT: /srv/openllmops/training-configs
+      RUNTIME_ROOT: /srv/openllmops/runtime
+      RUNTIME_NETWORK: ${RUNTIME_NETWORK:-openllmops-runtime}
+      VLLM_ALLOWED_IMAGES: ${VLLM_ALLOWED_IMAGES:-vllm/vllm-openai:v0.10.2}
+      LLAMAFACTORY_ALLOWED_IMAGES: ${LLAMAFACTORY_ALLOWED_IMAGES:-openllmops/llamafactory-secure:0.9.6.dev0-c4e09c7-rcefix1}
+      WORKLOAD_UID: ${WORKLOAD_UID:-1000}
+      WORKLOAD_GID: ${WORKLOAD_GID:-1000}
+      WORKLOAD_SHM_SIZE: ${WORKLOAD_SHM_SIZE:-16g}
+      ENFORCE_NVML_PROCESS_CHECK: ${ENFORCE_NVML_PROCESS_CHECK:-true}
+      LOG_LEVEL: ${NODE_AGENT_LOG_LEVEL:-INFO}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      # 绑定到容器内相同的绝对路径，避免 node-agent 把容器路径误当作宿主机路径。
+      - type: bind
+        source: ${OPENLLMOPS_STORAGE_ROOT:-/srv/openllmops}
+        target: /srv/openllmops
+    depends_on:
+      docker-socket-proxy:
+        condition: service_healthy
+    expose:
+      - "9000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    networks:
+      - control
+      - docker-control
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    logging: *default-logging
+    <<: *service-security
+
+  # node-agent 不直接持有 Docker socket；代理只开放容器生命周期所需的 API。
+  # 即使如此，socket 代理仍属于高权限边界，只连接独立网络，禁止向宿主机映射端口。
+  docker-socket-proxy:
+    image: ${DOCKER_SOCKET_PROXY_IMAGE:-tecnativa/docker-socket-proxy:0.3.0}
+    restart: unless-stopped
+    environment:
+      CONTAINERS: "1"
+      NETWORKS: "1"
+      INFO: "1"
+      VERSION: "1"
+      PING: "1"
+      POST: "1"
+      DELETE: "1"
+      # Docker SDK 在镜像不存在时会执行 pull，且读取容器详情也需要 Images API；
+      # node-agent 代码仍会在调用前执行精确镜像白名单校验。
+      IMAGES: "1"
+      VOLUMES: "0"
+      SERVICES: "0"
+      SWARM: "0"
+      SYSTEM: "0"
+      AUTH: "0"
+      SECRETS: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    expose:
+      - "2375"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2375/_ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks:
+      # 防止 API/Web 等普通控制面容器绕过 node-agent 直接访问 Docker API。
+      - docker-control
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
+      - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-20GB}
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    expose:
+      - "9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks:
+      - control
+    logging: *default-logging
+    <<: *service-security
+
+  dcgm-exporter:
+    image: ${DCGM_EXPORTER_IMAGE:-nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04}
+    restart: unless-stopped
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    expose:
+      - "9400"
+    cap_add:
+      # DCGM 读取部分设备计数器需要 SYS_ADMIN；该服务不接入公网，也不挂载 Docker socket。
+      - SYS_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - control
+    logging: *default-logging
+
+  # 仅用于显式构建经过审计的训练运行时，不属于常驻控制面。
+  # 使用方式：docker compose --profile runtime-image build llamafactory-secure-image
+  llamafactory-secure-image:
+    profiles: ["runtime-image"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/llamafactory-secure.Dockerfile
+    image: ${LLAMAFACTORY_SECURE_IMAGE:-openllmops/llamafactory-secure:0.9.6.dev0-c4e09c7-rcefix1}
+    entrypoint: ["/bin/true"]
+    restart: "no"
+    network_mode: none
+    read_only: true
+    logging: *default-logging
+    <<: *service-security
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/docker/web.Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+        VITE_USE_MOCKS: ${VITE_USE_MOCKS:-false}
+    image: ${WEB_IMAGE:-openllmops/web:local}
+    restart: unless-stopped
+    environment:
+      TLS_AUTO_GENERATE: ${TLS_AUTO_GENERATE:-true}
+      TLS_COMMON_NAME: ${TLS_COMMON_NAME:-openllmops.local}
+    volumes:
+      - ${TLS_DIR:-./secrets/tls}:/etc/nginx/tls
+    ports:
+      - "${HTTP_BIND_ADDRESS:-0.0.0.0}:${HTTP_PORT:-80}:8080"
+      - "${HTTPS_BIND_ADDRESS:-0.0.0.0}:${HTTPS_PORT:-443}:8443"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-check-certificate", "-qO-", "https://127.0.0.1:8443/_gateway/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /var/cache/nginx:size=128m,mode=0755
+      - /var/run:size=16m,mode=0755
+    networks:
+      control:
+        # Uvicorn/后端只信任这个单一反代地址提供的 Forwarded 头。
+        ipv4_address: ${WEB_PROXY_IP:-172.30.10.10}
+    logging: *default-logging
+    <<: *service-security
+    cap_add:
+      # Nginx master 只需把 worker 降权；监听端口均高于 1024。
+      - CHOWN
+      - SETGID
+      - SETUID
+
+volumes:
+  postgres-data:
+  prometheus-data:
+
+networks:
+  control:
+    name: ${CONTROL_NETWORK:-openllmops-control}
+    internal: true
+    ipam:
+      config:
+        - subnet: ${CONTROL_SUBNET:-172.30.10.0/24}
+  runtime:
+    name: ${RUNTIME_NETWORK:-openllmops-runtime}
+    internal: true
+  egress:
+    name: ${EGRESS_NETWORK:-openllmops-egress}
+  docker-control:
+    name: ${DOCKER_CONTROL_NETWORK:-openllmops-docker-control}
+    internal: true

@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openllmops-node-agent"
+version = "0.1.0"
+description = "OpenLLMOps 单机 GPU 节点的受限工作负载执行代理"
+requires-python = ">=3.11"
+dependencies = [
+  "docker>=7.1,<8",
+  "fastapi>=0.115,<1",
+  "nvidia-ml-py>=12,<14",
+  "prometheus-client>=0.21,<1",
+  "pydantic-settings>=2.7,<3",
+  "PyYAML>=6.0,<7",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "httpx>=0.28,<1",
+  "pytest>=8.3,<9",
+]
+
+[tool.setuptools.packages.find]
+include = ["openllmops_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+  # Starlette 1.x 正在把 TestClient 从 httpx 迁移到 httpx2；不影响生产 ASGI 路径。
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
+ignore = [
+  # FastAPI 参数声明按官方模式在默认值中调用 Query/Depends。
+  "B008",
+  # 中文文案和有效中文注释需要使用全角标点，并非 Unicode 混淆字符。
+  "RUF001",
+  "RUF002",
+  "RUF003",
+]
