@@ -121,7 +121,7 @@ def create_checkpoint_archive(
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""
                 info.mtime = 0
-                info.mode &= 0o644
+                info.mode = 0o644
                 with path.open("rb") as content:
                     archive.addfile(info, content)
             manifest_info = tarfile.TarInfo("openllmops-artifact-manifest.json")
