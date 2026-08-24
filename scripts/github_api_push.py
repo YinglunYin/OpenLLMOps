@@ -236,6 +236,11 @@ def main() -> None:
     parser.add_argument("--commit", default="HEAD")
     parser.add_argument("--branch", default="main")
     parser.add_argument(
+        "--remote-name",
+        default="origin",
+        help="发布成功后更新对应的本地 remote-tracking ref",
+    )
+    parser.add_argument(
         "--create-private",
         action="store_true",
         help="目标不存在时，在当前凭证账号下创建同名私有仓库",
@@ -442,6 +447,21 @@ def main() -> None:
                 "POST",
                 f"{api_root}/git/refs",
                 json={"ref": f"refs/heads/{args.branch}", "sha": local_commit},
+            )
+        try:
+            remote_url = str(git("remote", "get-url", args.remote_name)).strip().casefold()
+        except subprocess.CalledProcessError:
+            remote_url = ""
+        normalized_repository = owner_repo.casefold()
+        if normalized_repository in remote_url:
+            subprocess.run(
+                [
+                    "git",
+                    "update-ref",
+                    f"refs/remotes/{args.remote_name}/{args.branch}",
+                    published_commit,
+                ],
+                check=True,
             )
         print(f"已发布 {owner_repo}:{args.branch} -> {published_commit}")
 
