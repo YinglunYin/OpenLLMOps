@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { Box, DataAnalysis, Files, Refresh, Search, Upload, Warning } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
@@ -21,7 +21,9 @@ const detailTab = ref('overview')
 const uploadVisible = ref(false)
 const uploadBusy = ref(false)
 const uploadProgress = ref(0)
+const previewLoading = ref(false)
 let uploadController: AbortController | undefined
+let previewRequestVersion = 0
 const filters = reactive({ keyword: '', purpose: '', status: '' })
 const uploadForm = reactive({ name: '', purpose: 'SFT', version: 'v1.0.0' })
 
@@ -56,12 +58,26 @@ function handleFileChange(file: UploadFile) {
   uploadFile.value = file.raw
 }
 
-async function selectDataset(row: Dataset) {
-  selected.value = row
-  if (!useMocks) {
-    try { previewRows.value = await api.datasets.preview(row.id) }
-    catch { previewRows.value = [] }
+async function loadPreview(row: Dataset, showError = false) {
+  if (useMocks) return
+  const version = ++previewRequestVersion
+  previewLoading.value = true
+  try {
+    const result = await api.datasets.preview(row.id)
+    if (version === previewRequestVersion && selected.value?.id === row.id) previewRows.value = result
+  } catch (error) {
+    if (version !== previewRequestVersion || selected.value?.id !== row.id) return
+    previewRows.value = []
+    if (showError) ElMessage.error(error instanceof Error ? error.message : '数据预览加载失败')
+  } finally {
+    if (version === previewRequestVersion) previewLoading.value = false
   }
+}
+
+async function selectDataset(row: Dataset) {
+  if (selected.value?.id !== row.id) previewRows.value = []
+  selected.value = row
+  if (detailTab.value === 'preview') await loadPreview(row, true)
 }
 
 async function showPreview(row: Dataset) {
@@ -116,6 +132,11 @@ function beforeCloseUpload(done: () => void) {
   uploadController?.abort()
   done()
 }
+
+// 表格默认选中项不会触发 current-change；用户首次打开预览页签时再按需拉取内容。
+watch(detailTab, (tab) => {
+  if (tab === 'preview' && selected.value) void loadPreview(selected.value, true)
+})
 
 onBeforeUnmount(() => uploadController?.abort())
 
@@ -174,7 +195,7 @@ onMounted(async () => {
             <div class="overview-card"><h3>错误详情（按行）</h3><el-table :data="selected.validationErrors ?? (useMocks ? [{line:12845,type:'格式错误',reason:'instruction 字段缺失'},{line:14672,type:'超长',reason:'输出长度超过上限（8192）'},{line:17123,type:'JSON 解析错误',reason:'无法解析 JSON 对象'}] : [])" size="small"><el-table-column prop="line" label="行号" width="74"/><el-table-column prop="type" label="错误类型" width="105"/><el-table-column prop="reason" label="错误原因" min-width="155"/></el-table></div>
           </div>
         </el-tab-pane>
-        <el-tab-pane label="数据预览" name="preview"><pre v-if="previewRows.length" class="json-preview">{{ previewRows.map((row) => JSON.stringify(row)).join('\n') }}</pre><el-empty v-else description="暂无可预览记录" /></el-tab-pane>
+        <el-tab-pane label="数据预览" name="preview"><div v-loading="previewLoading"><pre v-if="previewRows.length" class="json-preview">{{ previewRows.map((row) => JSON.stringify(row)).join('\n') }}</pre><el-empty v-else description="暂无可预览记录" /></div></el-tab-pane>
         <el-tab-pane label="校验报告" name="report"><el-result :icon="selected.status === 'failed' ? 'error' : 'success'" :title="statusMeta(selected.status).text" :sub-title="`${selected.samples.toLocaleString()} 条记录，${selected.validationErrors?.length ?? 0} 条校验错误`" /></el-tab-pane>
         <el-tab-pane label="版本记录" name="versions"><el-timeline v-if="versionRows.length"><el-timeline-item v-for="version in versionRows" :key="version.id" :timestamp="version.updatedAt">{{ version.version }} · {{ version.samples.toLocaleString() }} 条 · {{ statusMeta(version.status).text }}</el-timeline-item></el-timeline><el-empty v-else description="暂无版本记录" /><p class="version-hint">数据集内容不可原地覆盖；上传同名的新记录即可形成新版本。</p></el-tab-pane>
       </el-tabs>
