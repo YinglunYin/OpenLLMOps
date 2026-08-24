@@ -1,0 +1,279 @@
+import asyncio
+import threading
+import time
+import uuid
+from pathlib import Path
+
+import pytest
+import pytest_asyncio
+from openllmops_model_importer import ImportRequest, ModelManifest
+from openllmops_model_importer.importer import ImportCancelledError
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from app.models import Base, ModelAsset, ModelImportJob
+from app.models.enums import (
+    AssetStatus,
+    ModelImportSource,
+    ModelImportStatus,
+    ModelKind,
+)
+from app.services.model_import_coordinator import (
+    ModelImportCoordinator,
+    claim_next_model_import,
+    read_secret_file,
+    request_model_import_cancel,
+)
+
+
+@pytest_asyncio.fixture
+async def import_session_factory(tmp_path: Path):  # type: ignore[no-untyped-def]
+    """文件型 SQLite 允许用两个连接真实覆盖 CAS 双领取竞争。"""
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'imports.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    yield factory
+    await engine.dispose()
+
+
+async def _seed_import(
+    factory,  # type: ignore[no-untyped-def]
+    *,
+    source: ModelImportSource = ModelImportSource.CONTROLLED_DIRECTORY,
+    repository: str | None = None,
+    source_directory: str | None = "candidate",
+) -> uuid.UUID:
+    async with factory() as session, session.begin():
+        job = ModelImportJob(
+            name=f"import-{uuid.uuid4()}",
+            source=source,
+            repository=repository,
+            source_directory=source_directory,
+            model_kind=ModelKind.BASE,
+            status=ModelImportStatus.PENDING,
+            progress_completed=0,
+        )
+        session.add(job)
+        await session.flush()
+        return job.id
+
+
+class SuccessfulImporter:
+    def __init__(self, final_path: Path) -> None:
+        self.final_path = final_path
+
+    def run(self, request: ImportRequest, *, progress=None, cancelled=None):  # type: ignore[no-untyped-def]
+        assert cancelled is not None and not cancelled()
+        if progress is not None:
+            progress("transferring", 5, 10)
+            progress("validating", 0, None)
+        manifest = ModelManifest(
+            model_type="qwen2",
+            architecture="Qwen2ForCausalLM",
+            total_size_bytes=10,
+            file_count=2,
+            files=(),
+        )
+        return self.final_path / str(request.import_id), manifest
+
+
+class FailingImporter:
+    def __init__(self) -> None:
+        self.received_token: str | None = None
+
+    def run(self, request: ImportRequest, *, progress=None, cancelled=None):  # type: ignore[no-untyped-def]
+        self.received_token = request.access_token
+        raise ValueError(f"远端下载失败：{request.access_token}")
+
+
+class CancelableImporter:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+
+    def run(self, request: ImportRequest, *, progress=None, cancelled=None):  # type: ignore[no-untyped-def]
+        del request, progress
+        assert cancelled is not None
+        self.started.set()
+        while not cancelled():
+            time.sleep(0.001)
+        raise ImportCancelledError("测试主动取消")
+
+
+async def test_sqlite_atomic_claim_does_not_double_claim(import_session_factory) -> None:
+    job_id = await _seed_import(import_session_factory)
+
+    results = await asyncio.gather(
+        claim_next_model_import(import_session_factory, "worker-a"),
+        claim_next_model_import(import_session_factory, "worker-b"),
+    )
+
+    claimed = [job for job in results if job is not None]
+    assert len(claimed) == 1
+    assert claimed[0].id == job_id
+    async with import_session_factory() as session:
+        job = await session.get(ModelImportJob, job_id)
+        assert job is not None
+        assert job.status == ModelImportStatus.TRANSFERRING
+        assert job.claimed_by in {"worker-a", "worker-b"}
+
+
+async def test_success_creates_ready_asset_only_after_validation(
+    import_session_factory,
+    tmp_path: Path,
+) -> None:
+    job_id = await _seed_import(import_session_factory)
+    coordinator = ModelImportCoordinator(
+        import_session_factory,
+        SuccessfulImporter(tmp_path / "models"),
+        inbox_root=tmp_path / "inbox",
+        staging_root=tmp_path / "staging",
+    )
+
+    await coordinator.run_once()
+    await coordinator.wait_for_idle()
+
+    async with import_session_factory() as session:
+        job = await session.get(ModelImportJob, job_id)
+        assets = list(await session.scalars(select(ModelAsset)))
+        assert job is not None and job.status == ModelImportStatus.READY
+        assert job.result_asset_id is not None
+        assert job.progress_completed == 10 == job.progress_total
+        assert len(assets) == 1
+        assert assets[0].id == job.result_asset_id
+        assert assets[0].status == AssetStatus.READY
+        assert assets[0].family == "qwen2"
+
+
+async def test_failure_redacts_secret_and_never_creates_asset(
+    import_session_factory,
+    tmp_path: Path,
+) -> None:
+    secret = "hf_private_value"
+    secret_file = tmp_path / "hf-token"
+    secret_file.write_text(secret, encoding="utf-8")
+    secret_file.chmod(0o400)
+    job_id = await _seed_import(
+        import_session_factory,
+        source=ModelImportSource.HUGGINGFACE,
+        repository="example/model",
+        source_directory=None,
+    )
+    importer = FailingImporter()
+    coordinator = ModelImportCoordinator(
+        import_session_factory,
+        importer,
+        inbox_root=tmp_path / "inbox",
+        staging_root=tmp_path / "staging",
+        huggingface_token_file=secret_file,
+    )
+
+    await coordinator.run_once()
+    await coordinator.wait_for_idle()
+
+    assert importer.received_token == secret
+    async with import_session_factory() as session:
+        job = await session.get(ModelImportJob, job_id)
+        assert job is not None and job.status == ModelImportStatus.FAILED
+        assert job.result_asset_id is None
+        assert job.error_message is not None
+        assert secret not in job.error_message
+        assert "[REDACTED]" in job.error_message
+        assert await session.scalar(select(func.count()).select_from(ModelAsset)) == 0
+
+
+async def test_cancel_running_import_is_idempotent_and_creates_no_asset(
+    import_session_factory,
+    tmp_path: Path,
+) -> None:
+    job_id = await _seed_import(import_session_factory)
+    importer = CancelableImporter()
+    coordinator = ModelImportCoordinator(
+        import_session_factory,
+        importer,
+        inbox_root=tmp_path / "inbox",
+        staging_root=tmp_path / "staging",
+    )
+
+    await coordinator.run_once()
+    assert await asyncio.to_thread(importer.started.wait, 2)
+    async with import_session_factory() as session:
+        first = await request_model_import_cancel(session, job_id)
+        assert first is not None and first.status == ModelImportStatus.CANCELING
+    await coordinator.run_once()
+    await coordinator.wait_for_idle()
+    async with import_session_factory() as session:
+        second = await request_model_import_cancel(session, job_id)
+        assert second is not None and second.status == ModelImportStatus.CANCELED
+        assert await session.scalar(select(func.count()).select_from(ModelAsset)) == 0
+
+
+def test_secret_file_must_be_regular_and_read_only(tmp_path: Path) -> None:
+    token_file = tmp_path / "token"
+    token_file.write_text("secret", encoding="utf-8")
+    token_file.chmod(0o400)
+    assert read_secret_file(token_file) == "secret"
+
+    token_file.chmod(0o600)
+    with pytest.raises(ValueError, match="只读权限"):
+        read_secret_file(token_file)
+
+
+def test_model_import_api_and_inbox_reject_directory_escape(client, test_root: Path) -> None:
+    inbox = test_root / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    candidate_name = f"candidate-{uuid.uuid4()}"
+    candidate = inbox / candidate_name
+    candidate.mkdir()
+    (candidate / "config.json").write_text('{"model_type":"qwen2"}', encoding="utf-8")
+    (candidate / "model.safetensors").write_bytes(b"safe-test-weights")
+
+    inbox_response = client.get("/api/v1/model-inbox")
+    assert inbox_response.status_code == 200
+    assert any(item["name"] == candidate_name for item in inbox_response.json())
+
+    escaped = client.post(
+        "/api/v1/model-imports",
+        json={
+            "name": "escape",
+            "source": "controlled_directory",
+            "source_directory": "../outside",
+            "model_kind": "base",
+        },
+    )
+    assert escaped.status_code == 422
+
+    leaked_secret = client.post(
+        "/api/v1/model-imports",
+        json={
+            "name": "secret-in-request",
+            "source": "huggingface",
+            "repository": "example/model",
+            "model_kind": "base",
+            "access_token": "must-not-be-accepted",
+        },
+    )
+    assert leaked_secret.status_code == 422
+
+    created = client.post(
+        "/api/v1/model-imports",
+        json={
+            "name": "controlled-import",
+            "source": "controlled_directory",
+            "source_directory": candidate_name,
+            "model_kind": "base",
+        },
+    )
+    assert created.status_code == 201
+    body = created.json()
+    assert body["status"] == "pending"
+
+    detail = client.get(f"/api/v1/model-imports/{body['id']}")
+    assert detail.status_code == 200
+    canceled = client.post(f"/api/v1/model-imports/{body['id']}/cancel")
+    assert canceled.status_code == 200
+    assert canceled.json()["status"] == "canceled"
+    repeated = client.post(f"/api/v1/model-imports/{body['id']}/cancel")
+    assert repeated.status_code == 200
+    assert repeated.json()["status"] == "canceled"

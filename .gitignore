@@ -6,6 +6,7 @@
 # Python
 __pycache__/
 *.py[cod]
+*.db
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
