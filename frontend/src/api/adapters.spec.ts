@@ -50,9 +50,10 @@ describe('FastAPI 资源适配器', () => {
       ...timestamps, name: 'job', model_asset_id: 'asset', dataset_id: 'dataset', stage: 'sft', algorithm: 'qlora',
       desired_state: 'terminated', actual_state: 'canceled', gpu_ids: [0], progress: 42.7, current_step: 427,
       total_steps: 1000, metrics: { epoch: '1 / 3', eta: '00:12:30' }, training_config: {}, output_dir: '/checkpoints/job',
-      checkpoint_path: '/checkpoints/job/checkpoint-427', adapter_path: '/checkpoints/job/adapter', merged_model_path: null, error_message: null,
+      checkpoint_path: '/checkpoints/job/checkpoint-427', adapter_path: '/checkpoints/job/adapter', merged_model_path: null,
+      published_model_asset_id: 'published-asset', error_message: null,
     }
-    expect(toTrainingJob(training, 'Qwen-Test')).toMatchObject({ stage: 'SFT', algorithm: 'QLoRA', status: 'terminated', progress: 43, baseModel: 'Qwen-Test', checkpointPath: '/checkpoints/job/checkpoint-427', adapterPath: '/checkpoints/job/adapter' })
+    expect(toTrainingJob(training, 'Qwen-Test')).toMatchObject({ stage: 'SFT', algorithm: 'QLoRA', status: 'terminated', progress: 43, baseModel: 'Qwen-Test', checkpointPath: '/checkpoints/job/checkpoint-427', adapterPath: '/checkpoints/job/adapter', publishedModelAssetId: 'published-asset' })
   })
 
   it('把评测 comparison 和 GPU 租约转换为量化结果及无遥测设备', () => {

@@ -24,7 +24,7 @@ const storageForm = reactive({ modelRoot: useMocks ? '/data/openllmops/models' :
 const maskedHf = computed(() => showHfToken.value ? 'hf_demo_token_not_a_real_secret' : sourceForm.hfToken)
 const maskedMs = computed(() => showMsToken.value ? 'ms_demo_token_not_a_real_secret' : sourceForm.msToken)
 const apiKeyRows = ref<ApiKeySummary[]>([])
-const runtimeRows = useMocks ? [{name:'控制面 API',version:'0.1.0',status:'运行中'},{name:'节点代理',version:'0.1.0',status:'运行中'},{name:'vLLM',version:'0.10.1',status:'可用'},{name:'LLaMA-Factory',version:'0.9.4',status:'可用'},{name:'PostgreSQL',version:'16',status:'运行中'},{name:'Prometheus',version:'3.x',status:'运行中'}] : []
+const runtimeRows = useMocks ? [{name:'控制面 API',version:'0.1.0',status:'运行中'},{name:'节点代理',version:'0.1.0',status:'运行中'},{name:'vLLM',version:'0.27.1',status:'可用'},{name:'LLaMA-Factory 安全衍生版',version:'0.9.6.dev0-c4e09c7-rcefix1',status:'可用'},{name:'PostgreSQL',version:'16',status:'运行中'},{name:'Prometheus',version:'3.x',status:'运行中'}] : []
 const activeApiKeyCount = computed(() => apiKeyRows.value.filter((item) => item.active).length)
 function unsupported() { ElMessage.warning('控制面尚未提供该设置的读取或保存端点') }
 function save(message = '设置已保存') { if (!useMocks) { unsupported(); return }; ElMessage.success(message) }
@@ -99,7 +99,7 @@ onMounted(async () => {
           </div>
           <aside class="settings-aside">
             <PanelCard title="系统安全"><div class="security-list"><div><el-icon><Lock/></el-icon><span>HTTPS</span><StatusPill :text="useMocks ? '已启用' : '未读取'" :tone="useMocks ? 'success' : 'info'"/></div><div><el-icon><Key/></el-icon><span>有效 API Key</span><b>{{ activeApiKeyCount }}</b></div><div><el-icon><User/></el-icon><span>单管理员模式</span><StatusPill :text="useMocks ? '已启用' : '会话认证'" :tone="useMocks ? 'success' : 'primary'"/></div></div></PanelCard>
-            <PanelCard title="运行时物料" class="section-gap"><div v-if="useMocks" class="runtime-list"><div><strong>vLLM 镜像</strong><span>vllm/vllm-openai:0.10.1</span></div><div><strong>LLaMA-Factory 镜像</strong><span>hiyouga/llamafactory:0.9.4</span></div><div><strong>NVIDIA Driver</strong><span>稳定版（由宿主机提供）</span></div><div><strong>基础镜像 Digest</strong><span>sha256:9b8d3a6c7f4e…</span></div></div><el-empty v-else description="运行时版本端点尚未接入" :image-size="54"/></PanelCard>
+            <PanelCard title="运行时物料" class="section-gap"><div v-if="useMocks" class="runtime-list"><div><strong>vLLM 镜像</strong><span>vllm/vllm-openai:v0.27.1</span></div><div><strong>LLaMA-Factory 镜像</strong><span>openllmops/llamafactory-secure:0.9.6.dev0-c4e09c7-rcefix1</span></div><div><strong>NVIDIA Driver</strong><span>稳定版（由宿主机提供）</span></div><div><strong>生产镜像策略</strong><span>内部仓库不可变 @sha256</span></div></div><el-empty v-else description="运行时版本端点尚未接入" :image-size="54"/></PanelCard>
           </aside>
         </div>
       </el-tab-pane>

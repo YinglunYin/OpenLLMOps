@@ -14,6 +14,9 @@ import type {
   BackendInboxCandidate,
   BackendModelAsset,
   BackendModelImport,
+  BackendTrainingArtifact,
+  BackendTrainingArtifactKind,
+  BackendTrainingArtifactManifest,
   BackendTrainingJob,
 } from './contracts'
 import { createOpenAIStreamParser } from './sse'
@@ -43,12 +46,6 @@ function loadMockData(): Promise<MockData> {
   // 动态加载保证真实模式不会在页面初始化时读取 fixture。
   mockDataPromise ??= mockDataLoader()
   return mockDataPromise
-}
-
-export interface CapabilityResult<T> {
-  supported: boolean
-  data: T
-  reason?: string
 }
 
 export interface DatasetUploadInput {
@@ -192,10 +189,9 @@ function normalizeDeploymentUpdate(payload: Record<string, unknown>) {
 }
 
 function normalizeTraining(payload: Record<string, unknown>) {
-  const name = String(payload.name)
   const gpuCount = Number(payload.gpuCount ?? 1)
   return {
-    name,
+    name: String(payload.name),
     model_asset_id: payload.modelAssetId,
     dataset_id: payload.datasetId,
     stage: String(payload.stage).toLowerCase(),
@@ -204,12 +200,20 @@ function normalizeTraining(payload: Record<string, unknown>) {
     training_config: {
       num_train_epochs: payload.epochs,
       learning_rate: payload.learningRate,
+      cutoff_len: payload.cutoffLen,
       per_device_train_batch_size: payload.batchSize,
       gradient_accumulation_steps: payload.gradientAccumulation,
+      logging_steps: payload.loggingSteps,
+      save_steps: payload.saveSteps,
+      warmup_ratio: payload.warmupRatio,
       lora_rank: payload.loraRank,
+      lora_alpha: payload.loraAlpha,
+      lora_dropout: payload.loraDropout,
+      freeze_trainable_layers: payload.freezeTrainableLayers,
+      ...(payload.maxSamples == null ? {} : { max_samples: payload.maxSamples }),
+      seed: payload.seed,
       ...(payload.stage === 'SFT' ? { template: payload.template } : {}),
     },
-    output_dir: `/srv/openllmops/checkpoints/${name}`,
   }
 }
 
@@ -350,8 +354,24 @@ export const api = {
       : (await http.post<BackendTrainingJob>('/v1/training-jobs', normalizeTraining(payload))).data,
     stop: async (id: string) => useMocks ? mockMutation(true) : (await http.post(`/v1/training-jobs/${id}/terminate`), true),
     remove: async (id: string) => useMocks ? mockMutation(true) : (await http.delete(`/v1/training-jobs/${id}`), true),
-    async checkpoints(): Promise<CapabilityResult<Array<Record<string, unknown>>>> {
-      return { supported: false, data: [], reason: '控制面尚未提供 checkpoint 列表与导出端点' }
+    async artifacts(id: string): Promise<BackendTrainingArtifact[]> {
+      if (useMocks) return clone([
+        { kind: 'checkpoint', path: '/checkpoints/demo/checkpoint-1000', file_count: 8, size_bytes: 38_400_000, archive_filename: 'training-demo-checkpoint.tar.gz' },
+        { kind: 'adapter', path: '/checkpoints/demo', file_count: 5, size_bytes: 24_200_000, archive_filename: 'training-demo-adapter.tar.gz' },
+        { kind: 'merged', path: '/checkpoints/demo/merged', file_count: 12, size_bytes: 15_032_385_536, archive_filename: 'training-demo-merged.tar.gz' },
+      ] satisfies BackendTrainingArtifact[])
+      return (await http.get<BackendTrainingArtifactManifest>(`/v1/training-jobs/${id}/artifacts`)).data.artifacts
+    },
+    artifactDownloadUrl(id: string, kind: BackendTrainingArtifactKind): string {
+      const base = String(http.defaults.baseURL ?? '/api').replace(/\/$/, '')
+      return `${base}/v1/training-jobs/${encodeURIComponent(id)}/artifacts/${kind}/download`
+    },
+    async publishModel(id: string): Promise<ModelAsset> {
+      if (useMocks) {
+        return mockMutation({ id: crypto.randomUUID(), name: 'trained-demo', version: '训练产物', type: 'generation', source: '训练产物', format: 'Safetensors', size: '14.0 GB', status: 'available', updatedAt: '刚刚' })
+      }
+      const { data } = await http.post<BackendModelAsset>(`/v1/training-jobs/${id}/publish-model`)
+      return toModelAsset(data)
     },
   },
   evaluations: {

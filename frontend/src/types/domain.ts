@@ -66,6 +66,7 @@ export interface TrainingJob {
   checkpointPath?: string
   adapterPath?: string
   mergedModelPath?: string
+  publishedModelAssetId?: string
   updatedAt?: string
 }
 

@@ -130,6 +130,7 @@ export function toTrainingJob(item: BackendTrainingJob, modelName?: string): Tra
     checkpointPath: item.checkpoint_path ?? undefined,
     adapterPath: item.adapter_path ?? undefined,
     mergedModelPath: item.merged_model_path ?? undefined,
+    publishedModelAssetId: item.published_model_asset_id ?? undefined,
     updatedAt: formatDateTime(item.updated_at),
   }
 }

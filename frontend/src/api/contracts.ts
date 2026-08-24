@@ -97,7 +97,24 @@ export interface BackendTrainingJob extends TimestampedResource {
   checkpoint_path: string | null
   adapter_path: string | null
   merged_model_path: string | null
+  published_model_asset_id: string | null
   error_message: string | null
+}
+
+export type BackendTrainingArtifactKind = 'checkpoint' | 'adapter' | 'merged' | 'full'
+
+export interface BackendTrainingArtifact {
+  kind: BackendTrainingArtifactKind
+  path: string
+  file_count: number
+  size_bytes: number
+  archive_filename: string
+}
+
+export interface BackendTrainingArtifactManifest {
+  job_id: string
+  state: BackendTrainingJob['actual_state']
+  artifacts: BackendTrainingArtifact[]
 }
 
 export interface BackendEvaluationRun extends TimestampedResource {
