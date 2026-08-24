@@ -47,6 +47,8 @@ GENERATION_LABEL = "com.openllmops.generation"
 OWNER_TYPE_LABEL = "com.openllmops.owner-type"
 OUTPUT_PATH_LABEL = "com.openllmops.output-path"
 DATASET_MANIFEST_PATH_LABEL = "com.openllmops.dataset-manifest-path"
+BASE_TEMPLATE_LABEL = "com.openllmops.base-template"
+CANDIDATE_TEMPLATE_LABEL = "com.openllmops.candidate-template"
 PORT_LABEL = "com.openllmops.port"
 
 ACTIVE_STATES = frozenset({"created", "running", "restarting", "paused"})
@@ -287,6 +289,13 @@ class DockerRunner:
         raw_manifest = container.labels.get(DATASET_MANIFEST_PATH_LABEL)
         if not raw_output or not raw_manifest:
             raise InvalidWorkload("评测容器缺少受控产物标签")
+        base_template = container.labels.get(BASE_TEMPLATE_LABEL)
+        candidate_template = container.labels.get(CANDIDATE_TEMPLATE_LABEL)
+        if base_template not in {"base", "instruct"} or candidate_template not in {
+            "base",
+            "instruct",
+        }:
+            raise InvalidWorkload("评测容器缺少可信模板标签")
         try:
             output_path, _ = strict_existing_path(
                 Path(raw_output),
@@ -306,6 +315,8 @@ class DockerRunner:
                 output_path,
                 expected_dataset_sha256=dataset_sha256,
                 expected_total=record_count,
+                expected_base_template=base_template,
+                expected_candidate_template=candidate_template,
             )
         except EvaluationInputError as exc:
             raise InvalidWorkload(f"评测产物无效：{exc}") from exc
@@ -525,6 +536,8 @@ class DockerRunner:
                 owner_type="evaluation",
                 output_path=output_path,
                 dataset_manifest_path=manifest_path,
+                base_template=request.base_template,
+                candidate_template=request.candidate_template,
                 restart_policy={"Name": "no"},
                 network_mode="none",
             )
@@ -628,6 +641,8 @@ class DockerRunner:
         owner_type: str | None = None,
         output_path: Path | None = None,
         dataset_manifest_path: Path | None = None,
+        base_template: str | None = None,
+        candidate_template: str | None = None,
         port: int | None = None,
         entrypoint: list[str] | None = None,
         network_mode: str | None = None,
@@ -649,6 +664,10 @@ class DockerRunner:
             labels[OUTPUT_PATH_LABEL] = str(output_path)
         if dataset_manifest_path:
             labels[DATASET_MANIFEST_PATH_LABEL] = str(dataset_manifest_path)
+        if base_template:
+            labels[BASE_TEMPLATE_LABEL] = base_template
+        if candidate_template:
+            labels[CANDIDATE_TEMPLATE_LABEL] = candidate_template
         if port is not None:
             labels[PORT_LABEL] = str(port)
         try:

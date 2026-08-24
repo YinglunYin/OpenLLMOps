@@ -675,6 +675,9 @@ def _comparison_summary(
     candidate_categories = {item["category"]: item for item in candidate["categories"]}
     if baseline_categories.keys() != candidate_categories.keys():
         raise EvaluationInputError("评测报告前后分类集合不一致")
+    for category_name in baseline_categories:
+        if baseline_categories[category_name]["total"] != candidate_categories[category_name]["total"]:
+            raise EvaluationInputError("评测报告前后同名分类的样本数不一致")
     expected_names = sorted(baseline_categories.keys() & candidate_categories.keys())
     normalized_changes: list[dict[str, Any]] = []
     for index, (change, expected_name) in enumerate(zip(raw_changes, expected_names, strict=False)):
@@ -736,6 +739,8 @@ def load_pair_report_metadata(
     *,
     expected_dataset_sha256: str | None = None,
     expected_total: int | None = None,
+    expected_base_template: str | None = None,
+    expected_candidate_template: str | None = None,
 ) -> dict[str, Any]:
     report_path = output_path / "pair-report.json"
     try:
@@ -758,6 +763,10 @@ def load_pair_report_metadata(
     candidate = _metric_summary(pair["candidate"], "candidate")
     if baseline["model_name"] != "baseline" or candidate["model_name"] != "candidate":
         raise EvaluationInputError("评测报告模型名与节点固定合同不一致")
+    if expected_base_template is not None and baseline["template"] != expected_base_template:
+        raise EvaluationInputError("评测报告 baseline 模板与节点启动合同不一致")
+    if expected_candidate_template is not None and candidate["template"] != expected_candidate_template:
+        raise EvaluationInputError("评测报告 candidate 模板与节点启动合同不一致")
     comparison = _comparison_summary(pair["comparison"], baseline, candidate)
     fingerprints = {
         baseline["dataset_sha256"],

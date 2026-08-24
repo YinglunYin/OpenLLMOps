@@ -204,6 +204,92 @@ def test_pair_report_rejects_nonfinite_and_inconsistent_comparison(tmp_path: Pat
         load_pair_report_metadata(output)
 
 
+def test_pair_report_rejects_category_denominator_or_template_drift(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    report_path = output / "pair-report.json"
+    report = _pair_report("d" * 64)
+    report["baseline"].update(
+        {
+            "total": 3,
+            "correct": 1,
+            "accuracy_percent": 33.3333,
+            "sample_ids": ["domain:1", "domain:2", "domain:3"],
+            "categories": [
+                {
+                    "category": "domain/a",
+                    "total": 2,
+                    "correct": 1,
+                    "invalid": 0,
+                    "accuracy_percent": 50.0,
+                },
+                {
+                    "category": "domain/b",
+                    "total": 1,
+                    "correct": 0,
+                    "invalid": 0,
+                    "accuracy_percent": 0.0,
+                },
+            ],
+        }
+    )
+    report["candidate"].update(
+        {
+            "total": 3,
+            "correct": 2,
+            "accuracy_percent": 66.6667,
+            "sample_ids": ["domain:1", "domain:2", "domain:3"],
+            "categories": [
+                {
+                    "category": "domain/a",
+                    "total": 1,
+                    "correct": 1,
+                    "invalid": 0,
+                    "accuracy_percent": 100.0,
+                },
+                {
+                    "category": "domain/b",
+                    "total": 2,
+                    "correct": 1,
+                    "invalid": 0,
+                    "accuracy_percent": 50.0,
+                },
+            ],
+        }
+    )
+    report["comparison"].update(
+        {
+            "baseline_percent": 33.3333,
+            "candidate_percent": 66.6667,
+            "percentage_point_change": 33.3334,
+            "relative_change_percent": 100.0003,
+            "category_changes": [
+                {
+                    "category": "domain/a",
+                    "baseline_percent": 50.0,
+                    "candidate_percent": 100.0,
+                    "percentage_point_change": 50.0,
+                },
+                {
+                    "category": "domain/b",
+                    "baseline_percent": 0.0,
+                    "candidate_percent": 50.0,
+                    "percentage_point_change": 50.0,
+                },
+            ],
+        }
+    )
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(EvaluationInputError, match="同名分类的样本数"):
+        load_pair_report_metadata(output)
+
+    valid = _pair_report("d" * 64)
+    report_path.write_text(json.dumps(valid), encoding="utf-8")
+    with pytest.raises(EvaluationInputError, match="baseline 模板"):
+        load_pair_report_metadata(output, expected_base_template="instruct")
+
+
 def test_merge_rejects_category_that_would_exceed_report_contract(tmp_path: Path) -> None:
     roots = _roots(tmp_path)
     dataset = roots["dataset_root"] / "long-category.jsonl"
