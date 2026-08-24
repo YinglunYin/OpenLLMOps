@@ -17,10 +17,11 @@ class Generation:
 class CompatibleClient:
     """调用平台统一入口，而不是绕过 Gateway 访问临时容器端口。"""
 
-    def __init__(self, base_url: str, api_key: str, timeout_seconds: float = 120.0) -> None:
+    def __init__(self, base_url: str, api_key: str | None, timeout_seconds: float = 120.0) -> None:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
             timeout=timeout_seconds,
         )
 
@@ -37,6 +38,7 @@ class CompatibleClient:
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,
                     "top_p": 1,
+                    "seed": 42,
                     "max_tokens": max_tokens,
                     "stream": False,
                 },
@@ -51,6 +53,7 @@ class CompatibleClient:
                     "prompt": prompt,
                     "temperature": 0,
                     "top_p": 1,
+                    "seed": 42,
                     "max_tokens": max_tokens,
                     "stream": False,
                 },
@@ -58,4 +61,3 @@ class CompatibleClient:
             response.raise_for_status()
             text = response.json()["choices"][0]["text"]
         return Generation(text=str(text), latency_ms=(time.perf_counter() - started) * 1000)
-

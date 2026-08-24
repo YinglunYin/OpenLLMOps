@@ -11,6 +11,7 @@ from pathlib import Path
 from .benchmarks import convert_csv_directory
 from .client import CompatibleClient
 from .dataset import load_jsonl
+from .orchestrator import ModelTarget, evaluate_pair
 from .runner import evaluate
 
 
@@ -32,6 +33,20 @@ def _parser() -> argparse.ArgumentParser:
     convert.add_argument("--source-dir", type=Path, required=True)
     convert.add_argument("--output", type=Path, required=True)
     convert.add_argument("--benchmark", choices=("ceval", "cmmlu"), required=True)
+
+    pair = subparsers.add_parser("run-pair", help="顺序启动 vLLM 并比较训练前后模型")
+    pair.add_argument("--dataset", type=Path, required=True)
+    pair.add_argument("--output-dir", type=Path, required=True)
+    pair.add_argument("--baseline-path", type=Path, required=True)
+    pair.add_argument("--baseline-name", default="baseline")
+    pair.add_argument("--baseline-template", choices=("base", "instruct"), required=True)
+    pair.add_argument("--candidate-path", type=Path, required=True)
+    pair.add_argument("--candidate-name", default="candidate")
+    pair.add_argument("--candidate-template", choices=("base", "instruct"), required=True)
+    pair.add_argument("--tensor-parallel-size", type=int, default=1)
+    pair.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    pair.add_argument("--concurrency", type=int, default=4)
+    pair.add_argument("--max-tokens", type=int, default=32)
     return parser
 
 
@@ -56,15 +71,32 @@ async def _run(args: argparse.Namespace) -> None:
     args.output.write_text(json.dumps(report.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+async def _run_pair(args: argparse.Namespace) -> None:
+    samples, fingerprint = load_jsonl(args.dataset)
+    await evaluate_pair(
+        baseline=ModelTarget(args.baseline_path, args.baseline_name, args.baseline_template),
+        candidate=ModelTarget(args.candidate_path, args.candidate_name, args.candidate_template),
+        samples=samples,
+        dataset_sha256=fingerprint,
+        output_dir=args.output_dir,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        concurrency=args.concurrency,
+        max_tokens=args.max_tokens,
+    )
+
+
 def main() -> None:
     args = _parser().parse_args()
     if args.command == "convert-benchmark":
         count = convert_csv_directory(args.source_dir, args.output, args.benchmark)
         print(f"已转换 {count} 条样本")
         return
+    if args.command == "run-pair":
+        asyncio.run(_run_pair(args))
+        return
     asyncio.run(_run(args))
 
 
 if __name__ == "__main__":
     main()
-
