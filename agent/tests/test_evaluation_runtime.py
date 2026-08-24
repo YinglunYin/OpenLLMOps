@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 
+import openllmops_agent.evaluation_runtime as evaluation_runtime
 from openllmops_agent.evaluation_runtime import (
     DatasetSource,
     EvaluationInputError,
@@ -303,6 +304,44 @@ def test_merge_rejects_category_that_would_exceed_report_contract(tmp_path: Path
             run_id=run_id,
             generation=1,
             sources=[DatasetSource("s" * 64, dataset)],
+            requested_output_path=roots["evaluation_output_root"] / str(run_id),
+            **roots,
+        )
+
+
+def test_merge_rejects_excessive_category_count_or_sample_id_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    dataset = roots["dataset_root"] / "bounded.jsonl"
+    rows = []
+    for sample_id, category in (("1", "first"), ("2", "second")):
+        row = json.loads(_row(sample_id, "question"))
+        row["category"] = category
+        rows.append(json.dumps(row))
+    dataset.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(evaluation_runtime, "MAX_REPORT_CATEGORIES", 1)
+    run_id = uuid4()
+    with pytest.raises(EvaluationInputError, match="分类数量"):
+        prepare_evaluation_workspace(
+            run_id=run_id,
+            generation=1,
+            sources=[DatasetSource("domain", dataset)],
+            requested_output_path=roots["evaluation_output_root"] / str(run_id),
+            **roots,
+        )
+
+    # 前一失败会留下空输出目录，使用新 UUID 单独验证 ID 报告预算。
+    monkeypatch.setattr(evaluation_runtime, "MAX_REPORT_CATEGORIES", 4_096)
+    monkeypatch.setattr(evaluation_runtime, "MAX_REPORT_SAMPLE_ID_BYTES", 1)
+    run_id = uuid4()
+    with pytest.raises(EvaluationInputError, match="ID 总字节数"):
+        prepare_evaluation_workspace(
+            run_id=run_id,
+            generation=1,
+            sources=[DatasetSource("domain", dataset)],
             requested_output_path=roots["evaluation_output_root"] / str(run_id),
             **roots,
         )

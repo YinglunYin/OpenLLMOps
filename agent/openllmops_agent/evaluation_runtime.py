@@ -21,6 +21,8 @@ MAX_DATASET_RECORDS = 200_000
 MAX_REPORT_BYTES = 128 * 1024 * 1024
 MAX_REPORT_JSON_NODES = 600_000
 MAX_REPORT_CATEGORIES = 4_096
+# pair report 会同时保存 baseline/candidate 两份 ID；预留一半以上空间给 JSON 结构与分类。
+MAX_REPORT_SAMPLE_ID_BYTES = 32 * 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -303,6 +305,8 @@ def prepare_evaluation_workspace(
     try:
         with temporary.open("xb") as merged:
             seen_ids: set[str] = set()
+            seen_categories: set[str] = set()
+            sample_id_bytes = 0
             for source, source_path, matched_root in resolved_sources:
                 with _source_file(source_path) as input_file:
                     before = os.fstat(input_file.fileno())
@@ -342,6 +346,9 @@ def prepare_evaluation_workspace(
                         if merged_id in seen_ids:
                             raise EvaluationInputError(f"评测样本 ID 重复：{merged_id}")
                         seen_ids.add(merged_id)
+                        sample_id_bytes += len(merged_id.encode("utf-8"))
+                        if sample_id_bytes > MAX_REPORT_SAMPLE_ID_BYTES:
+                            raise EvaluationInputError("评测样本 ID 总字节数超过报告安全上限")
                         category = _safe_short_text(
                             row.get("category"),
                             "category",
@@ -354,8 +361,12 @@ def prepare_evaluation_workspace(
                             raise EvaluationInputError("评测数据 metadata 必须是对象")
                         if "openllmops_source" in metadata:
                             raise EvaluationInputError("评测数据 metadata 不能覆盖 openllmops_source")
+                        merged_category = f"{source.name}/{category}"
+                        seen_categories.add(merged_category)
+                        if len(seen_categories) > MAX_REPORT_CATEGORIES:
+                            raise EvaluationInputError(f"评测分类数量超过报告上限 {MAX_REPORT_CATEGORIES}")
                         row["id"] = merged_id
-                        row["category"] = f"{source.name}/{category}"
+                        row["category"] = merged_category
                         row["metadata"] = {
                             **metadata,
                             "openllmops_source": {
