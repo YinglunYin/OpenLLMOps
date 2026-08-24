@@ -32,7 +32,7 @@ OpenLLMOps 面向一台无 NVLink 的多卡 NVIDIA 服务器。控制面长期�
 
 ### 3.1 模型导入
 
-1. 用户选择 Hugging Face、ModelScope、SFTP 或人工受控目录来源。
+1. 用户选择 Hugging Face、ModelScope 或人工受控目录来源；SFTP 仅是系统外的人工传输手段。
 2. 下载或复制先进入同文件系统的暂存目录，记录来源、大小、校验和与进度。
 3. 校验器拒绝越界路径、软链接逃逸、缺失配置、非 Safetensors 权重和需要远程代码的模型。
 4. 校验通过后原子移动至只读模型仓库，并生成不可变版本记录。
@@ -63,9 +63,10 @@ GPU 租约存储在 PostgreSQL，而非进程内存。Scheduler 在事务中锁�
 ## 5. 恢复策略
 
 - 推理部署保存期望状态 `running/stopped`，控制面重启后自动恢复期望为运行的服务。
-- 训练任务在控制面重启后标记为 `interrupted`，不自动续训；管理员确认 checkpoint 后手工恢复。
+- 控制面重启后先与仍存在的训练容器按 generation 对账；容器丢失的任务进入 `failed`，训练不会自动重跑。首版不支持 checkpoint resume，需要管理员以原基础模型、数据集与配置新建任务。
 - Node Agent 重启后先盘点带 OpenLLMOps 标签的容器，再与数据库对账，禁止盲目重复创建。
-- 每次状态变化写入追加式事件表，详情页由事件重建操作时间线。
+- 当前状态、`state_version` 与 `runtime_generation` 持久化在业务记录中；管理员 HTTP 操作进入审计
+  日志。首版不提供追加式状态事件表或由事件重建的操作时间线。
 
 ## 6. 存储建议
 

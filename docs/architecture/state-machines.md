@@ -1,6 +1,7 @@
 # 任务与服务状态机
 
-状态机用于约束所有异步操作。API 只提交命令，Worker/Agent 回报事件后才能进入相应完成状态。
+状态机用于约束所有异步操作。API 写入期望状态，Reconciler 主动查询 Worker/Agent 后更新实际状态；
+首版没有 Agent 回调和追加式状态事件表。
 
 ## 模型导入
 
@@ -13,31 +14,36 @@
 
 部署的期望状态只有 `running` 与 `stopped`；实际状态为：
 
-`draft → queued → starting → running → stopping → stopped`
+`created → queued → starting → running → stopping → stopped`
 
 - `starting/running/stopping → failed`
 - 编辑运行中部署：`running → stopping → stopped → starting → running`
-- 删除：先把期望状态设为 `stopped`，实际停止后进入 `deleting → deleted`。
+- 删除：先把期望状态设为 `stopped`；确认对应 runtime 已不存在后，接口删除部署记录。
 
-删除是软删除。只要部署仍被评测或审计记录引用，就不能物理清除其元数据。
+部署删除不是软删除，但 Node Agent 只有在签名请求中的 owner、资源 ID 与 generation 都精确匹配时才
+清理终态容器；无法确认停止时保留部署记录并返回冲突。
 
 ## 训练任务
 
-`draft → queued → allocating → running → succeeded`
+`created → queued → starting → running → succeeded`
 
-- `queued/allocating/running → cancelling → cancelled`
-- `allocating/running → failed`
-- 控制面或 Agent 异常且容器无法确认时进入 `interrupted`；只有管理员可从有效 checkpoint 创建恢复尝试。
+- `created/queued/starting/running → canceling → canceled`
+- `starting/running → failed`
+- Agent 暂时失联时保留当前状态与 GPU 租约，待同 generation 的状态查询收敛；确认容器丢失后进入 `failed`，不得自动重跑。
+- 首版没有 `interrupted` 或 `resume` 状态。成功任务可导出已移除 pickle 优化器状态的安全 checkpoint，但该产物不承诺恢复训练。
 
 终止请求幂等：重复终止不会创建多个停止操作，也不会把已成功任务改为取消。
 
 ## 评测任务
 
-`draft → queued → allocating → running → aggregating → succeeded`
+`created → queued → starting → running → succeeded`
 
 - 取消与失败规则和训练任务一致。
 - 基线与候选必须使用同一数据集版本、同一评测模板和兼容的生成参数，才能生成“前后对比”。
 
-## 非法转换处理
+## 并发与非法转换处理
 
-每次状态更新携带记录版本号，使用乐观锁防止重复回调覆盖新状态。非法转换返回冲突错误并写审计日志，但不得修改当前状态。Node Agent 回调必须包含操作 ID；过期操作的回调只记录，不驱动当前修订。
+控制面动作在数据库事务中锁定目标行，并使用 `state_version`/`runtime_generation` 区分配置修订和运行
+实例。非法转换返回冲突且不修改当前状态。Node Agent 请求携带资源 ID、owner 与 generation；旧
+generation 的检查结果不能驱动当前修订。HTTP 审计记录管理员操作，但首版详情页不承诺完整的状态
+变化时间线。

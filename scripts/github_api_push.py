@@ -108,7 +108,9 @@ def request(client: httpx.Client, method: str, path: str, **kwargs: object) -> d
     if response.status_code >= 400:
         # 只展示 GitHub 的非敏感错误摘要，绝不输出请求头。
         message = response.json().get("message", response.text[:300])
-        raise SystemExit(f"GitHub API {method} {path} 失败 ({response.status_code}): {message}")
+        raise SystemExit(
+            f"GitHub API {method} {path} 失败 ({response.status_code}): {message}"
+        )
     return response.json()
 
 
@@ -154,12 +156,16 @@ def materialize_bootstrap_commit(
 ) -> str:
     """把 Contents API 的单文件引导提交重建到本地对象库。"""
 
-    blob = subprocess.run(
-        ["git", "hash-object", "-w", "--stdin"],
-        input=content,
-        capture_output=True,
-        check=True,
-    ).stdout.decode().strip()
+    blob = (
+        subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"],
+            input=content,
+            capture_output=True,
+            check=True,
+        )
+        .stdout.decode()
+        .strip()
+    )
     expected_blob = bootstrap["content"]["sha"]
     if blob != expected_blob:
         raise SystemExit(f"引导 Blob SHA 校验失败，本地 {blob}，远端 {expected_blob}")
@@ -182,7 +188,9 @@ def materialize_bootstrap_commit(
         author=Identity(
             name=commit["author"]["name"],
             email=commit["author"]["email"],
-            date=_date_with_original_timezone(commit["author"]["date"], author_timezone_hint),
+            date=_date_with_original_timezone(
+                commit["author"]["date"], author_timezone_hint
+            ),
         ),
         committer=Identity(
             name=commit["committer"]["name"],
@@ -256,7 +264,9 @@ def main() -> None:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    with httpx.Client(base_url="https://api.github.com", headers=headers, timeout=120) as client:
+    with httpx.Client(
+        base_url="https://api.github.com", headers=headers, timeout=120
+    ) as client:
         repository_response = client.get(api_root)
         if repository_response.status_code == 404 and args.create_private:
             current_user = request(client, "GET", "/user")["login"]
@@ -276,7 +286,10 @@ def main() -> None:
                     "auto_init": False,
                 },
             )
-            if repository["full_name"].casefold() != owner_repo.casefold() or not repository["private"]:
+            if (
+                repository["full_name"].casefold() != owner_repo.casefold()
+                or not repository["private"]
+            ):
                 raise SystemExit("仓库创建结果不符合预期，已停止上传")
             print(f"已创建私有仓库 {repository['full_name']}")
         elif repository_response.status_code >= 400:
@@ -385,12 +398,17 @@ def main() -> None:
                     client,
                     "POST",
                     f"{api_root}/git/blobs",
-                    json={"content": base64.b64encode(content).decode(), "encoding": "base64"},
+                    json={
+                        "content": base64.b64encode(content).decode(),
+                        "encoding": "base64",
+                    },
                 )
                 if result["sha"] != sha:
                     raise SystemExit(f"Blob SHA 校验失败: {path}")
                 uploaded.add(sha)
-            tree_entries.append({"path": path, "mode": mode, "type": "blob", "sha": sha})
+            tree_entries.append(
+                {"path": path, "mode": mode, "type": "blob", "sha": sha}
+            )
 
         tree = request(
             client,
@@ -410,7 +428,9 @@ def main() -> None:
                 tree=metadata.tree,
                 parents=(local_commit, bootstrap_commit),
                 author=Identity(metadata.author.name, metadata.author.email, now),
-                committer=Identity(metadata.committer.name, metadata.committer.email, now),
+                committer=Identity(
+                    metadata.committer.name, metadata.committer.email, now
+                ),
                 message="chore: connect GitHub API bootstrap history\n",
             )
             published_commit = create_local_commit(merge_metadata)
@@ -449,7 +469,9 @@ def main() -> None:
                 json={"ref": f"refs/heads/{args.branch}", "sha": local_commit},
             )
         try:
-            remote_url = str(git("remote", "get-url", args.remote_name)).strip().casefold()
+            remote_url = (
+                str(git("remote", "get-url", args.remote_name)).strip().casefold()
+            )
         except subprocess.CalledProcessError:
             remote_url = ""
         normalized_repository = owner_repo.casefold()

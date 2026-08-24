@@ -6,7 +6,7 @@
 
 主机需要：
 
-- 受支持的 NVIDIA 驱动；主机不必单独安装完整 CUDA Toolkit，CUDA 用户态库由固定版本容器镜像提供。
+- 受支持的 NVIDIA 内核驱动；主机不必安装 CUDA Toolkit。CUDA 运行时、cuBLAS/NCCL 等用户态库由固定容器镜像提供，NVIDIA Container Toolkit 把宿主驱动能力安全暴露给容器。
 - Docker Engine 与 Compose 2.33.1 或更高版本。
 - NVIDIA Container Toolkit，并确认普通测试容器可以枚举全部 GPU。
 - 一个只用于 OpenLLMOps 的存储根目录，不能把 `/`、用户主目录或未展开的环境变量直接作为根目录。
@@ -28,6 +28,25 @@ cp deploy/.env.example deploy/.env
 - 更新 NVIDIA 驱动或 CUDA 基础镜像前，先在 2 卡开发机完成 vLLM 单卡、双卡张量并行、Embedding 和 LLaMA-Factory QLoRA 冒烟测试。
 - RTX 4090D 没有 NVLink。多卡任务仍可能通过 PCIe/NCCL 工作，但必须显式测试；遇到 P2P 不支持时使用经验证的 NCCL 设置，不能在未测试的生产环境临时试错。
 - LLaMA-Factory 镜像必须通过已知漏洞预检。受影响版本和 `latest` 会被部署脚本拒绝。
+
+当前已审计的 vLLM `v0.27.1` 只有两种允许变体：
+
+| `CUDA_VARIANT` | 容器 CUDA | Linux 宿主驱动下限 | 镜像 tag |
+| --- | --- | --- | --- |
+| `cu130` | 13.0.2 | `580.95.05` | `vllm/vllm-openai:v0.27.1` |
+| `cu129` | 12.9.1 | `575.57.08` | `vllm/vllm-openai:v0.27.1-cu129` |
+
+这两个下限分别来自 NVIDIA [CUDA 13.0 Update 2](https://docs.nvidia.com/cuda/archive/13.0.2/cuda-toolkit-release-notes/index.html#cuda-driver) 和 [CUDA 12.9 Update 1](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-toolkit-release-notes/index.html#cuda-driver) 的官方驱动表。预检逐张 GPU 读取 `index,driver_version`，因此不会在第一张卡合格时忽略后续异常行。项目不依赖具有 JIT/新特性限制的 CUDA 小版本兼容下限。
+
+默认使用 `CUDA_VARIANT=cu130`。若机房暂时只有 R575，需在 `.env` 中同时修改下列三项，并用新基础镜像重建评测镜像：
+
+```dotenv
+CUDA_VARIANT=cu129
+VLLM_ALLOWED_IMAGES=vllm/vllm-openai:v0.27.1-cu129
+EVALUATION_VLLM_BASE_IMAGE=vllm/vllm-openai:v0.27.1-cu129
+```
+
+生产环境把 tag 替换为文档中已核验的 amd64 digest，但 `CUDA_VARIANT` 仍保留；预检会通过镜像内的 `CUDA_VERSION` 防止 digest、评测基础镜像或已构建评测镜像与声明变体不一致。
 
 ## 3. TLS 与首次启动
 
@@ -75,7 +94,7 @@ TLS_AUTO_GENERATE=true
 4. 停止 `web`、`api`、监控和 Node Agent，最后停止 PostgreSQL。
 5. 完成数据库和文件快照后，才允许移除固定容器。
 
-控制面异常重启后，期望为运行的推理服务会重新排队恢复；训练和评测不会自动重跑，管理员必须检查 checkpoint 后手工恢复。
+控制面异常重启后，期望为运行的推理服务会重新排队恢复；训练和评测不会自动重跑。仍存在的容器会按 generation 对账，已丢失任务需由管理员使用原模型、数据集和配置新建任务，首版不能从 checkpoint 恢复优化器状态。
 
 ## 6. 上线验收
 
