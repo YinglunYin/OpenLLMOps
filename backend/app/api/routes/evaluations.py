@@ -6,15 +6,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.dependencies import get_cleanup_node_agent
 from app.core.config import get_settings
 from app.core.database import get_db
-from app.models import Dataset, EvaluationRun, ModelAsset
+from app.models import Dataset, EvaluationRun
 from app.models.enums import (
     AssetStatus,
     DatasetStatus,
     DatasetType,
     DesiredJobState,
     JobState,
+    LeaseOwnerType,
     ModelKind,
 )
 from app.schemas import EvaluationRunCreate, EvaluationRunRead
@@ -24,6 +26,13 @@ from app.services.evaluation_control import (
     build_evaluation_execution,
     derive_evaluation_output_dir,
     template_for_model,
+)
+from app.services.model_assets import get_active_model_assets_for_update
+from app.services.workload_cleanup import (
+    CleanupAgentGateway,
+    WorkloadCleanupBlocked,
+    WorkloadCleanupUnavailable,
+    confirm_absent_and_release_leases,
 )
 
 router = APIRouter(prefix="/evaluation-runs", tags=["模型评测"])
@@ -39,8 +48,15 @@ async def create_evaluation_run(
     invalid = [gpu_id for gpu_id in payload.gpu_ids if gpu_id >= settings.gpu_count]
     if invalid:
         raise HTTPException(status_code=422, detail=f"GPU 编号超出本机范围：{invalid}")
-    base = await get_or_404(session, ModelAsset, payload.base_model_asset_id, "基线模型")
-    candidate = await get_or_404(session, ModelAsset, payload.candidate_model_asset_id, "候选模型")
+    assets = await get_active_model_assets_for_update(
+        session,
+        {
+            payload.base_model_asset_id: "基线模型",
+            payload.candidate_model_asset_id: "候选模型",
+        },
+    )
+    base = assets[payload.base_model_asset_id]
+    candidate = assets[payload.candidate_model_asset_id]
     if base.status != AssetStatus.READY or candidate.status != AssetStatus.READY:
         raise HTTPException(status_code=422, detail="基线模型和候选模型必须处于 ready 状态")
     if ModelKind.EMBEDDING in {base.model_kind, candidate.model_kind}:
@@ -131,10 +147,29 @@ async def cancel_evaluation_run(
 async def delete_evaluation_run(
     run_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
+    agent: CleanupAgentGateway | None = Depends(get_cleanup_node_agent),
 ) -> Response:
-    run = await get_or_404(session, EvaluationRun, run_id, "评测任务")
+    run = await session.get(EvaluationRun, run_id, with_for_update=True)
+    if run is None:
+        raise HTTPException(status_code=404, detail="评测任务不存在")
     if run.actual_state not in TERMINAL_STATES:
         raise HTTPException(status_code=409, detail="只能删除已结束的评测任务")
+    if agent is None:
+        raise HTTPException(status_code=503, detail="未配置 node-agent HMAC 密钥，无法确认容器 absent")
+    try:
+        await confirm_absent_and_release_leases(
+            session,
+            agent,
+            owner_type=LeaseOwnerType.EVALUATION,
+            owner_id=run.id,
+            owner_name=run.name,
+            generation=run.runtime_generation or run.state_version,
+            gpu_ids=run.gpu_ids,
+        )
+    except WorkloadCleanupUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except WorkloadCleanupBlocked as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     await session.delete(run)
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

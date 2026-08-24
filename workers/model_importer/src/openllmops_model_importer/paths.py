@@ -45,4 +45,3 @@ def iter_regular_files(root: Path) -> Iterator[tuple[Path, Path]]:
             if not resolved.is_relative_to(root):
                 raise UnsafePathError(f"文件越过受控目录: {path.relative_to(root)}")
             yield path, path.relative_to(root)
-

@@ -11,9 +11,19 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from .downloaders import download_huggingface, download_modelscope
+from .downloaders import (
+    DownloadCancelledError,
+    DownloadResult,
+    download_huggingface,
+    download_modelscope,
+)
 from .paths import UnsafePathError, iter_regular_files, resolve_inside
-from .validation import ModelManifest, validate_model_directory
+from .validation import (
+    GENERATED_MANIFEST_NAME,
+    ModelManifest,
+    ModelValidationCancelled,
+    validate_model_directory,
+)
 
 ProgressCallback = Callable[[str, int, int | None], None]
 CancelCallback = Callable[[], bool]
@@ -49,7 +59,9 @@ class ModelImporter:
             raise ValueError("暂存目录与模型仓库必须位于同一文件系统")
 
     @staticmethod
-    def _notify(callback: ProgressCallback | None, stage: str, done: int, total: int | None) -> None:
+    def _notify(
+        callback: ProgressCallback | None, stage: str, done: int, total: int | None
+    ) -> None:
         if callback:
             callback(stage, done, total)
 
@@ -103,6 +115,7 @@ class ModelImporter:
         staging.mkdir(mode=0o750)
 
         try:
+            download_result: DownloadResult | None = None
             self._check_cancelled(cancelled)
             if request.source == ModelSource.CONTROLLED_DIRECTORY:
                 if request.source_directory is None:
@@ -113,31 +126,54 @@ class ModelImporter:
             elif request.source == ModelSource.HUGGINGFACE:
                 if not request.repository:
                     raise ValueError("Hugging Face 导入必须提供 repository")
-                download_huggingface(
-                    request.repository, request.revision, staging, request.access_token
+                download_result = download_huggingface(
+                    request.repository,
+                    request.revision,
+                    staging,
+                    request.access_token,
+                    progress=progress,
+                    cancelled=cancelled,
                 )
             elif request.source == ModelSource.MODELSCOPE:
                 if not request.repository:
                     raise ValueError("ModelScope 导入必须提供 repository")
-                download_modelscope(
-                    request.repository, request.revision, staging, request.access_token
+                download_result = download_modelscope(
+                    request.repository,
+                    request.revision,
+                    staging,
+                    request.access_token,
+                    progress=progress,
+                    cancelled=cancelled,
                 )
             else:  # pragma: no cover - StrEnum 已限制取值，保留防御性分支
                 raise ValueError(f"不支持的模型来源: {request.source}")
 
             self._check_cancelled(cancelled)
-            self._notify(progress, "validating", 0, None)
-            manifest = validate_model_directory(staging)
-            (staging / "openllmops-manifest.json").write_text(
+            manifest = validate_model_directory(
+                staging,
+                progress=progress,
+                cancelled=cancelled,
+                requested_revision=(
+                    request.revision
+                    if request.source in {ModelSource.HUGGINGFACE, ModelSource.MODELSCOPE}
+                    else None
+                ),
+                resolved_revision=(
+                    download_result.resolved_revision if download_result is not None else None
+                ),
+            )
+            self._check_cancelled(cancelled)
+            (staging / GENERATED_MANIFEST_NAME).write_text(
                 json.dumps(manifest.as_dict(), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             # 清单 fsync 后再原子改名，避免掉电后出现名义 ready、内容未落盘的目录。
-            manifest_fd = os.open(staging / "openllmops-manifest.json", os.O_RDONLY)
+            manifest_fd = os.open(staging / GENERATED_MANIFEST_NAME, os.O_RDONLY)
             try:
                 os.fsync(manifest_fd)
             finally:
                 os.close(manifest_fd)
+            self._check_cancelled(cancelled)
             os.replace(staging, final)
             store_fd = os.open(self.store_root, os.O_RDONLY)
             try:
@@ -146,6 +182,10 @@ class ModelImporter:
                 os.close(store_fd)
             self._notify(progress, "ready", manifest.total_size_bytes, manifest.total_size_bytes)
             return final, manifest
+        except (DownloadCancelledError, ModelValidationCancelled) as exc:
+            if staging.exists():
+                shutil.rmtree(staging)
+            raise ImportCancelledError(str(exc)) from exc
         except Exception:
             # 删除范围由 import_id 精确确定且已经验证在 staging_root 下，不接收外部路径。
             if staging.exists():

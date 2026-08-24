@@ -98,6 +98,11 @@ class WorkloadInfo(StrictModel):
     port: int | None = None
     generation: int = Field(default=1, ge=1)
     exit_code: int | None = None
+    health_status: Literal["starting", "healthy", "unhealthy"] | None = None
+    health_failing_streak: int = Field(default=0, ge=0)
+    restart_count: int = Field(default=0, ge=0)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     created_at: datetime | None = None
 
 

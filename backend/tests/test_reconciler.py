@@ -51,6 +51,7 @@ class FakeAgent:
                 "endpoint": "http://127.0.0.1:18000/v1",
                 "port": 18000,
                 "service_type": command.execution.get("service_type", "generate"),
+                "health_status": "healthy",
             }
         return AgentCommandResponse(
             request_id=command.request_id,
@@ -80,7 +81,11 @@ class UncertainStartAgent(FakeAgent):
             accepted=True,
             observed_state=state,
             observed_at=datetime.now(UTC),
-            metadata={"endpoint": "http://127.0.0.1:18000/v1", "port": 18000}
+            metadata={
+                "endpoint": "http://127.0.0.1:18000/v1",
+                "port": 18000,
+                "health_status": "healthy",
+            }
             if command.owner.type == LeaseOwnerType.DEPLOYMENT
             else {},
         )
@@ -97,6 +102,57 @@ class RejectStartAgent(FakeAgent):
             message="GPU 与节点已有工作负载冲突",
             error_code="gpu_conflict",
         )
+
+
+class LoadingThenHealthyAgent(FakeAgent):
+    async def execute(self, command: AgentCommand) -> AgentCommandResponse:
+        self.commands.append(command)
+        key = (command.owner.type, command.owner.id, command.owner.generation)
+        if command.action == AgentAction.START:
+            self.states[key] = AgentWorkloadState.STARTING
+        elif command.action == AgentAction.STATUS and self.states.get(key) == AgentWorkloadState.STARTING:
+            self.states[key] = AgentWorkloadState.RUNNING
+        elif command.action == AgentAction.STOP:
+            self.states[key] = AgentWorkloadState.ABSENT
+        state = self.states.get(key, AgentWorkloadState.ABSENT)
+        metadata = {}
+        if command.owner.type == LeaseOwnerType.DEPLOYMENT:
+            if state == AgentWorkloadState.STARTING:
+                metadata = {"health_status": "starting"}
+            elif state == AgentWorkloadState.RUNNING:
+                metadata = {
+                    "health_status": "healthy",
+                    "endpoint": "http://127.0.0.1:18000/v1",
+                    "port": 18000,
+                }
+        return AgentCommandResponse(
+            request_id=command.request_id,
+            accepted=True,
+            observed_state=state,
+            observed_at=datetime.now(UTC),
+            metadata=metadata,
+        )
+
+
+class SharedContainerPortAgent(FakeAgent):
+    async def execute(self, command: AgentCommand) -> AgentCommandResponse:
+        response = await super().execute(command)
+        if (
+            command.owner.type == LeaseOwnerType.DEPLOYMENT
+            and response.observed_state == AgentWorkloadState.RUNNING
+        ):
+            # 两个隔离容器都监听 8000，但通过不同容器地址访问。
+            return response.model_copy(
+                update={
+                    "metadata": {
+                        "endpoint": f"http://deployment-{command.owner.id}:8000/v1",
+                        "port": 8000,
+                        "service_type": command.execution.get("service_type", "generate"),
+                        "health_status": "healthy",
+                    }
+                }
+            )
+        return response
 
 
 async def _seed_deployment_and_training(factory):  # type: ignore[no-untyped-def]
@@ -164,6 +220,137 @@ async def _seed_deployment_and_training(factory):  # type: ignore[no-untyped-def
         session.add_all([deployment, training])
         await session.flush()
         return deployment.id, training.id
+
+
+async def _seed_parallel_deployments(factory):  # type: ignore[no-untyped-def]
+    settings = get_settings()
+    model_path = settings.model_root / f"parallel-{uuid.uuid4()}"
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text('{"model_type":"qwen2"}', encoding="utf-8")
+    (model_path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    header = json.dumps(
+        {"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}},
+        separators=(",", ":"),
+    ).encode()
+    (model_path / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + b"\0\0\0\0")
+
+    queued_at = datetime(2026, 8, 24, tzinfo=UTC)
+    async with factory() as session, session.begin():
+        asset = ModelAsset(
+            name=f"parallel-base-{uuid.uuid4()}",
+            source_type=ModelSourceType.MANUAL,
+            local_path=str(model_path),
+            model_kind=ModelKind.BASE,
+            status=AssetStatus.READY,
+        )
+        session.add(asset)
+        await session.flush()
+        deployments = [
+            Deployment(
+                name=f"parallel-{gpu_id}",
+                served_model_name=f"parallel-model-{gpu_id}",
+                model_asset_id=asset.id,
+                task_type=DeploymentTaskType.GENERATE,
+                desired_state=DesiredServiceState.RUNNING,
+                actual_state=DeploymentState.QUEUED,
+                gpu_ids=[gpu_id],
+                tensor_parallel_size=1,
+                queued_at=queued_at + timedelta(seconds=gpu_id),
+            )
+            for gpu_id in (0, 1)
+        ]
+        session.add_all(deployments)
+        await session.flush()
+        return [deployment.id for deployment in deployments]
+
+
+async def test_parallel_deployments_can_share_container_port(
+    isolated_session_factory,
+) -> None:
+    deployment_ids = await _seed_parallel_deployments(isolated_session_factory)
+    reconciler = StateReconciler(
+        isolated_session_factory,
+        SharedContainerPortAgent(),
+        GPULeaseManager(ttl_seconds=30),
+    )
+
+    report = await reconciler.run_once()
+
+    assert report.scheduled == 2 and report.agent_errors == 0
+    async with isolated_session_factory() as session:
+        deployments = [await session.get(Deployment, item_id) for item_id in deployment_ids]
+        assert all(item is not None for item in deployments)
+        assert [item.actual_state for item in deployments if item] == [
+            DeploymentState.RUNNING,
+            DeploymentState.RUNNING,
+        ]
+        assert [item.port for item in deployments if item] == [8000, 8000]
+        assert len({item.internal_url for item in deployments if item}) == 2
+        assert len(list(await session.scalars(select(GPULease)))) == 2
+
+
+async def test_deployment_health_and_started_at_follow_current_runtime(
+    isolated_session_factory,
+) -> None:
+    deployment_id, training_id = await _seed_deployment_and_training(isolated_session_factory)
+    async with isolated_session_factory() as session, session.begin():
+        training = await session.get(TrainingJob, training_id)
+        assert training is not None
+        training.actual_state = JobState.CANCELED
+
+    current_time = datetime(2026, 8, 24, 10, 0, tzinfo=UTC)
+    agent = LoadingThenHealthyAgent()
+    reconciler = StateReconciler(
+        isolated_session_factory,
+        agent,
+        GPULeaseManager(ttl_seconds=30),
+        clock=lambda: current_time,
+    )
+
+    await reconciler.run_once()
+    async with isolated_session_factory() as session:
+        deployment = await session.get(Deployment, deployment_id)
+        assert deployment is not None
+        assert deployment.actual_state == DeploymentState.STARTING
+        assert deployment.health_status == "starting"
+        assert deployment.started_at is None
+
+    current_time = datetime(2026, 8, 24, 10, 5, tzinfo=UTC)
+    await reconciler.run_once()
+    async with isolated_session_factory() as session:
+        deployment = await session.get(Deployment, deployment_id)
+        assert deployment is not None
+        assert deployment.actual_state == DeploymentState.RUNNING
+        assert deployment.health_status == "healthy"
+        # SQLite 测试方言会丢失 timezone 标记；生产 PostgreSQL 仍保存 timestamptz。
+        assert deployment.started_at is not None
+        assert deployment.started_at.replace(tzinfo=UTC) == current_time
+        first_started_at = deployment.started_at
+
+    # 周期性 STATUS 只刷新健康状态和租约心跳，不应把启动时间变成“最后轮询时间”。
+    current_time = datetime(2026, 8, 24, 11, 0, tzinfo=UTC)
+    await reconciler.run_once()
+    async with isolated_session_factory() as session:
+        deployment = await session.get(Deployment, deployment_id)
+        assert deployment is not None
+        assert deployment.started_at == first_started_at
+        assert deployment.health_status == "healthy"
+
+    async with isolated_session_factory() as session, session.begin():
+        deployment = await session.get(Deployment, deployment_id)
+        assert deployment is not None
+        deployment.desired_state = DesiredServiceState.STOPPED
+        deployment.actual_state = DeploymentState.STOPPING
+        deployment.state_version += 1
+    await reconciler.run_once()
+    async with isolated_session_factory() as session:
+        deployment = await session.get(Deployment, deployment_id)
+        assert deployment is not None
+        assert deployment.actual_state == DeploymentState.STOPPED
+        assert deployment.health_status is None
+        # 已停止时仍保留最近一轮的启动时间，便于管理员追溯。
+        assert deployment.started_at == first_started_at
 
 
 async def test_fifo_and_training_never_preempts_inference(isolated_session_factory) -> None:
@@ -310,4 +497,5 @@ async def test_explicit_start_rejection_fails_and_releases_lease(
         deployment = await session.get(Deployment, deployment_id)
         assert deployment is not None and deployment.actual_state == DeploymentState.FAILED
         assert "GPU" in (deployment.error_message or "")
+        assert deployment.health_status is None and deployment.internal_url is None
         assert list(await session.scalars(select(GPULease))) == []

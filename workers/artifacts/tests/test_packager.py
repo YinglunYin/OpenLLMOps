@@ -53,6 +53,4 @@ def test_rejects_output_outside_artifact_root(tmp_path: Path) -> None:
     artifact_root.mkdir()
 
     with pytest.raises(ArtifactPackagingError, match="不在受控"):
-        create_checkpoint_archive(
-            source, tmp_path / "escaped.tar.gz", artifact_root=artifact_root
-        )
+        create_checkpoint_archive(source, tmp_path / "escaped.tar.gz", artifact_root=artifact_root)

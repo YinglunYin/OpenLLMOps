@@ -51,6 +51,8 @@ HISTORY_METRICS: dict[GPUHistoryMetric, tuple[str, str]] = {
     GPUHistoryMetric.POWER_WATTS: (DCGM_POWER_USAGE, "W"),
 }
 GPU_INDEX_PATTERN = re.compile(r"^[0-9]+$")
+UNMANAGED_MEMORY_THRESHOLD_MIB = 512
+UNMANAGED_UTILIZATION_THRESHOLD = 1
 
 
 def _parse_gpu_index(labels: dict[str, str]) -> int:
@@ -154,6 +156,18 @@ def _build_gpu_status(
     elif degraded_reason is None:
         degraded_reason = f"未收到 GPU {gpu_index} 的 DCGM 指标"
 
+    if lease is not None:
+        resource_state = "leased"
+    elif not telemetry_available:
+        # 没有租约且遥测不可用时不能宣称空闲；节点启动前仍会用 NVML 做最终门禁。
+        resource_state = "unknown"
+    elif (used or 0) >= UNMANAGED_MEMORY_THRESHOLD_MIB or (
+        values.get(DCGM_GPU_UTIL) or 0
+    ) >= UNMANAGED_UTILIZATION_THRESHOLD:
+        resource_state = "unmanaged"
+    else:
+        resource_state = "idle"
+
     return GPUStatusRead(
         index=gpu_index,
         name=name,
@@ -165,6 +179,7 @@ def _build_gpu_status(
         power_watts=values.get(DCGM_POWER_USAGE),
         telemetry_available=telemetry_available,
         degraded_reason=degraded_reason,
+        resource_state=resource_state,
         owner_type=lease.owner_type if lease else None,
         owner_id=lease.owner_id if lease else None,
         owner_name=lease.owner_name if lease else None,

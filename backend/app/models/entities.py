@@ -57,6 +57,7 @@ class ModelAsset(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     checksum: Mapped[str | None] = mapped_column(String(128))
     error_message: Mapped[str | None] = mapped_column(Text)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class ModelImportJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -125,10 +126,15 @@ class Deployment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     gpu_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     tensor_parallel_size: Mapped[int] = mapped_column(Integer, default=1)
-    port: Mapped[int | None] = mapped_column(Integer, unique=True)
+    # 端口属于各自隔离的容器网络命名空间；多个部署可同时监听相同容器端口。
+    port: Mapped[int | None] = mapped_column(Integer)
     internal_url: Mapped[str | None] = mapped_column(String(512))
     simplified_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     vllm_args: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # 健康状态来自 node-agent 的容器 healthcheck，只保存公开语义，不保存探测地址。
+    health_status: Mapped[str | None] = mapped_column(String(32))
+    # 表示当前（或最近一轮）实例首次进入 running 的时间，不随轮询刷新。
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
     queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     state_version: Mapped[int] = mapped_column(Integer, default=1)

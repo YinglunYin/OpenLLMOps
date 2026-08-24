@@ -1,6 +1,7 @@
 import os
 import tempfile
-from collections.abc import Iterator
+import uuid
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -36,8 +37,10 @@ os.environ.update(
     }
 )
 
+from app.core.database import AsyncSessionFactory
 from app.main import app
-from app.models import Base
+from app.models import Base, ModelAsset
+from app.models.enums import AssetStatus, ModelKind, ModelSourceType
 
 
 @pytest.fixture(scope="session")
@@ -50,6 +53,40 @@ def client() -> Iterator[TestClient]:
 @pytest.fixture(scope="session")
 def test_root() -> Path:
     return TEST_ROOT
+
+
+@pytest.fixture
+def seed_model_asset(client: TestClient) -> Callable[..., dict[str, str]]:
+    """测试专用数据库种子，不经过已从生产 API 移除的通用资产写入口。"""
+
+    def seed(
+        path: Path,
+        *,
+        kind: ModelKind | str = ModelKind.BASE,
+        name: str | None = None,
+    ) -> dict[str, str]:
+        async def persist() -> dict[str, str]:
+            async with AsyncSessionFactory() as session, session.begin():
+                asset = ModelAsset(
+                    name=name or f"test-model-{uuid.uuid4()}",
+                    source_type=ModelSourceType.MANUAL,
+                    local_path=str(path),
+                    model_kind=ModelKind(kind),
+                    status=AssetStatus.READY,
+                )
+                session.add(asset)
+                await session.flush()
+                return {
+                    "id": str(asset.id),
+                    "name": asset.name,
+                    "local_path": asset.local_path,
+                    "model_kind": asset.model_kind.value,
+                }
+
+        assert client.portal is not None
+        return client.portal.call(persist)
+
+    return seed
 
 
 @pytest_asyncio.fixture

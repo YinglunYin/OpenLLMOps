@@ -1,6 +1,9 @@
 import hashlib
 import json
 import os
+import re
+import stat
+import time
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -13,9 +16,51 @@ from app.models.enums import DatasetType
 MAX_DATASET_BYTES = 5 * 1024 * 1024 * 1024
 MAX_LINE_BYTES = 16 * 1024 * 1024
 MAX_REPORTED_ERRORS = 20
+MAX_SCHEMA_FIELDS = 256
+MAX_FIELD_NAME_LENGTH = 128
+MAX_TRAINING_RECORDS = 10_000_000
 MAX_EVALUATION_SOURCE_FIELD_LENGTH = 191
 MAX_EVALUATION_DATASET_BYTES = 256 * 1024 * 1024
 MAX_EVALUATION_RECORDS = 200_000
+STALE_UPLOAD_PART_AGE_SECONDS = 24 * 60 * 60
+UPLOAD_PART_NAME_PATTERN = re.compile(
+    r"^\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.jsonl\.part$"
+)
+
+
+def cleanup_stale_upload_parts(
+    dataset_root: Path,
+    *,
+    older_than_seconds: int = STALE_UPLOAD_PART_AGE_SECONDS,
+    now: float | None = None,
+) -> int:
+    """清理进程被强杀后遗留的严格命名上传临时文件。
+
+    只处理本系统 UUIDv4 命名、普通且非符号链接的文件，并设置 24 小时安全时龄，
+    避免误删管理员文件或另一个仍在上传的实例。
+    """
+
+    if older_than_seconds < 0:
+        raise ValueError("临时文件安全时龄不能为负数")
+    cutoff = (time.time() if now is None else now) - older_than_seconds
+    removed = 0
+    try:
+        entries = list(os.scandir(dataset_root))
+    except FileNotFoundError:
+        return 0
+    for entry in entries:
+        if not UPLOAD_PART_NAME_PATTERN.fullmatch(entry.name):
+            continue
+        try:
+            file_stat = entry.stat(follow_symlinks=False)
+            if not stat.S_ISREG(file_stat.st_mode) or entry.is_symlink() or file_stat.st_mtime > cutoff:
+                continue
+            Path(entry.path).unlink()
+            removed += 1
+        except (FileNotFoundError, PermissionError, OSError):
+            # 并发清理或单个损坏目录项不应阻塞控制面启动。
+            continue
+    return removed
 
 
 def _record_error(errors: list[dict[str, Any]], line: int, message: str) -> None:
@@ -119,19 +164,34 @@ def validate_and_store_jsonl(
     temporary_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with temporary_path.open("wb") as target:
-            for line_number, raw_line in enumerate(source, start=1):
+            line_number = 0
+            byte_limit = (
+                MAX_EVALUATION_DATASET_BYTES if dataset_type == DatasetType.EVALUATION else MAX_DATASET_BYTES
+            )
+            line_limit = (
+                MAX_EVALUATION_LINE_BYTES if dataset_type == DatasetType.EVALUATION else MAX_LINE_BYTES
+            )
+            while True:
+                # BinaryIO 的普通迭代会先把整条物理行读入内存，攻击者可用单条数 GiB
+                # JSONL 触发 OOM。每次最多读取“业务上限 + 1”字节，超长行再分块排空。
+                raw_line = source.readline(line_limit + 1)
+                if not raw_line:
+                    break
+                line_number += 1
                 total_bytes += len(raw_line)
-                byte_limit = (
-                    MAX_EVALUATION_DATASET_BYTES
-                    if dataset_type == DatasetType.EVALUATION
-                    else MAX_DATASET_BYTES
-                )
                 if total_bytes > byte_limit:
                     raise ValueError(f"数据集超过 {byte_limit} 字节限制")
-                line_limit = (
-                    MAX_EVALUATION_LINE_BYTES if dataset_type == DatasetType.EVALUATION else MAX_LINE_BYTES
-                )
                 if len(raw_line) > line_limit:
+                    # readline(size) 截断后必须排空到下一换行，否则一条恶意长行会被
+                    # 错当成多条记录；排空本身同样受单次块大小和总文件上限约束。
+                    while not raw_line.endswith(b"\n"):
+                        drained = source.readline(min(1024 * 1024, line_limit + 1))
+                        if not drained:
+                            break
+                        total_bytes += len(drained)
+                        if total_bytes > byte_limit:
+                            raise ValueError(f"数据集超过 {byte_limit} 字节限制")
+                        raw_line = drained
                     _record_error(errors, line_number, f"单行超过 {line_limit} 字节限制")
                     continue
 
@@ -155,8 +215,25 @@ def validate_and_store_jsonl(
                 record_count += 1
                 if dataset_type == DatasetType.EVALUATION and record_count > MAX_EVALUATION_RECORDS:
                     raise ValueError("评测数据集有效记录数超过 200000")
+                if dataset_type != DatasetType.EVALUATION and record_count > MAX_TRAINING_RECORDS:
+                    raise ValueError(f"训练数据集有效记录数超过 {MAX_TRAINING_RECORDS}")
                 if isinstance(item, dict):
-                    field_names.update(str(key) for key in item)
+                    for key in item:
+                        if len(key) > MAX_FIELD_NAME_LENGTH:
+                            _record_error(
+                                errors,
+                                line_number,
+                                f"字段名超过 {MAX_FIELD_NAME_LENGTH} 字符限制",
+                            )
+                            continue
+                        if key not in field_names and len(field_names) >= MAX_SCHEMA_FIELDS:
+                            _record_error(
+                                errors,
+                                line_number,
+                                f"全文件字段种类超过 {MAX_SCHEMA_FIELDS} 限制",
+                            )
+                            continue
+                        field_names.add(key)
                 if dataset_type == DatasetType.EVALUATION and isinstance(item, dict):
                     try:
                         sample = parse_evaluation_row(item, line_number)

@@ -2,15 +2,24 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import anyio
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import make_asgi_app
+from starlette.exceptions import HTTPException
 
 from app.api.router import root_router
 from app.core.config import get_settings
 from app.core.database import AsyncSessionFactory, create_all_tables, dispose_engine, engine
+from app.core.early_auth import early_large_upload_auth_middleware
+from app.core.errors import (
+    openllmops_http_exception_handler,
+    openllmops_validation_exception_handler,
+)
 from app.core.metrics import metrics_middleware
 from app.core.request_context import request_context_and_audit_middleware
+from app.services.dataset_files import cleanup_stale_upload_parts
 from app.services.gpu_scheduler import GPULeaseManager
 from app.services.model_import_coordinator import (
     ModelImportCoordinator,
@@ -26,6 +35,8 @@ settings = get_settings()
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if settings.auto_create_tables:
         await create_all_tables()
+    # SIGKILL 无法执行请求 finally；启动时只回收超过安全时龄的本系统上传临时文件。
+    await anyio.to_thread.run_sync(cleanup_stale_upload_parts, settings.dataset_root)
     stop_event: asyncio.Event | None = None
     reconciler_task: asyncio.Task[None] | None = None
     import_stop_event: asyncio.Event | None = None
@@ -98,6 +109,8 @@ app = FastAPI(
     docs_url="/docs" if settings.environment != "production" else None,
     redoc_url=None,
 )
+app.add_exception_handler(HTTPException, openllmops_http_exception_handler)
+app.add_exception_handler(RequestValidationError, openllmops_validation_exception_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -113,6 +126,7 @@ app.add_middleware(
     ],
     expose_headers=[settings.request_id_header],
 )
+app.middleware("http")(early_large_upload_auth_middleware)
 app.middleware("http")(metrics_middleware)
 app.middleware("http")(request_context_and_audit_middleware)
 app.include_router(root_router)

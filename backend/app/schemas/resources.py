@@ -28,6 +28,7 @@ from app.schemas.evaluation import (
     EvaluationWarning,
 )
 from app.schemas.training import TrainingParameters
+from app.schemas.vllm import validate_vllm_arguments
 
 
 class ModelAssetCreate(BaseModel):
@@ -47,14 +48,9 @@ class ModelAssetCreate(BaseModel):
 
 
 class ModelAssetUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str | None = Field(default=None, min_length=1, max_length=128)
-    status: AssetStatus | None = None
-    family: str | None = Field(default=None, max_length=128)
-    parameter_count: int | None = Field(default=None, ge=0)
-    size_bytes: int | None = Field(default=None, ge=0)
-    checksum: str | None = Field(default=None, max_length=128)
-    error_message: str | None = None
-    metadata_json: dict[str, Any] | None = None
 
 
 class ModelAssetRead(TimestampedModel):
@@ -96,13 +92,9 @@ class DatasetCreate(BaseModel):
 
 
 class DatasetUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str | None = Field(default=None, min_length=1, max_length=128)
-    status: DatasetStatus | None = None
-    record_count: int | None = Field(default=None, ge=0)
-    size_bytes: int | None = Field(default=None, ge=0)
-    sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
-    schema_summary: dict[str, Any] | None = None
-    validation_errors: list[dict[str, Any]] | None = None
     description: str | None = None
 
 
@@ -132,15 +124,28 @@ SYSTEM_MANAGED_VLLM_ARGS = {
 }
 
 
+class DeploymentSimplifiedConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    max_model_len: int | None = Field(default=None, ge=1024, le=131_072)
+    gpu_memory_utilization: float | None = Field(default=None, ge=0.1, le=0.98)
+    dtype: Literal["auto", "float16", "bfloat16"] | None = None
+
+
 class DeploymentCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=128)
-    served_model_name: str = Field(min_length=1, max_length=128)
+    served_model_name: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$",
+    )
     model_asset_id: uuid.UUID
     task_type: DeploymentTaskType
     gpu_ids: list[int] = Field(default_factory=lambda: [0], min_length=1)
     tensor_parallel_size: int = Field(default=1, ge=1, le=32)
-    port: int | None = Field(default=None, ge=1024, le=65535)
-    simplified_config: dict[str, Any] = Field(default_factory=dict)
+    simplified_config: DeploymentSimplifiedConfig = Field(default_factory=DeploymentSimplifiedConfig)
     vllm_args: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -153,15 +158,17 @@ class DeploymentCreate(BaseModel):
         blocked = normalized_keys & SYSTEM_MANAGED_VLLM_ARGS
         if blocked:
             raise ValueError(f"以下 vLLM 参数由系统管理，不能覆盖：{', '.join(sorted(blocked))}")
+        validate_vllm_arguments(self.vllm_args)
         return self
 
 
 class DeploymentUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str | None = Field(default=None, min_length=1, max_length=128)
     gpu_ids: list[int] | None = Field(default=None, min_length=1)
     tensor_parallel_size: int | None = Field(default=None, ge=1, le=32)
-    port: int | None = Field(default=None, ge=1024, le=65535)
-    simplified_config: dict[str, Any] | None = None
+    simplified_config: DeploymentSimplifiedConfig | None = None
     vllm_args: dict[str, Any] | None = None
 
     @model_validator(mode="after")
@@ -181,6 +188,7 @@ class DeploymentUpdate(BaseModel):
             blocked = normalized & SYSTEM_MANAGED_VLLM_ARGS
             if blocked:
                 raise ValueError(f"以下 vLLM 参数由系统管理，不能覆盖：{', '.join(sorted(blocked))}")
+            validate_vllm_arguments(self.vllm_args)
         return self
 
 
@@ -193,10 +201,10 @@ class DeploymentRead(TimestampedModel):
     actual_state: DeploymentState
     gpu_ids: list[int]
     tensor_parallel_size: int
-    port: int | None
-    internal_url: str | None
     simplified_config: dict[str, Any]
     vllm_args: dict[str, Any]
+    health_status: Literal["starting", "healthy", "unhealthy"] | None
+    started_at: datetime | None
     error_message: str | None
     queued_at: datetime | None
     state_version: int

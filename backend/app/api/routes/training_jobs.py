@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.background import BackgroundTask
 
+from app.api.dependencies import get_cleanup_node_agent
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.models import Dataset, ModelAsset, TrainingJob
@@ -18,6 +19,7 @@ from app.models.enums import (
     DatasetType,
     DesiredJobState,
     JobState,
+    LeaseOwnerType,
     ModelKind,
     ModelSourceType,
     TrainingStage,
@@ -31,6 +33,7 @@ from app.schemas import (
     TrainingJobRead,
 )
 from app.services.crud import commit_or_conflict, get_or_404
+from app.services.model_assets import get_active_model_asset
 from app.services.training_control import (
     TrainingControlError,
     build_training_archive,
@@ -38,6 +41,12 @@ from app.services.training_control import (
     derive_training_output_dir,
     list_training_artifacts,
     publish_training_model_files,
+)
+from app.services.workload_cleanup import (
+    CleanupAgentGateway,
+    WorkloadCleanupBlocked,
+    WorkloadCleanupUnavailable,
+    confirm_absent_and_release_leases,
 )
 
 router = APIRouter(prefix="/training-jobs", tags=["模型训练"])
@@ -53,7 +62,7 @@ async def create_training_job(
     invalid_gpu_ids = [gpu_id for gpu_id in payload.gpu_ids if gpu_id >= settings.gpu_count]
     if invalid_gpu_ids:
         raise HTTPException(status_code=422, detail=f"GPU 编号超出本机范围：{invalid_gpu_ids}")
-    asset = await get_or_404(session, ModelAsset, payload.model_asset_id, "模型资产")
+    asset = await get_active_model_asset(session, payload.model_asset_id, for_update=True)
     dataset = await get_or_404(session, Dataset, payload.dataset_id, "数据集")
     if asset.status != AssetStatus.READY or dataset.status != DatasetStatus.READY:
         raise HTTPException(status_code=422, detail="模型资产和数据集必须处于 ready 状态")
@@ -263,10 +272,29 @@ async def terminate_training_job(
 async def delete_training_job(
     job_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
+    agent: CleanupAgentGateway | None = Depends(get_cleanup_node_agent),
 ) -> Response:
-    job = await get_or_404(session, TrainingJob, job_id, "训练任务")
+    job = await session.get(TrainingJob, job_id, with_for_update=True)
+    if job is None:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
     if job.actual_state not in TERMINAL_STATES:
         raise HTTPException(status_code=409, detail="只能删除已结束的训练任务")
+    if agent is None:
+        raise HTTPException(status_code=503, detail="未配置 node-agent HMAC 密钥，无法确认容器 absent")
+    try:
+        await confirm_absent_and_release_leases(
+            session,
+            agent,
+            owner_type=LeaseOwnerType.TRAINING,
+            owner_id=job.id,
+            owner_name=job.name,
+            generation=job.runtime_generation or job.state_version,
+            gpu_ids=job.gpu_ids,
+        )
+    except WorkloadCleanupUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except WorkloadCleanupBlocked as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     await session.delete(job)
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

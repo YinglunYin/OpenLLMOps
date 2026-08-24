@@ -208,6 +208,10 @@ async def require_api_key(
 async def require_admin_auth(request: Request) -> AdminIdentity:
     """管理面仅接受 bootstrap 管理员密钥或已签名浏览器会话。"""
 
+    existing = getattr(request.state, "admin_identity", None)
+    if isinstance(existing, AdminIdentity):
+        return existing
+
     settings = get_settings()
     if not settings.auth_enabled:
         identity = AdminIdentity(username=settings.admin_username, auth_method="disabled")

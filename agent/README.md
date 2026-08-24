@@ -8,7 +8,7 @@ node-agent 是单机 GPU 节点的最小特权执行面。控制面负责期望�
 
 | 方法 | 路径 | 鉴权 | 作用 |
 | --- | --- | --- | --- |
-| `POST` | `/v1/workloads/commands` | 双向 HMAC | 幂等执行 `start`、`stop`、`status` |
+| `POST` | `/v1/workloads/commands` | 双向 HMAC | 幂等执行 `start`、`stop`、`status` 及终态清理 |
 | `GET` | `/v1/gpus` | `X-Node-Agent-Token` | NVML 指标与当前整卡分配 |
 | `GET` | `/v1/workloads` | `X-Node-Agent-Token` | 列出受管容器 |
 | `GET` | `/v1/workloads/{name}` | `X-Node-Agent-Token` | 查看受管容器 |
@@ -27,15 +27,25 @@ node-agent 是单机 GPU 节点的最小特权执行面。控制面负责期望�
 
 `start` 的 `execution.runner` 与 owner 类型固定映射：
 
-- `deployment -> vllm`：支持 `service_type=generate|embedding`，返回 `endpoint`、`port` 和 `service_type`。
+- `deployment -> vllm`：支持 `service_type=generate|embedding`；只有 readiness 通过后才返回
+  `running` 以及 `endpoint`、`port` 和 `service_type`。
 - `training -> llamafactory`：agent 根据受控 JSONL 数据集生成配置，状态响应尽可能返回 `progress`、步数、metrics、checkpoint、adapter 和合并模型路径。
 - `evaluation -> evaluation`：要求基线/候选模型、模板、1–16 个已准备 JSONL、系统派生输出目录及有界的 TP/显存比/并发/max_tokens。agent 确定性合并多数据集，再在同一整卡组上先基线、后候选顺序运行；成功返回前后 metrics、overall/category_changes、`result_path` 和 `dataset_manifest_path`。
 
-`stop` 和 `status` 的 `execution` 必须是空对象。停止成功会删除已停止容器并返回 `absent`，控制面只有看到该状态后才能释放整卡租约。
+`status` 和普通 `stop` 的 `execution` 必须是空对象。停止成功会删除已停止容器并返回 `absent`，控制面只有看到该状态后才能释放整卡租约。删除业务记录前，控制面使用签名的 `stop` 命令并且仅传 `execution={"cleanup_terminal":true}`：agent 仅会删除 owner、generation 精确匹配且已是 `exited/dead` 的容器。目标不存在时幂等返回 `accepted=true + absent`；active、removing、未知状态、标签不可信、generation 不匹配或 Docker 检查不确定时都不会返回 `absent`。清理只删容器，保留 checkpoint、评测报告和缓存等宿主 bind mount 产物。
 
 ## 运行安全边界
 
 推理详细参数采用节点侧白名单。`--model`、`--host`、`--port`、`--served-model-name`、`--runner`、`--convert`、`--load-format safetensors` 和 `--tensor-parallel-size` 都由 agent 构造，调用方不能覆盖；`trust_remote_code` 永久不在白名单中。embedding 服务固定使用 vLLM pooling/embed 模式。
+
+每个推理容器都带有 Docker 原生健康检查，持续访问容器内回环地址的 vLLM `/health`。
+Docker `running` 仅表示进程存在：模型加载中、健康检查失败、paused 或 restart loop 均映射为
+`starting`，控制面继续保留整卡租约并探测；仅 `healthy` 映射为 `running`。进程明确退出才映射
+为 `failed`，避免仍持有 GPU 的异常容器被提前释放租约并产生双重调度。推理容器使用
+`on-failure` 且最多重启 3 次；启动默认 1800 秒未就绪、连续 unhealthy 默认 60 秒或达到
+重启上限时，Agent 会先停止并再次确认容器已非 active，之后才上报 `failed`。停止结果不确定
+时仍上报 `starting`。三个时间参数可由 `INFERENCE_STARTUP_TIMEOUT_SECONDS`、
+`INFERENCE_UNHEALTHY_TIMEOUT_SECONDS` 和 `INFERENCE_FAILURE_STOP_TIMEOUT_SECONDS` 调整。
 
 训练只允许继续预训练 `stage=pt + LoRA`，以及 SFT 的 Freeze、LoRA、4-bit QLoRA。控制面参数使用严格 Pydantic 白名单，输出必须精确为 `CHECKPOINT_ROOT/<job UUID>`。训练容器通过 `openllmops-training-runtime` 以参数数组执行 `llamafactory-cli train`，不启动 WebUI；模型、JSONL、dataset_info 和配置分别固定只读挂载到 `/workspace`，容器断网并固定离线环境、`trust_remote_code=false`。多卡 world size 等于整卡租约数；LoRA/QLoRA 成功后顺序合并至 `output/merged`，Freeze 输出本身可部署。
 
@@ -43,7 +53,7 @@ wrapper 在容器 tini 之后监管 torchrun 进程组，SIGTERM/SIGINT 会先�
 
 评测模型只能来自 `MODEL_ROOT` 下的非链接普通目录，数据只能来自 `DATASET_ROOT`/`EVALUATION_DATASET_ROOT` 下的非链接 JSONL。合并产物位于 agent runtime，输出只允许 `EVALUATION_OUTPUT_ROOT/<run UUID>`。评测容器断网、只读根文件系统，`pair-report.json` 必须通过大小、有限数、计数、分类汇总与数据指纹绑定校验才会上报 `succeeded`。
 
-动态容器固定为非 root、只读根文件系统、丢弃全部 capabilities、启用 `no-new-privileges`，且不能使用宿主机网络、特权模式或任意挂载。GPU 分配在单 worker 内串行完成，并结合受管容器标签与 NVML 外部进程检查实现整卡独占；任何不确定状态均拒绝启动，不自动抢占运行中的推理服务。
+动态容器固定为非 root、只读根文件系统、丢弃全部 capabilities、启用 `no-new-privileges`，且不能使用宿主机网络、特权模式或任意挂载。所有这类容器显式使用 Docker `local` 日志驱动，单文件最大 `20m`、最多保留 `5` 个轮转文件。GPU 分配在单 worker 内串行完成，并结合受管容器标签与 NVML 外部进程检查实现整卡独占；任何不确定状态均拒绝启动，不自动抢占运行中的推理服务。
 
 ## LLaMAFactory 镜像基线
 

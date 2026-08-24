@@ -89,28 +89,22 @@ def test_login_session_csrf_logout_and_audit(
         == 401
     )
 
-    model_payload = {
-        "name": "audit model",
-        "source_type": "manual",
-        "local_path": "/srv/openllmops/models/audit-model",
-        "model_kind": "instruct",
-        "status": "ready",
-    }
+    key_payload = {"name": "audit integration key"}
     missing_csrf = client.post(
-        "/api/v1/model-assets",
+        "/api/v1/api-keys",
         headers={"X-Request-ID": "csrf-rejected-request"},
-        json=model_payload,
+        json=key_payload,
     )
     assert missing_csrf.status_code == 403
 
     created = client.post(
-        "/api/v1/model-assets",
+        "/api/v1/api-keys",
         headers={
             configured_admin.csrf_header: csrf_token,
             "Origin": "http://localhost:5173",
-            "X-Request-ID": "model-create-request",
+            "X-Request-ID": "api-key-create-request",
         },
-        json=model_payload,
+        json=key_payload,
     )
     assert created.status_code == 201, created.text
 
@@ -124,7 +118,7 @@ def test_login_session_csrf_logout_and_audit(
     assert "bad-password" not in str(failed_entry)
     assert "cookie" not in str(failed_entry).lower()
 
-    created_audit = client.get("/api/v1/audit-logs?request_id=model-create-request").json()
+    created_audit = client.get("/api/v1/audit-logs?request_id=api-key-create-request").json()
     assert len(created_audit) == 1
     assert created_audit[0]["actor"] == "admin:admin"
     assert created_audit[0]["auth_method"] == "session"
@@ -142,6 +136,28 @@ def test_login_session_csrf_logout_and_audit(
     )
     assert logout.status_code == 200
     assert client.get("/api/v1/auth/me").status_code == 401
+
+
+def test_dataset_upload_auth_runs_before_multipart_body_parsing(
+    client: TestClient,
+    configured_admin: Settings,
+) -> None:
+    malformed_headers = {"Content-Type": "multipart/form-data; boundary=never-present"}
+    unauthenticated = client.post(
+        "/api/v1/datasets/upload",
+        headers=malformed_headers,
+        content=b"x" * 1024,
+    )
+    # 若 FastAPI 先解析 body，这里会是 multipart/字段错误；401 证明中间件未读取 body
+    # 就拒绝请求，未认证客户端无法先占用 5 GiB upload-tmp。
+    assert unauthenticated.status_code == 401
+
+    authenticated = client.post(
+        "/api/v1/datasets/upload",
+        headers={**malformed_headers, configured_admin.api_key_header: "bootstrap-test-key"},
+        content=b"x" * 1024,
+    )
+    assert authenticated.status_code == 400
 
 
 def test_signed_session_expiry_and_tampering(configured_admin: Settings) -> None:
@@ -163,13 +179,19 @@ def test_signed_session_expiry_and_tampering(configured_admin: Settings) -> None
 
 def test_production_auth_configuration_has_no_plaintext_default() -> None:
     password_hash = PasswordHasher().hash("production-password")
+    production_secrets = {
+        "session_signing_key": "session-" + "s" * 40,
+        "admin_api_key": "admin-" + "a" * 40,
+        "api_key_pepper": "pepper-" + "p" * 40,
+        "node_agent_token": "agent-" + "n" * 40,
+    }
     production = Settings(
         _env_file=None,
         environment="production",
         auth_enabled=True,
         admin_password_hash=password_hash,
-        session_signing_key="p" * 48,
         cors_origins=["https://openllmops.internal"],
+        **production_secrets,
     )
     assert production.admin_password_hash.startswith("$argon2")
     assert not hasattr(production, "admin_password")
@@ -180,8 +202,8 @@ def test_production_auth_configuration_has_no_plaintext_default() -> None:
             environment="production",
             auth_enabled=True,
             admin_password_hash=None,
-            session_signing_key="p" * 48,
             cors_origins=["https://openllmops.internal"],
+            **production_secrets,
         )
     with pytest.raises(ValidationError, match="有效的 Argon2"):
         Settings(
@@ -189,8 +211,27 @@ def test_production_auth_configuration_has_no_plaintext_default() -> None:
             environment="production",
             auth_enabled=True,
             admin_password_hash="$argon2id$invalid",
-            session_signing_key="p" * 48,
             cors_origins=["https://openllmops.internal"],
+            **production_secrets,
+        )
+
+    with pytest.raises(ValidationError, match="ADMIN_API_KEY"):
+        Settings(
+            _env_file=None,
+            environment="production",
+            auth_enabled=True,
+            admin_password_hash=password_hash,
+            cors_origins=["https://openllmops.internal"],
+            **{**production_secrets, "admin_api_key": "replace-with-at-least-32-random-characters"},
+        )
+    with pytest.raises(ValidationError, match="彼此独立"):
+        Settings(
+            _env_file=None,
+            environment="production",
+            auth_enabled=True,
+            admin_password_hash=password_hash,
+            cors_origins=["https://openllmops.internal"],
+            **{**production_secrets, "node_agent_token": production_secrets["admin_api_key"]},
         )
 
 

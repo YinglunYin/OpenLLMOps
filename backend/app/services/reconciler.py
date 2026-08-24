@@ -56,6 +56,7 @@ TERMINAL_DEPLOYMENT_STATES = {
     DeploymentState.FAILED,
 }
 TERMINAL_JOB_STATES = {JobState.CANCELED, JobState.SUCCEEDED, JobState.FAILED}
+DEPLOYMENT_HEALTH_STATUSES = {"starting", "healthy", "unhealthy"}
 
 
 class NodeAgentGateway(Protocol):
@@ -372,6 +373,11 @@ class StateReconciler:
             )
             row.queued_at = None
             row.error_message = None
+            if isinstance(row, Deployment):
+                # 每次成功取得租约都代表一轮新实例；旧端点和旧健康状态不得跨代展示。
+                row.internal_url = None
+                row.health_status = None
+                row.started_at = None
             return ScheduleAttempt(
                 ScheduleOutcome.CLAIMED,
                 workload=self._snapshot(row, owner_type, execution=execution),
@@ -457,38 +463,49 @@ class StateReconciler:
         response: AgentCommandResponse,
     ) -> None:
         observed = response.observed_state
+        health_status = self._deployment_health_status(response)
         if not response.accepted and observed == AgentWorkloadState.ABSENT:
             row.actual_state = DeploymentState.FAILED
+            row.health_status = None
+            row.internal_url = None
             row.error_message = response.message or "node-agent 拒绝部署启动"
             await self._leases.release(session, owner)
             return
         if observed == AgentWorkloadState.ABSENT:
             await self._leases.release(session, owner)
+            row.health_status = None
+            row.internal_url = None
             if row.desired_state == DesiredServiceState.RUNNING:
                 # 推理服务允许自动恢复，但仍重新进入 FIFO，不越过更早任务。
                 row.actual_state = DeploymentState.QUEUED
                 row.queued_at = self._clock()
                 row.runtime_generation = 0
+                row.started_at = None
                 row.error_message = "node-agent 未发现运行实例，已重新排队"
             else:
                 row.actual_state = DeploymentState.STOPPED
-                row.internal_url = None
                 row.error_message = None
             return
         if observed in {AgentWorkloadState.FAILED, AgentWorkloadState.SUCCEEDED}:
             row.actual_state = DeploymentState.FAILED
+            row.health_status = health_status
             row.error_message = response.message or "推理实例异常退出"
             row.internal_url = None
             await self._leases.release(session, owner)
             return
         if row.desired_state == DesiredServiceState.STOPPED:
             row.actual_state = DeploymentState.STOPPING
+            row.health_status = health_status
             return
         row.actual_state = {
             AgentWorkloadState.STARTING: DeploymentState.STARTING,
             AgentWorkloadState.RUNNING: DeploymentState.RUNNING,
             AgentWorkloadState.STOPPING: DeploymentState.STOPPING,
         }[observed]
+        row.health_status = health_status
+        if observed == AgentWorkloadState.RUNNING and row.started_at is None:
+            # 只在首次观察到本代实例 ready 时落库，后续 STATUS 轮询不得刷新运行起点。
+            row.started_at = self._clock()
         endpoint = response.metadata.get("endpoint")
         if isinstance(endpoint, str):
             row.internal_url = endpoint
@@ -496,6 +513,17 @@ class StateReconciler:
         if isinstance(port, int):
             row.port = port
         row.error_message = None if response.accepted else response.message
+
+    @staticmethod
+    def _deployment_health_status(response: AgentCommandResponse) -> str | None:
+        value = response.metadata.get("health_status")
+        if value is None:
+            return None
+        if isinstance(value, str) and value in DEPLOYMENT_HEALTH_STATUSES:
+            return value
+        # metadata 是扩展对象，不能让异常 agent 值污染 API 的有限状态契约。
+        logger.warning("忽略 node-agent 返回的非法 deployment health_status：%r", value)
+        return None
 
     async def _apply_job_observation(
         self,
@@ -644,7 +672,10 @@ class StateReconciler:
                 else JobState.FAILED
             )
             row.error_message = message
-            if isinstance(row, (TrainingJob, EvaluationRun)):
+            if isinstance(row, Deployment):
+                row.health_status = None
+                row.internal_url = None
+            else:
                 row.finished_at = self._clock()
             await self._leases.release(session, workload.owner)
 

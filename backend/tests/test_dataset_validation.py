@@ -1,12 +1,45 @@
 import io
 import json
+import os
 from pathlib import Path
 
 import pytest
 from openllmops_eval.dataset import DatasetValidationError, load_jsonl, parse_row
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.routes.datasets import upload_dataset
+from app.core.config import get_settings
 from app.models.enums import DatasetType
+from app.services import dataset_files
 from app.services.dataset_files import validate_and_store_jsonl
+
+
+def test_startup_cleanup_only_removes_old_strict_upload_parts(tmp_path: Path) -> None:
+    now = 2_000_000_000.0
+    old_part = tmp_path / ".123e4567-e89b-42d3-a456-426614174000.jsonl.part"
+    recent_part = tmp_path / ".123e4567-e89b-42d3-a456-426614174001.jsonl.part"
+    unrelated = tmp_path / ".not-an-openllmops-upload.jsonl.part"
+    target = tmp_path / "operator-data.jsonl"
+    symlink = tmp_path / ".123e4567-e89b-42d3-a456-426614174002.jsonl.part"
+    for path in (old_part, recent_part, unrelated, target):
+        path.write_bytes(b"{}\n")
+    symlink.symlink_to(target)
+    os.utime(old_part, (now - 90_000, now - 90_000))
+    os.utime(recent_part, (now - 60, now - 60))
+    os.utime(unrelated, (now - 90_000, now - 90_000))
+
+    removed = dataset_files.cleanup_stale_upload_parts(
+        tmp_path,
+        older_than_seconds=86_400,
+        now=now,
+    )
+
+    assert removed == 1
+    assert not old_part.exists()
+    assert recent_part.exists()
+    assert unrelated.exists()
+    assert symlink.is_symlink()
+    assert target.exists()
 
 
 def test_invalid_sft_jsonl_is_not_persisted(tmp_path: Path) -> None:
@@ -189,3 +222,86 @@ def test_training_dataset_requires_one_consistent_record_format(tmp_path: Path) 
             tmp_path / "mixed-cpt.jsonl",
             DatasetType.CPT,
         )
+
+
+def test_oversized_physical_line_is_read_and_drained_in_bounded_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BoundedReader(io.BytesIO):
+        requested_sizes: list[int]
+
+        def __init__(self, value: bytes) -> None:
+            super().__init__(value)
+            self.requested_sizes = []
+
+        def readline(self, size: int = -1, /) -> bytes:
+            self.requested_sizes.append(size)
+            assert 0 < size <= 17
+            return super().readline(size)
+
+    monkeypatch.setattr(dataset_files, "MAX_LINE_BYTES", 16)
+    monkeypatch.setattr(dataset_files, "MAX_DATASET_BYTES", 1024)
+    source = BoundedReader(b'{"text":"' + b"x" * 200 + b'"}\n')
+    temporary = tmp_path / ".oversized-physical-line.part"
+
+    with pytest.raises(ValueError, match="单行超过 16"):
+        validate_and_store_jsonl(
+            source,
+            temporary,
+            tmp_path / "oversized-physical-line.jsonl",
+            DatasetType.CPT,
+        )
+
+    assert source.requested_sizes and max(source.requested_sizes) == 17
+    assert not temporary.exists()
+
+
+def test_schema_summary_has_bounded_field_cardinality(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dataset_files, "MAX_SCHEMA_FIELDS", 4)
+    rows = b"".join(
+        json.dumps(
+            {"instruction": "Q", "output": "A", f"extra_{index}": index},
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+        for index in range(5)
+    )
+
+    with pytest.raises(ValueError, match="字段种类超过 4"):
+        validate_and_store_jsonl(
+            io.BytesIO(rows),
+            tmp_path / ".too-many-fields.part",
+            tmp_path / "too-many-fields.jsonl",
+            DatasetType.SFT,
+        )
+
+
+@pytest.mark.asyncio
+async def test_upload_close_failure_removes_atomically_stored_orphan(
+    isolated_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    class CloseFailureUpload:
+        filename = "close-failure.jsonl"
+        file = io.BytesIO(b'{"instruction":"Q","output":"A"}\n')
+
+        @staticmethod
+        async def close() -> None:
+            raise RuntimeError("模拟临时上传文件关闭失败")
+
+    dataset_root = get_settings().dataset_root
+    before = {path.name for path in dataset_root.glob("*.jsonl")}
+    async with isolated_session_factory() as session:
+        with pytest.raises(RuntimeError, match="关闭失败"):
+            await upload_dataset(
+                name="close-failure",
+                dataset_type=DatasetType.SFT,
+                version="v1.0.0",
+                description=None,
+                file=CloseFailureUpload(),  # type: ignore[arg-type]
+                session=session,
+            )
+    assert {path.name for path in dataset_root.glob("*.jsonl")} == before

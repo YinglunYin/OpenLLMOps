@@ -76,6 +76,8 @@ services:
       HUGGINGFACE_TOKEN_FILE: ${HUGGINGFACE_TOKEN_FILE:-}
       MODELSCOPE_TOKEN_FILE: ${MODELSCOPE_TOKEN_FILE:-}
       DATASET_ROOT: /srv/openllmops/datasets
+      # Starlette 会先把 multipart 大文件落盘；必须使用数据盘，不能占用 256 MiB /tmp tmpfs。
+      TMPDIR: /srv/openllmops/upload-tmp
       EVALUATION_DATASET_ROOT: /srv/openllmops/evaluation-datasets
       EVALUATION_OUTPUT_ROOT: /srv/openllmops/evaluation-output
       NODE_AGENT_RUNTIME_ROOT: /srv/openllmops/runtime
@@ -327,6 +329,8 @@ services:
     environment:
       TLS_AUTO_GENERATE: ${TLS_AUTO_GENERATE:-true}
       TLS_COMMON_NAME: ${TLS_COMMON_NAME:-openllmops.local}
+      TLS_OWNER_UID: ${APP_UID:-1000}
+      TLS_OWNER_GID: ${APP_GID:-1000}
     volumes:
       - ${TLS_DIR:-./secrets/tls}:/etc/nginx/tls
     ports:
@@ -353,8 +357,12 @@ services:
     logging: *default-logging
     <<: *service-security
     cap_add:
+      # DAC_OVERRIDE 仅用于读取/原子写入唯一的 TLS bind mount；容器没有其他宿主机挂载。
+      - DAC_OVERRIDE
       # Nginx master 只需把 worker 降权；监听端口均高于 1024。
       - CHOWN
+      # Root master 需要向已降权的 nginx worker 发送优雅退出/重载信号。
+      - KILL
       - SETGID
       - SETUID
 

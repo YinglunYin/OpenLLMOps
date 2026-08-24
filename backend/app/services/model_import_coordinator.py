@@ -35,7 +35,10 @@ ONLINE_SECRET_ENVIRONMENT_KEYS = {
     "HF_HUB_DISABLE_IMPLICIT_TOKEN",
     "HF_HOME",
     "MODELSCOPE_API_TOKEN",
+    "MODELSCOPE_CACHE",
+    "MODELSCOPE_CREDENTIALS_PATH",
     "MODELSCOPE_HOME",
+    "MS_CACHE_HOME",
 }
 ACTIVE_IMPORT_STATUSES = {
     ModelImportStatus.TRANSFERRING,
@@ -121,6 +124,8 @@ def isolated_online_credentials(
                 os.environ["HF_HOME"] = str(runtime_home / "huggingface")
             elif source == ModelImportSource.MODELSCOPE:
                 os.environ["MODELSCOPE_HOME"] = str(runtime_home / "modelscope")
+                os.environ["MODELSCOPE_CACHE"] = str(runtime_home / "modelscope" / "cache")
+                os.environ["MODELSCOPE_CREDENTIALS_PATH"] = str(runtime_home / "modelscope" / "credentials")
                 if token:
                     os.environ["MODELSCOPE_API_TOKEN"] = token
             yield
@@ -420,8 +425,8 @@ class ModelImportCoordinator:
             repository=job.repository,
             revision=job.revision,
             source_directory=(self.inbox_root / job.source_directory if job.source_directory else None),
-            # ModelScope 本地包明确通过标准环境变量取 token，不能作为参数传入。
-            access_token=token if job.source == ModelImportSource.HUGGINGFACE else None,
+            # 仅在线程/隔离下载子进程内传递；不会进入任务、资产、命令行或日志。
+            access_token=token,
         )
         if job.source == ModelImportSource.CONTROLLED_DIRECTORY:
             return self.importer.run(request, progress=progress, cancelled=cancelled)
@@ -457,21 +462,35 @@ class ModelImportCoordinator:
                 ModelImportSource.MODELSCOPE: ModelSourceType.MODELSCOPE,
                 ModelImportSource.CONTROLLED_DIRECTORY: ModelSourceType.MANUAL,
             }[job.source]
+            online_source = job.source in {
+                ModelImportSource.HUGGINGFACE,
+                ModelImportSource.MODELSCOPE,
+            }
+            if online_source:
+                if manifest.requested_revision != job.revision:
+                    raise RuntimeError("模型导入 worker 返回的 requested revision 与任务不一致")
+                if not manifest.resolved_revision:
+                    raise RuntimeError("在线模型导入缺少 resolved commit，拒绝创建不可复现资产")
             source_uri = job.repository if job.repository else f"inbox://{job.source_directory or 'unknown'}"
             asset = ModelAsset(
                 name=job.name,
                 source_type=source_type,
                 source_uri=source_uri,
-                revision=job.revision,
+                revision=manifest.resolved_revision,
                 local_path=str(final_path),
                 model_kind=job.model_kind,
                 format="safetensors",
                 status=AssetStatus.READY,
                 family=manifest.model_type,
+                parameter_count=manifest.parameter_count,
                 size_bytes=manifest.total_size_bytes,
+                checksum=manifest.checksum,
                 metadata_json={
                     "import_job_id": str(job.id),
                     "architecture": manifest.architecture,
+                    "weight_dtypes": list(manifest.weight_dtypes),
+                    "requested_revision": manifest.requested_revision,
+                    "resolved_revision": manifest.resolved_revision,
                     "manifest": manifest_json,
                 },
             )

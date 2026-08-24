@@ -16,6 +16,12 @@ from app.schemas import OpenAIProxyRequest
 router = APIRouter(tags=["OpenAI Compatible API"])
 
 
+def _build_proxy_client() -> httpx.AsyncClient:
+    """集中创建上游客户端，既固定生产超时，也便于用无网络传输做合同测试。"""
+
+    return httpx.AsyncClient(timeout=get_settings().proxy_timeout_seconds)
+
+
 async def _find_deployment(
     model_name: str,
     task_type: DeploymentTaskType,
@@ -55,7 +61,7 @@ async def _proxy(
     if settings.vllm_internal_api_key:
         headers["Authorization"] = f"Bearer {settings.vllm_internal_api_key}"
 
-    client = httpx.AsyncClient(timeout=settings.proxy_timeout_seconds)
+    client = _build_proxy_client()
     upstream_url = f"{deployment.internal_url.rstrip('/')}{endpoint}"
     try:
         request = client.build_request("POST", upstream_url, json=payload, headers=headers)

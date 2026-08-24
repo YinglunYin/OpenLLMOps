@@ -1,4 +1,6 @@
 import asyncio
+import json
+import os
 import threading
 import time
 import uuid
@@ -23,6 +25,7 @@ from app.models.enums import (
 from app.services.model_import_coordinator import (
     ModelImportCoordinator,
     claim_next_model_import,
+    isolated_online_credentials,
     read_secret_file,
     recover_stale_model_imports,
     request_model_import_cancel,
@@ -47,12 +50,14 @@ async def _seed_import(
     source: ModelImportSource = ModelImportSource.CONTROLLED_DIRECTORY,
     repository: str | None = None,
     source_directory: str | None = "candidate",
+    revision: str | None = None,
 ) -> uuid.UUID:
     async with factory() as session, session.begin():
         job = ModelImportJob(
             name=f"import-{uuid.uuid4()}",
             source=source,
             repository=repository,
+            revision=revision,
             source_directory=source_directory,
             model_kind=ModelKind.BASE,
             status=ModelImportStatus.PENDING,
@@ -78,6 +83,11 @@ class SuccessfulImporter:
             total_size_bytes=10,
             file_count=2,
             files=(),
+            parameter_count=7_000_000_000,
+            weight_dtypes=("BF16",),
+            checksum="c" * 64,
+            requested_revision=(request.revision if request.source.value != "controlled_directory" else None),
+            resolved_revision=("a" * 40 if request.source.value != "controlled_directory" else None),
         )
         return self.final_path / str(request.import_id), manifest
 
@@ -163,13 +173,50 @@ async def test_success_creates_ready_asset_only_after_validation(
     async with import_session_factory() as session:
         job = await session.get(ModelImportJob, job_id)
         assets = list(await session.scalars(select(ModelAsset)))
-        assert job is not None and job.status == ModelImportStatus.READY
+        assert job is not None and job.status == ModelImportStatus.READY, job.error_message if job else None
         assert job.result_asset_id is not None
         assert job.progress_completed == 10 == job.progress_total
         assert len(assets) == 1
         assert assets[0].id == job.result_asset_id
         assert assets[0].status == AssetStatus.READY
         assert assets[0].family == "qwen2"
+        assert assets[0].parameter_count == 7_000_000_000
+        assert assets[0].checksum == "c" * 64
+        assert assets[0].metadata_json["weight_dtypes"] == ["BF16"]
+
+
+async def test_online_success_persists_requested_and_resolved_revisions(
+    import_session_factory,
+    tmp_path: Path,
+) -> None:
+    job_id = await _seed_import(
+        import_session_factory,
+        source=ModelImportSource.HUGGINGFACE,
+        repository="Qwen/Test",
+        source_directory=None,
+        revision="main",
+    )
+    coordinator = ModelImportCoordinator(
+        import_session_factory,
+        SuccessfulImporter(tmp_path / "models"),
+        inbox_root=tmp_path / "inbox",
+        staging_root=tmp_path / "staging",
+    )
+
+    await coordinator.run_once()
+    await coordinator.wait_for_idle()
+
+    async with import_session_factory() as session:
+        job = await session.get(ModelImportJob, job_id)
+        asset = await session.get(ModelAsset, job.result_asset_id if job else None)
+        assert job is not None and job.status == ModelImportStatus.READY
+        assert job.revision == "main"
+        assert job.manifest_json is not None
+        assert job.manifest_json["requested_revision"] == "main"
+        assert job.manifest_json["resolved_revision"] == "a" * 40
+        assert asset is not None and asset.revision == "a" * 40
+        assert asset.metadata_json["requested_revision"] == "main"
+        assert asset.metadata_json["resolved_revision"] == "a" * 40
 
 
 async def test_failure_redacts_secret_and_never_creates_asset(
@@ -378,6 +425,29 @@ def test_secret_file_must_be_regular_and_read_only(tmp_path: Path) -> None:
         read_secret_file(token_file)
 
 
+def test_modelscope_credentials_and_cache_are_isolated_and_restored(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MODELSCOPE_API_TOKEN", "host-token")
+    monkeypatch.setenv("MODELSCOPE_CREDENTIALS_PATH", "/host/modelscope/credentials")
+    monkeypatch.setenv("MODELSCOPE_CACHE", "/host/modelscope/cache")
+    runtime_home = tmp_path / "sdk-home"
+
+    with isolated_online_credentials(
+        ModelImportSource.MODELSCOPE,
+        "job-token",
+        runtime_home,
+    ):
+        assert os.environ["MODELSCOPE_API_TOKEN"] == "job-token"
+        assert os.environ["MODELSCOPE_CREDENTIALS_PATH"] == str(runtime_home / "modelscope" / "credentials")
+        assert os.environ["MODELSCOPE_CACHE"] == str(runtime_home / "modelscope" / "cache")
+
+    assert os.environ["MODELSCOPE_API_TOKEN"] == "host-token"
+    assert os.environ["MODELSCOPE_CREDENTIALS_PATH"] == "/host/modelscope/credentials"
+    assert os.environ["MODELSCOPE_CACHE"] == "/host/modelscope/cache"
+
+
 def test_model_import_api_and_inbox_reject_directory_escape(client, test_root: Path) -> None:
     inbox = test_root / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
@@ -385,7 +455,13 @@ def test_model_import_api_and_inbox_reject_directory_escape(client, test_root: P
     candidate = inbox / candidate_name
     candidate.mkdir()
     (candidate / "config.json").write_text('{"model_type":"qwen2"}', encoding="utf-8")
-    (candidate / "model.safetensors").write_bytes(b"safe-test-weights")
+    (candidate / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (candidate / "tokenizer.json").write_text("{}", encoding="utf-8")
+    header = json.dumps(
+        {"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}},
+        separators=(",", ":"),
+    ).encode()
+    (candidate / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + b"\0\0\0\0")
 
     inbox_response = client.get("/api/v1/model-inbox")
     assert inbox_response.status_code == 200

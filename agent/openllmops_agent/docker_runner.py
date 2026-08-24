@@ -7,6 +7,7 @@ import re
 import stat
 import threading
 from collections.abc import Iterable
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,9 @@ PORT_LABEL = "com.openllmops.port"
 TRAINING_ALGORITHM_LABEL = "com.openllmops.training-algorithm"
 
 ACTIVE_STATES = frozenset({"created", "running", "restarting", "paused"})
+TERMINAL_STATES = frozenset({"exited", "dead"})
+INFERENCE_HEALTH_INTERVAL_SECONDS = 5
+INFERENCE_MAX_RESTARTS = 3
 
 # 详细配置仍只允许无代码执行、无任意文件读取能力的 vLLM 参数。
 VLLM_ARGUMENT_ALLOWLIST = frozenset(
@@ -257,6 +261,105 @@ class DockerRunner:
             container.remove(force=False, v=True)
             return None
 
+    def cleanup_contract_workload(
+        self,
+        owner_type: str,
+        workload_id: UUID,
+        generation: int,
+    ) -> None:
+        """幂等删除一个已经确认处于终态的合同容器。
+
+        cleanup 与普通 STOP 刻意分离：它绝不停止 active 容器，也不会在 Docker 状态
+        不确定时报告成功。这里只删除容器本身（``v=False``），保留宿主 bind mount。
+        """
+
+        name = self.contract_workload_name(owner_type, workload_id)
+        expected_kind = {
+            "deployment": "inference",
+            "training": "training",
+            "evaluation": "evaluation",
+        }[owner_type]
+        with self._allocation_lock:
+            try:
+                # 此处不能使用 _managed_container：cleanup 必须区分真正 absent 与
+                # 同名但标签不可信的容器，后者不能被当作安全清理成功。
+                container = self.client.containers.get(name)
+            except NotFound:
+                return
+            try:
+                container.reload()
+            except NotFound:
+                return
+
+            labels = container.labels
+            if (
+                labels.get(MANAGED_LABEL) != "true"
+                or labels.get(ID_LABEL) != str(workload_id)
+                or labels.get(KIND_LABEL) != expected_kind
+                or labels.get(OWNER_TYPE_LABEL) != owner_type
+            ):
+                raise WorkloadConflict("cleanup 目标容器缺少可信 owner 标签")
+            raw_generation = labels.get(GENERATION_LABEL)
+            if not isinstance(raw_generation, str) or re.fullmatch(r"[1-9][0-9]*", raw_generation) is None:
+                raise WorkloadConflict("cleanup 目标容器缺少可信 generation 标签")
+            existing_generation = int(raw_generation)
+            if existing_generation != generation:
+                raise WorkloadConflict("cleanup generation 与节点容器不一致")
+            if container.status in ACTIVE_STATES:
+                raise WorkloadConflict("cleanup 仅允许删除已进入终态的工作负载")
+            if container.status == "removing":
+                raise WorkloadConflict("cleanup 目标容器正在删除，结果尚未确认")
+            if container.status not in TERMINAL_STATES:
+                raise WorkloadConflict(f"cleanup 无法确认容器终态：{container.status}")
+            try:
+                container.remove(force=False, v=False)
+            except NotFound:
+                # 另一个并发 cleanup 在终态检查后先完成，最终结果仍是可信 absent。
+                return
+
+    def quiesce_failed_inference(
+        self,
+        workload_id: UUID,
+        generation: int,
+        *,
+        timeout_seconds: int,
+    ) -> bool:
+        """先停止并确认推理容器不再活动，确认前绝不允许控制面释放租约。"""
+
+        name = self._workload_name("inference", workload_id)
+        with self._allocation_lock:
+            try:
+                container = self._managed_container(name)
+                container.reload()
+            except WorkloadNotFound:
+                return True
+            except NotFound:
+                # get 成功后 reload 才发现容器消失，同样已确认不再占用 GPU。
+                return True
+            except DockerException:
+                return False
+            if self._generation_from_labels(container.labels) != generation:
+                return False
+            if container.status == "removing":
+                return False
+            if container.status == "created":
+                try:
+                    container.remove(force=False, v=True)
+                except DockerException:
+                    return False
+                return True
+            if container.status in {"running", "restarting", "paused"}:
+                # stop 响应丢失不代表停止未发生；仍需 inspect 二次确认。
+                with suppress(DockerException):
+                    container.stop(timeout=timeout_seconds)
+            try:
+                container.reload()
+            except NotFound:
+                return True
+            except DockerException:
+                return False
+            return container.status not in ACTIVE_STATES and container.status != "removing"
+
     def training_metadata(self, workload_id: UUID, *, completed: bool = False) -> dict[str, Any]:
         container = self._managed_container(self._workload_name("training", workload_id))
         raw_output = container.labels.get(OUTPUT_PATH_LABEL)
@@ -424,6 +527,24 @@ class DockerRunner:
             }
         )
         endpoint = f"http://{name}:{request.port}"
+        # Docker healthcheck 同时承担 readiness 与持续 liveness 探测。仅进程处于
+        # running 不能说明 vLLM 已完成模型加载，也不能说明已加载服务仍可响应。
+        healthcheck = {
+            "test": [
+                "CMD",
+                "python",
+                "-c",
+                (
+                    "import urllib.request; "
+                    f"urllib.request.urlopen('http://127.0.0.1:{request.port}/health', timeout=3).close()"
+                ),
+            ],
+            "interval": INFERENCE_HEALTH_INTERVAL_SECONDS * 1_000_000_000,
+            "timeout": 4 * 1_000_000_000,
+            "retries": 3,
+            # 首次加载窗口与控制面判断使用同一配置；成功检查仍可提前变为 healthy。
+            "start_period": self.settings.inference_startup_timeout_seconds * 1_000_000_000,
+        }
 
         with self._allocation_lock:
             self._assert_name_available(name)
@@ -446,7 +567,11 @@ class DockerRunner:
                 generation=request.generation,
                 owner_type="deployment",
                 port=request.port,
-                restart_policy={"Name": "unless-stopped"},
+                healthcheck=healthcheck,
+                restart_policy={
+                    "Name": "on-failure",
+                    "MaximumRetryCount": INFERENCE_MAX_RESTARTS,
+                },
             )
         return self._to_info(container)
 
@@ -776,6 +901,7 @@ class DockerRunner:
         candidate_template: str | None = None,
         training_algorithm: str | None = None,
         port: int | None = None,
+        healthcheck: dict[str, Any] | None = None,
         entrypoint: list[str] | None = None,
         network_mode: str | None = None,
     ) -> Container:
@@ -810,6 +936,7 @@ class DockerRunner:
                 if network_mode is not None
                 else {"network": self.settings.runtime_network}
             )
+            health_arguments = {"healthcheck": healthcheck} if healthcheck is not None else {}
             return self.client.containers.run(
                 image=image,
                 name=name,
@@ -817,6 +944,7 @@ class DockerRunner:
                 entrypoint=entrypoint,
                 detach=True,
                 **network_arguments,
+                **health_arguments,
                 device_requests=[
                     DeviceRequest(
                         device_ids=[str(item) for item in gpu_ids],
@@ -834,6 +962,10 @@ class DockerRunner:
                 shm_size=self.settings.workload_shm_size,
                 tmpfs={"/tmp": "rw,nosuid,nodev,size=4g,mode=1777"},
                 restart_policy=restart_policy,
+                log_config={
+                    "type": "local",
+                    "config": {"max-size": "20m", "max-file": "5"},
+                },
             )
         except APIError as exc:
             raise RunnerError(f"Docker 创建工作负载失败：{exc.explanation}") from exc
@@ -1127,14 +1259,31 @@ class DockerRunner:
     def _to_info(self, container: Container) -> WorkloadInfo:
         container.reload()
         labels = container.labels
-        created_at: datetime | None = None
-        raw_created = container.attrs.get("Created")
-        if isinstance(raw_created, str):
-            try:
-                # 项目最低 Python 3.11，fromisoformat 已原生接受 Docker 的尾部 Z。
-                created_at = datetime.fromisoformat(raw_created)
-            except ValueError:
-                created_at = None
+        created_at = self._docker_datetime(container.attrs.get("Created"))
+        state = container.attrs.get("State", {})
+        health = state.get("Health") if isinstance(state, dict) else None
+        raw_health_status = health.get("Status") if isinstance(health, dict) else None
+        health_status = (
+            raw_health_status if raw_health_status in {"starting", "healthy", "unhealthy"} else None
+        )
+        raw_failing_streak = health.get("FailingStreak", 0) if isinstance(health, dict) else 0
+        health_failing_streak = (
+            raw_failing_streak
+            if isinstance(raw_failing_streak, int)
+            and not isinstance(raw_failing_streak, bool)
+            and raw_failing_streak >= 0
+            else 0
+        )
+        raw_restart_count = container.attrs.get("RestartCount", 0)
+        restart_count = (
+            raw_restart_count
+            if isinstance(raw_restart_count, int)
+            and not isinstance(raw_restart_count, bool)
+            and raw_restart_count >= 0
+            else 0
+        )
+        started_at = self._docker_datetime(state.get("StartedAt") if isinstance(state, dict) else None)
+        finished_at = self._docker_datetime(state.get("FinishedAt") if isinstance(state, dict) else None)
         return WorkloadInfo(
             name=container.name,
             workload_id=UUID(labels[ID_LABEL]),
@@ -1146,9 +1295,26 @@ class DockerRunner:
             endpoint=labels.get(ENDPOINT_LABEL),
             port=int(labels[PORT_LABEL]) if labels.get(PORT_LABEL, "").isdigit() else None,
             generation=self._generation_from_labels(labels),
-            exit_code=container.attrs.get("State", {}).get("ExitCode"),
+            exit_code=state.get("ExitCode") if isinstance(state, dict) else None,
+            health_status=health_status,
+            health_failing_streak=health_failing_streak,
+            restart_count=restart_count,
+            started_at=started_at,
+            finished_at=finished_at,
             created_at=created_at,
         )
+
+    @staticmethod
+    def _docker_datetime(raw: Any) -> datetime | None:
+        if not isinstance(raw, str):
+            return None
+        try:
+            # 项目最低 Python 3.11，fromisoformat 已原生接受 Docker 的尾部 Z。
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        # Docker 对尚未开始的容器使用 year=1 的零值时间，不能用于超时计算。
+        return parsed if parsed.year > 1 else None
 
 
 def docker_error_message(exc: DockerException) -> str:

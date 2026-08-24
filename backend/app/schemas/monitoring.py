@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -28,6 +29,7 @@ class GPUStatusRead(BaseModel):
     power_watts: float | None = Field(default=None, ge=0)
     telemetry_available: bool
     degraded_reason: str | None
+    resource_state: Literal["idle", "leased", "unmanaged", "unknown"]
     owner_type: LeaseOwnerType | None = None
     owner_id: uuid.UUID | None = None
     owner_name: str | None = None

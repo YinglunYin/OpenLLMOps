@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,7 +32,7 @@ from openllmops_training_runtime import (
     WORKSPACE_MODEL,
     WORKSPACE_OUTPUT,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from .agent_contract import (
     AgentAction,
@@ -42,6 +43,8 @@ from .agent_contract import (
 )
 from .config import Settings
 from .docker_runner import (
+    INFERENCE_HEALTH_INTERVAL_SECONDS,
+    INFERENCE_MAX_RESTARTS,
     DockerRunner,
     InvalidWorkload,
     WorkloadConflict,
@@ -67,6 +70,17 @@ STATE_VERSION = 1
 
 class ExecutionModel(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+class TerminalCleanupExecution(ExecutionModel):
+    cleanup_terminal: Literal[True]
+
+    @field_validator("cleanup_terminal", mode="before")
+    @classmethod
+    def require_json_boolean_true(cls, value: Any) -> Any:
+        if value is not True:
+            raise ValueError("cleanup_terminal 必须是 JSON 布尔值 true")
+        return value
 
 
 class VLLMExecution(ExecutionModel):
@@ -270,11 +284,18 @@ class CommandStateStore:
 
 
 class CommandProcessor:
-    def __init__(self, settings: Settings, runner: DockerRunner) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        runner: DockerRunner,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
         self.runner = runner
         self.state = CommandStateStore(settings.runtime_root)
         self._lock = threading.RLock()
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     def execute(self, command: AgentCommand) -> CommandResult:
         fingerprint = hashlib.sha256(canonical_json(command)).hexdigest()
@@ -335,10 +356,13 @@ class CommandProcessor:
     def _dispatch(self, command: AgentCommand) -> CommandResult:
         if command.action == AgentAction.START:
             return self._start(command)
-        if command.execution:
-            raise InvalidWorkload("stop/status 命令的 execution 必须为空对象")
         if command.action == AgentAction.STOP:
+            if command.execution:
+                TerminalCleanupExecution.model_validate(command.execution)
+                return self._cleanup(command)
             return self._stop(command)
+        if command.execution:
+            raise InvalidWorkload("status 命令的 execution 必须为空对象")
         return self._observe(command, accepted=True)
 
     def _start(self, command: AgentCommand) -> CommandResult:
@@ -444,6 +468,16 @@ class CommandProcessor:
             return self._response_from_info(command, info, accepted=True)
         return self._accepted_absent(command.request_id)
 
+    def _cleanup(self, command: AgentCommand) -> CommandResult:
+        """仅删除精确代次的终态容器；目标不存在时视为已完成清理。"""
+
+        self.runner.cleanup_contract_workload(
+            command.owner.type,
+            command.owner.id,
+            command.owner.generation,
+        )
+        return self._accepted_absent(command.request_id)
+
     def _observe(self, command: AgentCommand, *, accepted: bool) -> CommandResult:
         try:
             info = self.runner.get_contract_workload(command.owner.type, command.owner.id)
@@ -457,13 +491,32 @@ class CommandProcessor:
         self, command: AgentCommand, info: WorkloadInfo, *, accepted: bool
     ) -> CommandResult:
         state = self._state_from_info(info)
+        inference_failure: str | None = None
+        stop_uncertain = False
+        if info.kind == "inference" and state == AgentWorkloadState.STARTING:
+            inference_failure = self._inference_failure_reason(info)
+            if inference_failure is not None:
+                quiesced = self.runner.quiesce_failed_inference(
+                    info.workload_id,
+                    info.generation,
+                    timeout_seconds=self.settings.inference_failure_stop_timeout_seconds,
+                )
+                if quiesced:
+                    state = AgentWorkloadState.FAILED
+                else:
+                    stop_uncertain = True
         metadata: dict[str, Any] = {}
         if command.owner.type == "deployment":
-            metadata = {
-                "endpoint": info.endpoint,
-                "port": info.port,
-                "service_type": info.service_type,
-            }
+            # 未通过 readiness 前不发布上游地址；控制面会保留 GPU 租约并继续 STATUS。
+            metadata = {"health_status": info.health_status}
+            if state == AgentWorkloadState.RUNNING:
+                metadata.update(
+                    {
+                        "endpoint": info.endpoint,
+                        "port": info.port,
+                        "service_type": info.service_type,
+                    }
+                )
             metadata = {key: value for key, value in metadata.items() if value is not None}
         elif command.owner.type == "training":
             metadata = self.runner.training_metadata(
@@ -474,11 +527,22 @@ class CommandProcessor:
             metadata = self.runner.evaluation_metadata(command.owner.id)
         message = None
         if state == AgentWorkloadState.FAILED:
-            message = (
+            message = inference_failure or (
                 f"工作负载异常退出，exit_code={info.exit_code}"
                 if info.exit_code is not None
                 else "工作负载处于失败状态"
             )
+        elif info.kind == "inference" and state == AgentWorkloadState.STARTING:
+            if stop_uncertain:
+                message = f"{inference_failure}；停止结果尚未确认，继续保留 GPU 并探测"
+            elif info.status == "restarting":
+                message = "推理容器正在重启，继续保留 GPU 并探测"
+            elif info.health_status == "unhealthy":
+                message = "推理服务健康检查未通过，继续保留 GPU 并探测"
+            elif info.health_status == "starting":
+                message = "推理服务正在加载模型，等待 readiness"
+            else:
+                message = "推理容器尚未提供可信健康状态，等待重建或后续探测"
         response = AgentCommandResponse(
             request_id=command.request_id,
             accepted=accepted,
@@ -489,8 +553,52 @@ class CommandProcessor:
         )
         return CommandResult(status_code=200, response=response)
 
+    def _inference_failure_reason(self, info: WorkloadInfo) -> str | None:
+        if info.health_status == "healthy" and info.status == "running":
+            return None
+        if info.restart_count >= INFERENCE_MAX_RESTARTS:
+            return f"推理容器重启次数已达到上限 {INFERENCE_MAX_RESTARTS}"
+        if info.status == "restarting":
+            return self._startup_timeout_reason(info.finished_at or info.created_at)
+        if info.health_status == "unhealthy":
+            if info.health_failing_streak <= 0:
+                return "推理服务 unhealthy 状态缺少可信连续失败计数"
+            unhealthy_seconds = info.health_failing_streak * INFERENCE_HEALTH_INTERVAL_SECONDS
+            if unhealthy_seconds >= self.settings.inference_unhealthy_timeout_seconds:
+                return f"推理服务连续健康检查失败达到 {self.settings.inference_unhealthy_timeout_seconds} 秒"
+            return None
+        return self._startup_timeout_reason(info.started_at or info.created_at)
+
+    def _startup_timeout_reason(self, started_at: datetime | None) -> str | None:
+        if started_at is None:
+            # Docker 正常 inspect 必有 Created；缺失意味着无法证明启动窗口仍然有效。
+            # 继续等待会让异常容器无限占用整卡，因此进入同一“先停止、后失败”流程。
+            return "推理容器缺少可信启动时间，无法执行有界 readiness 探测"
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=UTC)
+        now = self._clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        elapsed = max(0.0, (now - started_at).total_seconds())
+        if elapsed >= self.settings.inference_startup_timeout_seconds:
+            return f"推理服务启动超过 {self.settings.inference_startup_timeout_seconds} 秒仍未就绪"
+        return None
+
     @staticmethod
     def _state_from_info(info: WorkloadInfo) -> AgentWorkloadState:
+        if info.kind == "inference":
+            if info.status in {"created", "restarting", "paused"}:
+                return AgentWorkloadState.STARTING
+            if info.status == "running":
+                # fail closed：只有 Docker healthcheck 的 /health 成功才可对外服务。
+                return (
+                    AgentWorkloadState.RUNNING
+                    if info.health_status == "healthy"
+                    else AgentWorkloadState.STARTING
+                )
+            if info.status == "removing":
+                return AgentWorkloadState.STOPPING
+            return AgentWorkloadState.FAILED
         if info.status in {"created", "restarting"}:
             return AgentWorkloadState.STARTING
         if info.status in {"running", "paused"}:

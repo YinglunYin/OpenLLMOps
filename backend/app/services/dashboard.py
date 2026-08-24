@@ -32,14 +32,22 @@ def _count(model, *criteria):  # type: ignore[no-untyped-def]
     return statement.scalar_subquery()
 
 
-def _activity_select(resource_type: str, model, status_column):  # type: ignore[no-untyped-def]
-    return select(
+def _activity_select(  # type: ignore[no-untyped-def]
+    resource_type: str,
+    model,
+    status_column,
+    *criteria,
+):
+    statement = select(
         literal(resource_type).label("resource_type"),
         cast(model.id, String).label("resource_id"),
         model.name.label("name"),
         cast(status_column, String).label("status"),
         model.updated_at.label("occurred_at"),
     )
+    if criteria:
+        statement = statement.where(*criteria)
+    return statement
 
 
 async def build_dashboard_summary(
@@ -50,10 +58,22 @@ async def build_dashboard_summary(
     """三个数据库往返完成全部摘要，避免逐资源列表后在 Python 中计数。"""
 
     counts_statement = select(
-        _count(ModelAsset).label("models_total"),
-        _count(ModelAsset, ModelAsset.status == AssetStatus.READY).label("models_ready"),
-        _count(ModelAsset, ModelAsset.status == AssetStatus.IMPORTING).label("models_importing"),
-        _count(ModelAsset, ModelAsset.status == AssetStatus.FAILED).label("models_failed"),
+        _count(ModelAsset, ModelAsset.deleted_at.is_(None)).label("models_total"),
+        _count(
+            ModelAsset,
+            ModelAsset.deleted_at.is_(None),
+            ModelAsset.status == AssetStatus.READY,
+        ).label("models_ready"),
+        _count(
+            ModelAsset,
+            ModelAsset.deleted_at.is_(None),
+            ModelAsset.status == AssetStatus.IMPORTING,
+        ).label("models_importing"),
+        _count(
+            ModelAsset,
+            ModelAsset.deleted_at.is_(None),
+            ModelAsset.status == AssetStatus.FAILED,
+        ).label("models_failed"),
         _count(Deployment).label("deployments_total"),
         _count(Deployment, Deployment.actual_state == DeploymentState.RUNNING).label("deployments_running"),
         _count(Deployment, Deployment.actual_state == DeploymentState.QUEUED).label("deployments_queued"),
@@ -73,7 +93,12 @@ async def build_dashboard_summary(
     lease_rows = list(await session.scalars(select(GPULease).order_by(GPULease.gpu_index)))
 
     activities = union_all(
-        _activity_select("model_asset", ModelAsset, ModelAsset.status),
+        _activity_select(
+            "model_asset",
+            ModelAsset,
+            ModelAsset.status,
+            ModelAsset.deleted_at.is_(None),
+        ),
         _activity_select("model_import", ModelImportJob, ModelImportJob.status),
         _activity_select("deployment", Deployment, Deployment.actual_state),
         _activity_select("training_job", TrainingJob, TrainingJob.actual_state),

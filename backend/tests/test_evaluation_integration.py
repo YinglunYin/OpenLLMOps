@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -78,22 +79,19 @@ def _prepare_builtin(root: Path, name: str) -> Path:
     return dataset_path
 
 
-def _create_model(client: TestClient, kind: ModelKind, suffix: str) -> dict:
+def _create_model(
+    seed_model_asset: Callable[..., dict[str, str]],
+    kind: ModelKind,
+    suffix: str,
+) -> dict[str, str]:
     settings = get_settings()
     model_path = settings.model_root / f"evaluation-{suffix}-{uuid.uuid4()}"
     model_path.mkdir(parents=True)
-    response = client.post(
-        "/api/v1/model-assets",
-        json={
-            "name": f"evaluation-{suffix}-{uuid.uuid4()}",
-            "source_type": "manual",
-            "local_path": str(model_path),
-            "model_kind": kind.value,
-            "status": "ready",
-        },
+    return seed_model_asset(
+        model_path,
+        kind=kind,
+        name=f"evaluation-{suffix}-{uuid.uuid4()}",
     )
-    assert response.status_code == 201, response.text
-    return response.json()
 
 
 def _upload_custom_dataset(client: TestClient) -> dict:
@@ -112,12 +110,15 @@ def _upload_custom_dataset(client: TestClient) -> dict:
     return response.json()
 
 
-def test_evaluation_api_derives_execution_and_rejects_client_paths(client: TestClient) -> None:
+def test_evaluation_api_derives_execution_and_rejects_client_paths(
+    client: TestClient,
+    seed_model_asset: Callable[..., dict[str, str]],
+) -> None:
     settings = get_settings()
     _prepare_builtin(settings.evaluation_dataset_root, "ceval")
     _prepare_builtin(settings.evaluation_dataset_root, "cmmlu")
-    base = _create_model(client, ModelKind.BASE, "base")
-    candidate = _create_model(client, ModelKind.INSTRUCT, "candidate")
+    base = _create_model(seed_model_asset, ModelKind.BASE, "base")
+    candidate = _create_model(seed_model_asset, ModelKind.INSTRUCT, "candidate")
     custom = _upload_custom_dataset(client)
     payload = {
         "name": f"evaluation-{uuid.uuid4()}",

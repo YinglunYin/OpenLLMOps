@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """以部署配置的真实身份验证共享存储权限。"""
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ CONTROLLED_DIRECTORIES = (
     "models",
     "inbox",
     "model-staging",
+    "upload-tmp",
     "datasets",
     "evaluation-datasets",
     "evaluation-output",

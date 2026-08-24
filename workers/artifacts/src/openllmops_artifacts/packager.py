@@ -51,11 +51,15 @@ def _files(source: Path) -> list[tuple[Path, Path]]:
             candidate = current / name
             mode = candidate.lstat().st_mode
             if stat.S_ISLNK(mode):
-                raise ArtifactPackagingError(f"Checkpoint 不允许软链接: {candidate.relative_to(source)}")
+                raise ArtifactPackagingError(
+                    f"Checkpoint 不允许软链接: {candidate.relative_to(source)}"
+                )
         for name in names:
             candidate = current / name
             if not stat.S_ISREG(candidate.lstat().st_mode):
-                raise ArtifactPackagingError(f"Checkpoint 包含特殊文件: {candidate.relative_to(source)}")
+                raise ArtifactPackagingError(
+                    f"Checkpoint 包含特殊文件: {candidate.relative_to(source)}"
+                )
             resolved = candidate.resolve(strict=True)
             if not resolved.is_relative_to(source):
                 raise ArtifactPackagingError("Checkpoint 文件逃逸来源目录")
@@ -114,9 +118,7 @@ def create_checkpoint_archive(
             tarfile.open(fileobj=compressed, mode="w") as archive,
         ):
             for path, relative in source_files:
-                info = archive.gettarinfo(
-                    str(path), arcname=f"checkpoint/{relative.as_posix()}"
-                )
+                info = archive.gettarinfo(str(path), arcname=f"checkpoint/{relative.as_posix()}")
                 # 删除宿主机身份与时间信息，归档在不同机器上仍可稳定审计。
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""

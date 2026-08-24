@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import UnsafePathError, iter_regular_files
+from .validation import ModelValidationError, _validate_model_files
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,19 +45,16 @@ def scan_inbox(inbox_root: Path, *, maximum_candidates: int = 1000) -> list[Inbo
                 )
             )
             continue
+        file_count = 0
+        size_bytes = 0
         try:
             files = list(iter_regular_files(child))
             file_count = len(files)
             size_bytes = sum(path.stat().st_size for path, _ in files)
-            has_config = any(relative.as_posix() == "config.json" for _, relative in files)
-            has_safetensors = any(
-                relative.suffix.casefold() == ".safetensors" for _, relative in files
-            )
-            ready = bool(files) and has_config and has_safetensors
-            reason = None if ready else "缺少 config.json、Safetensors 权重或目录为空"
-        except (OSError, UnsafePathError) as exc:
-            file_count = 0
-            size_bytes = 0
+            _validate_model_files(child, files)
+            ready = True
+            reason = None
+        except (OSError, UnsafePathError, ModelValidationError) as exc:
             ready = False
             reason = str(exc)
         candidates.append(

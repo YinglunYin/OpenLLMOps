@@ -126,8 +126,10 @@ async def test_gpu_status_preserves_missing_values_and_merges_lease(
     assert statuses[0].degraded_reason is not None and "指标不完整" in statuses[0].degraded_reason
     assert statuses[0].owner_type == LeaseOwnerType.TRAINING
     assert statuses[0].owner_name == "domain-sft"
+    assert statuses[0].resource_state == "leased"
     assert statuses[1].telemetry_available is False
     assert statuses[1].memory_used_mib is None
+    assert statuses[1].resource_state == "unknown"
     assert statuses[1].degraded_reason == "未收到 GPU 1 的 DCGM 指标"
 
 
@@ -159,7 +161,34 @@ async def test_gpu_status_uses_official_dcgm_units_and_derives_total(
     assert status.temperature_celsius == 61
     assert status.power_watts == 312.5
     assert status.telemetry_available is True
+    # 没有控制面租约但存在明显显存/计算活动，必须保守标为未纳管，不能误报空闲。
+    assert status.resource_state == "unmanaged"
     assert status.degraded_reason is None
+
+
+async def test_gpu_status_only_reports_idle_with_healthy_low_activity_telemetry(
+    isolated_session_factory,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_vector_payload(
+                (DCGM_FB_USED, "0", "256"),
+                (DCGM_FB_FREE, "0", "23268"),
+                (DCGM_FB_RESERVED, "0", "52"),
+                (DCGM_GPU_UTIL, "0", "0"),
+                (DCGM_GPU_TEMP, "0", "42"),
+                (DCGM_POWER_USAGE, "0", "26"),
+            ),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        prometheus = PrometheusClient("http://prometheus:9090", 1, http_client=http_client)
+        async with isolated_session_factory() as session:
+            status = (await get_gpu_statuses(session, prometheus, gpu_count=1))[0]
+
+    assert status.telemetry_available is True
+    assert status.resource_state == "idle"
 
 
 async def test_prometheus_timeout_becomes_explicit_degraded_gpu_data(
@@ -176,6 +205,7 @@ async def test_prometheus_timeout_becomes_explicit_degraded_gpu_data(
             statuses = await get_gpu_statuses(session, prometheus, gpu_count=2)
     assert all(not item.telemetry_available for item in statuses)
     assert all(item.memory_used_mib is None for item in statuses)
+    assert all(item.resource_state == "unknown" for item in statuses)
     assert {item.degraded_reason for item in statuses} == {"Prometheus 查询超时"}
 
 
@@ -186,6 +216,7 @@ def test_gpu_api_without_prometheus_is_degraded_not_zero(client) -> None:  # typ
     assert len(body) == 2
     assert all(item["telemetry_available"] is False for item in body)
     assert all(item["memory_used_mib"] is None for item in body)
+    assert all(item["resource_state"] == "unknown" for item in body)
     assert {item["degraded_reason"] for item in body} == {"Prometheus 未配置"}
 
 

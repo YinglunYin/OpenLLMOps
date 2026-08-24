@@ -1,9 +1,10 @@
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
+from docker.errors import APIError, NotFound
 from openllmops_training_config import (
     Algorithm,
     DatasetFormat,
@@ -29,6 +30,7 @@ from openllmops_agent.docker_runner import (
     TRAINING_ALGORITHM_LABEL,
     DockerRunner,
     InvalidWorkload,
+    WorkloadConflict,
 )
 from openllmops_agent.evaluation_image_policy import EXPECTED_EVALUATION_LABELS
 from openllmops_agent.image_policy import EXPECTED_SECURITY_LABELS
@@ -136,6 +138,166 @@ def test_vllm_027_command_keeps_supported_model_and_safetensors_flags(
     assert command[command.index("--model") + 1] == "/workspace/model"
     assert command[command.index("--runner") + 1] == "generate"
     assert command[command.index("--load-format") + 1] == "safetensors"
+
+
+def test_inference_installs_local_vllm_readiness_and_liveness_healthcheck(
+    runner: DockerRunner,
+) -> None:
+    deployment_id = uuid4()
+    model_path = runner.settings.model_root / "inference-demo"
+    model_path.mkdir()
+    image = MagicMock()
+    image.id = "sha256:" + "b" * 64
+    runner.client.images.get.return_value = image
+    runner.client.containers.run.return_value = MagicMock()
+    expected = WorkloadInfo(
+        name=f"openllmops-inference-{deployment_id}",
+        workload_id=deployment_id,
+        kind="inference",
+        image=image.id,
+        status="running",
+        health_status="starting",
+        gpu_ids=[0],
+        service_type="generate",
+        endpoint=f"http://openllmops-inference-{deployment_id}:8123",
+        port=8123,
+    )
+    request = InferenceLaunchRequest(
+        deployment_id=deployment_id,
+        image=runner.settings.vllm_runtime_image,
+        gpu_ids=[0],
+        model_path=model_path,
+        served_model_name="demo",
+        port=8123,
+    )
+
+    with (
+        patch.object(runner, "_assert_name_available"),
+        patch.object(runner, "_assert_gpus_available"),
+        patch.object(runner, "_to_info", return_value=expected),
+    ):
+        assert runner.launch_inference(request) == expected
+
+    arguments = runner.client.containers.run.call_args.kwargs
+    healthcheck = arguments["healthcheck"]
+    assert healthcheck["test"][:2] == ["CMD", "python"]
+    assert healthcheck["test"][2] == "-c"
+    assert "http://127.0.0.1:8123/health" in healthcheck["test"][3]
+    assert healthcheck["interval"] == 5 * 1_000_000_000
+    assert healthcheck["start_period"] == (runner.settings.inference_startup_timeout_seconds * 1_000_000_000)
+    assert healthcheck["retries"] == 3
+    assert arguments["restart_policy"] == {"Name": "on-failure", "MaximumRetryCount": 3}
+    assert arguments["log_config"] == {
+        "type": "local",
+        "config": {"max-size": "20m", "max-file": "5"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw_health", "expected"),
+    [
+        ({"Status": "starting"}, "starting"),
+        ({"Status": "healthy"}, "healthy"),
+        ({"Status": "unhealthy"}, "unhealthy"),
+        ({"Status": "unexpected"}, None),
+        (None, None),
+    ],
+)
+def test_workload_info_reads_only_known_docker_health_states(
+    runner: DockerRunner,
+    raw_health: dict[str, str] | None,
+    expected: str | None,
+) -> None:
+    deployment_id = uuid4()
+    container = MagicMock()
+    container.name = f"openllmops-inference-{deployment_id}"
+    container.status = "running"
+    container.labels = {
+        MANAGED_LABEL: "true",
+        ID_LABEL: str(deployment_id),
+        KIND_LABEL: "inference",
+        GPU_LABEL: "0",
+        GENERATION_LABEL: "1",
+    }
+    container.image.tags = [runner.settings.vllm_runtime_image]
+    state: dict[str, object] = {
+        "ExitCode": 0,
+        "StartedAt": "2026-08-25T01:02:03.123456Z",
+        "FinishedAt": "2026-08-25T01:03:04.123456Z",
+    }
+    if raw_health is not None:
+        state["Health"] = {**raw_health, "FailingStreak": 7}
+    container.attrs = {
+        "Created": "2026-08-25T01:00:00Z",
+        "RestartCount": 2,
+        "State": state,
+    }
+
+    info = runner._to_info(container)
+
+    assert info.health_status == expected
+    assert info.restart_count == 2
+    assert info.health_failing_streak == (7 if raw_health is not None else 0)
+    assert info.started_at is not None and info.finished_at is not None and info.created_at is not None
+
+
+def _inference_container(runner: DockerRunner, *, status: str = "running") -> MagicMock:
+    workload_id = uuid4()
+    container = MagicMock()
+    container.name = f"openllmops-inference-{workload_id}"
+    container.status = status
+    container.labels = {
+        MANAGED_LABEL: "true",
+        ID_LABEL: str(workload_id),
+        KIND_LABEL: "inference",
+        GPU_LABEL: "0",
+        GENERATION_LABEL: "4",
+    }
+    container.image.tags = [runner.settings.vllm_runtime_image]
+    container.attrs = {"State": {"ExitCode": 0}}
+    runner.client.containers.get.return_value = container
+    return container
+
+
+def test_quiesce_failed_inference_stops_then_confirms_non_active(
+    runner: DockerRunner,
+) -> None:
+    container = _inference_container(runner)
+
+    def stopped(*, timeout: int) -> None:
+        assert timeout == 9
+        container.status = "exited"
+        container.attrs = {"State": {"ExitCode": 137}}
+
+    container.stop.side_effect = stopped
+
+    confirmed = runner.quiesce_failed_inference(
+        UUID(container.labels[ID_LABEL]),
+        4,
+        timeout_seconds=9,
+    )
+
+    assert confirmed is True
+    container.stop.assert_called_once_with(timeout=9)
+    assert container.reload.call_count >= 2
+    container.remove.assert_not_called()
+
+
+def test_quiesce_failed_inference_keeps_uncertain_active_container(
+    runner: DockerRunner,
+) -> None:
+    container = _inference_container(runner)
+    container.stop.side_effect = APIError("stop response lost")
+
+    confirmed = runner.quiesce_failed_inference(
+        UUID(container.labels[ID_LABEL]),
+        4,
+        timeout_seconds=9,
+    )
+
+    assert confirmed is False
+    assert container.status == "running"
+    container.remove.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -263,6 +425,10 @@ def test_training_uses_fixed_wrapper_paths_offline_network_and_world_size(
     assert arguments["environment"]["NCCL_P2P_DISABLE"] == "1"
     assert arguments["network_mode"] == "none"
     assert arguments["labels"][TRAINING_ALGORITHM_LABEL] == "lora"
+    assert arguments["log_config"] == {
+        "type": "local",
+        "config": {"max-size": "20m", "max-file": "5"},
+    }
 
 
 def test_training_image_is_resolved_to_verified_immutable_id(
@@ -474,6 +640,10 @@ def test_evaluation_launch_uses_verified_image_fixed_command_and_no_network(
     assert arguments["security_opt"] == ["no-new-privileges:true"]
     assert arguments["volumes"][str(dataset.parent)]["mode"] == "ro"
     assert arguments["volumes"][str(output)]["mode"] == "rw"
+    assert arguments["log_config"] == {
+        "type": "local",
+        "config": {"max-size": "20m", "max-file": "5"},
+    }
 
 
 def test_stop_reloads_once_before_and_once_after_transition(runner: DockerRunner) -> None:
@@ -522,11 +692,162 @@ def _contract_terminal_container(
         KIND_LABEL: kind,
         GPU_LABEL: "0",
         GENERATION_LABEL: "1",
+        "com.openllmops.owner-type": "evaluation" if kind == "evaluation" else "training",
     }
     container.attrs = {"State": {"ExitCode": exit_code}}
     container.image.tags = [runner.settings.llamafactory_runtime_image]
     runner.client.containers.get.return_value = container
     return container
+
+
+@pytest.mark.parametrize(
+    ("kind", "owner_type", "status", "exit_code"),
+    [
+        ("training", "training", "exited", 0),
+        ("training", "training", "exited", 1),
+        ("evaluation", "evaluation", "dead", 137),
+        ("inference", "deployment", "exited", 1),
+    ],
+)
+def test_contract_cleanup_removes_only_confirmed_terminal_container_and_keeps_bind_output(
+    runner: DockerRunner,
+    kind: str,
+    owner_type: str,
+    status: str,
+    exit_code: int,
+) -> None:
+    workload_id = uuid4()
+    output = runner.settings.runtime_root / "preserved" / str(workload_id)
+    output.mkdir(parents=True)
+    artifact = output / "artifact.bin"
+    artifact.write_bytes(b"preserve me")
+    container = _contract_terminal_container(
+        runner,
+        workload_id,
+        kind=kind,
+        status=status,
+        exit_code=exit_code,
+    )
+    container.labels["com.openllmops.owner-type"] = owner_type
+
+    runner.cleanup_contract_workload(owner_type, workload_id, generation=1)
+
+    container.remove.assert_called_once_with(force=False, v=False)
+    assert artifact.read_bytes() == b"preserve me"
+
+
+def test_contract_cleanup_is_idempotent_when_container_is_absent(
+    runner: DockerRunner,
+) -> None:
+    workload_id = uuid4()
+    runner.client.containers.get.side_effect = NotFound("gone")
+
+    runner.cleanup_contract_workload("training", workload_id, generation=4)
+    runner.cleanup_contract_workload("training", workload_id, generation=4)
+
+    assert runner.client.containers.get.call_count == 2
+
+
+@pytest.mark.parametrize("status", ["created", "running", "restarting", "paused", "removing", "unknown"])
+def test_contract_cleanup_rejects_nonterminal_or_uncertain_status_without_removing(
+    runner: DockerRunner,
+    status: str,
+) -> None:
+    workload_id = uuid4()
+    container = _contract_terminal_container(
+        runner,
+        workload_id,
+        status=status,
+        exit_code=0,
+    )
+
+    with pytest.raises(WorkloadConflict, match="cleanup"):
+        runner.cleanup_contract_workload("training", workload_id, generation=1)
+
+    container.remove.assert_not_called()
+
+
+def test_contract_cleanup_rejects_generation_mismatch_without_removing(
+    runner: DockerRunner,
+) -> None:
+    workload_id = uuid4()
+    container = _contract_terminal_container(
+        runner,
+        workload_id,
+        status="exited",
+        exit_code=0,
+    )
+
+    with pytest.raises(WorkloadConflict, match="generation"):
+        runner.cleanup_contract_workload("training", workload_id, generation=2)
+
+    container.remove.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("label", "value", "message"),
+    [
+        (MANAGED_LABEL, "false", "owner"),
+        (KIND_LABEL, "evaluation", "owner"),
+        ("com.openllmops.owner-type", "evaluation", "owner"),
+        (GENERATION_LABEL, "01", "generation"),
+    ],
+)
+def test_contract_cleanup_rejects_untrusted_identity_labels_without_removing(
+    runner: DockerRunner,
+    label: str,
+    value: str,
+    message: str,
+) -> None:
+    workload_id = uuid4()
+    container = _contract_terminal_container(
+        runner,
+        workload_id,
+        status="exited",
+        exit_code=0,
+    )
+    container.labels[label] = value
+
+    with pytest.raises(WorkloadConflict, match=message):
+        runner.cleanup_contract_workload("training", workload_id, generation=1)
+
+    container.remove.assert_not_called()
+
+
+def test_contract_cleanup_preserves_container_when_inspect_is_uncertain(
+    runner: DockerRunner,
+) -> None:
+    workload_id = uuid4()
+    container = _contract_terminal_container(
+        runner,
+        workload_id,
+        status="exited",
+        exit_code=0,
+    )
+    container.reload.side_effect = APIError("inspect unavailable")
+
+    with pytest.raises(APIError, match="inspect unavailable"):
+        runner.cleanup_contract_workload("training", workload_id, generation=1)
+
+    container.remove.assert_not_called()
+
+
+def test_contract_cleanup_does_not_claim_success_when_remove_is_uncertain(
+    runner: DockerRunner,
+) -> None:
+    workload_id = uuid4()
+    container = _contract_terminal_container(
+        runner,
+        workload_id,
+        status="exited",
+        exit_code=1,
+    )
+    container.remove.side_effect = APIError("remove response unavailable")
+
+    with pytest.raises(APIError, match="remove response unavailable"):
+        runner.cleanup_contract_workload("training", workload_id, generation=1)
+
+    container.remove.assert_called_once_with(force=False, v=False)
 
 
 def test_contract_stop_preserves_preexisting_success_and_repeated_stop(

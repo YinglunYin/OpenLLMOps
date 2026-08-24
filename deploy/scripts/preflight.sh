@@ -15,16 +15,21 @@ if [ ! -f "$env_file" ]; then
     exit 1
 fi
 
-for command_name in docker nvidia-smi python3 stat; do
+for command_name in docker nvidia-smi openssl python3 stat; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         echo "缺少命令：$command_name" >&2
         exit 1
     fi
 done
 
-docker info >/dev/null
-compose_version=$(docker compose version --short)
-engine_version=$(docker version --format '{{.Server.Version}}')
+# Compose 的优先级规定 shell 环境覆盖 --env-file。先拒绝所有与 compose 插值同名的
+# 已导出变量，避免 ENVIRONMENT/AUTH_ENABLED/密钥/镜像白名单等绕过后续文件校验。
+python3 "$script_dir/reject-compose-overrides.py" "$env_file" "$compose_file"
+python3 "$script_dir/read-env-value.py" "$env_file" __VALIDATE_ONLY >/dev/null
+
+# 必须先拒绝公开占位值，随后才允许任何 Docker/Compose 操作。
+python3 "$script_dir/validate-secrets.py" "$env_file"
+python3 "$script_dir/validate-web-config.py" "$env_file"
 
 version_at_least() {
     current=$1
@@ -32,6 +37,117 @@ version_at_least() {
     first=$(printf '%s\n%s\n' "$minimum" "$current" | sort -V | head -n 1)
     [ "$first" = "$minimum" ]
 }
+
+read_env_value() {
+    key=$1
+    python3 "$script_dir/read-env-value.py" "$env_file" "$key"
+}
+
+# CUDA_VARIANT 不由驱动或镜像名隐式推测：生产 digest 不包含 tag，
+# 显式声明才能让审计、预检和评测镜像重建遵守同一契约。下限取自
+# NVIDIA 对应 Toolkit 更新版的 Linux x86_64 驱动表；不依赖有功能限制的
+# 跨小版本兼容下限，因为 vLLM 会运行 JIT 内核。
+cuda_variant=$(read_env_value CUDA_VARIANT)
+case "$cuda_variant" in
+    cu130)
+        expected_cuda_version=13.0.2
+        minimum_driver_version=580.95.05
+        ;;
+    cu129)
+        expected_cuda_version=12.9.1
+        minimum_driver_version=575.57.08
+        ;;
+    *)
+        echo "CUDA_VARIANT 必须显式设为 cu130 或 cu129" >&2
+        exit 1
+        ;;
+esac
+
+driver_version_has_valid_format() {
+    version=$1
+    major=${version%%.*}
+    remainder=${version#*.}
+    [ "$remainder" != "$version" ] || return 1
+    minor=${remainder%%.*}
+    patch=${remainder#*.}
+    [ "$patch" != "$remainder" ] || return 1
+    case "$patch" in
+        *.*) return 1 ;;
+    esac
+    for component in "$major" "$minor" "$patch"; do
+        case "$component" in
+            "" | *[!0-9]*) return 1 ;;
+        esac
+    done
+}
+
+# 一次读取每张卡的索引和驱动版本，逐行严格校验。虽然正常主机的
+# 各 GPU 共用同一内核驱动，仍不能只检查第一行后就放行。
+if ! gpu_inventory=$(nvidia-smi --query-gpu=index,driver_version --format=csv,noheader,nounits); then
+    echo "nvidia-smi 无法读取 GPU 驱动信息" >&2
+    exit 1
+fi
+if [ -z "$gpu_inventory" ]; then
+    echo "nvidia-smi 未返回任何 GPU" >&2
+    exit 1
+fi
+
+detected_gpu_count=0
+while IFS= read -r gpu_row; do
+    case "$gpu_row" in
+        *,*) ;;
+        *)
+            echo "nvidia-smi 返回了格式异常的 GPU 驱动行" >&2
+            exit 1
+            ;;
+    esac
+    gpu_index=${gpu_row%%,*}
+    driver_version=${gpu_row#*,}
+    # CSV 分隔符周围的空白是 nvidia-smi 的正常输出；中间空白不能
+    # 用全局删除“修复”，否则 580. 95.05 之类异常值会被放行。
+    gpu_index=$(printf '%s' "$gpu_index" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    driver_version=$(printf '%s' "$driver_version" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$gpu_index" in
+        "" | *[!0-9]*)
+            echo "nvidia-smi 返回了格式异常的 GPU 索引" >&2
+            exit 1
+            ;;
+    esac
+    case "$driver_version" in
+        *,*)
+            echo "GPU $gpu_index 的驱动版本格式异常" >&2
+            exit 1
+            ;;
+    esac
+    if ! driver_version_has_valid_format "$driver_version"; then
+        echo "GPU $gpu_index 的驱动版本格式异常：$driver_version" >&2
+        exit 1
+    fi
+    if ! version_at_least "$driver_version" "$minimum_driver_version"; then
+        echo "GPU $gpu_index 驱动 $driver_version 低于 CUDA_VARIANT=$cuda_variant 所需的 $minimum_driver_version" >&2
+        exit 1
+    fi
+    detected_gpu_count=$((detected_gpu_count + 1))
+done <<EOF
+$gpu_inventory
+EOF
+
+configured_gpu_count=$(read_env_value GPU_COUNT)
+configured_gpu_count=${configured_gpu_count:-4}
+case "$configured_gpu_count" in
+    "" | *[!0-9]* | 0)
+        echo "GPU_COUNT 必须是正整数" >&2
+        exit 1
+        ;;
+esac
+if [ "$configured_gpu_count" != "$detected_gpu_count" ]; then
+    echo "GPU_COUNT=$configured_gpu_count，但 nvidia-smi 检测到 $detected_gpu_count 张卡" >&2
+    exit 1
+fi
+
+docker info >/dev/null
+compose_version=$(docker compose version --short)
+engine_version=$(docker version --format '{{.Server.Version}}')
 
 if ! version_at_least "$compose_version" "2.33.1"; then
     echo "Docker Compose $compose_version 过旧，最低需要 2.33.1" >&2
@@ -42,11 +158,10 @@ if ! version_at_least "$engine_version" "28.0.0"; then
     exit 1
 fi
 docker compose --env-file "$env_file" -f "$compose_file" config --quiet
-
-read_env_value() {
-    key=$1
-    sed -n "s/^${key}=//p" "$env_file" | tail -n 1
-}
+# Compose 规定调用进程环境优先于 --env-file；把含密钥的最终 JSON 只经内存管道
+# 交给校验器，确认 TLS/CORS/存储等关键值没有被 shell 环境静默覆盖。
+docker compose --env-file "$env_file" -f "$compose_file" config --format json \
+    | python3 "$script_dir/validate-rendered-config.py" "$env_file"
 
 environment=$(read_env_value ENVIRONMENT)
 environment=${environment:-production}
@@ -112,6 +227,16 @@ while [ -n "$remaining_images" ]; do
 done
 
 # vLLM 仅允许已审计的 0.27.1 固定变体或仓库 digest，且必须由管理员预拉取。
+validate_image_cuda_version() {
+    image_reference=$1
+    image_cuda_version=$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image_reference" \
+        | sed -n 's/^CUDA_VERSION=//p')
+    if [ "$image_cuda_version" != "$expected_cuda_version" ]; then
+        echo "镜像 $image_reference 的 CUDA_VERSION 与 CUDA_VARIANT=$cuda_variant 不一致；期望 $expected_cuda_version" >&2
+        exit 1
+    fi
+}
+
 vllm_images=$(read_env_value VLLM_ALLOWED_IMAGES)
 vllm_images=${vllm_images:-vllm/vllm-openai:v0.27.1}
 vllm_images=$(PYTHONPATH="$project_root/agent" python3 -m openllmops_agent.vllm_image_policy "$vllm_images")
@@ -133,7 +258,20 @@ while [ -n "$remaining_images" ]; do
         exit 1
     fi
     require_production_digest "$environment" "VLLM_ALLOWED_IMAGES" "$vllm_image"
+    validate_image_cuda_version "$vllm_image"
 done
+
+# 评测镜像的构建基础引用与运行白名单分开配置，因此也要单独
+# 核对。否则一次重建可能把 cu129 评测镜像静默换回 cu130。
+evaluation_vllm_base_image=$(read_env_value EVALUATION_VLLM_BASE_IMAGE)
+evaluation_vllm_base_image=${evaluation_vllm_base_image:-vllm/vllm-openai:v0.27.1}
+evaluation_vllm_base_image=$(PYTHONPATH="$project_root/agent" python3 -m openllmops_agent.vllm_image_policy "$evaluation_vllm_base_image")
+if ! docker image inspect "$evaluation_vllm_base_image" >/dev/null 2>&1; then
+    echo "评测基础 vLLM 镜像尚未拉取：$evaluation_vllm_base_image" >&2
+    exit 1
+fi
+require_production_digest "$environment" "EVALUATION_VLLM_BASE_IMAGE" "$evaluation_vllm_base_image"
+validate_image_cuda_version "$evaluation_vllm_base_image"
 
 # 评测镜像除引用白名单外，还要核对构建标签，防止同名镜像替换执行器。
 evaluation_images=$(read_env_value EVALUATION_ALLOWED_IMAGES)
@@ -164,15 +302,8 @@ while [ -n "$remaining_images" ]; do
         echo "评测镜像缺少可验证的顺序运行/禁用远程代码/vLLM 版本标签：$evaluation_image" >&2
         exit 1
     fi
+    validate_image_cuda_version "$evaluation_image"
 done
-
-configured_gpu_count=$(read_env_value GPU_COUNT)
-configured_gpu_count=${configured_gpu_count:-4}
-detected_gpu_count=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')
-if [ "$configured_gpu_count" != "$detected_gpu_count" ]; then
-    echo "GPU_COUNT=$configured_gpu_count，但 nvidia-smi 检测到 $detected_gpu_count 张卡" >&2
-    exit 1
-fi
 
 docker_runtimes=$(docker info --format '{{json .Runtimes}}')
 case "$docker_runtimes" in

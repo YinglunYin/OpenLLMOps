@@ -2,6 +2,7 @@ import time
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from docker.errors import APIError
 from fastapi.testclient import TestClient
 
 from openllmops_agent.agent_contract import (
@@ -41,6 +42,11 @@ class StubProcessor:
 class BrokenProcessor:
     def execute(self, command: AgentCommand) -> CommandResult:
         raise AssertionError(f"unexpected {command.request_id}")
+
+
+class DockerUnavailableProcessor:
+    def execute(self, command: AgentCommand) -> CommandResult:
+        raise APIError(f"inspect uncertain for {command.request_id}")
 
 
 def status_command() -> AgentCommand:
@@ -141,3 +147,31 @@ def test_unexpected_contract_failure_is_sanitized_and_signed() -> None:
     assert error.request_id == command.request_id
     assert error.error_code == "internal_error"
     assert "unexpected" not in error.message
+
+
+def test_cleanup_docker_uncertainty_is_signed_rejection_never_absent() -> None:
+    signer, _ = configure_contract_state()
+    app.state.command_processor = DockerUnavailableProcessor()
+    command = AgentCommand(
+        action="stop",
+        owner=AgentOwner(type="training", id=uuid4(), name="cleanup", generation=2),
+        resources=AgentResourceRequest(gpu_ids=[0]),
+        execution={"cleanup_terminal": True},
+    )
+    body = canonical_json(command)
+
+    response = TestClient(app).post(
+        "/v1/workloads/commands",
+        content=body,
+        headers=signer.sign(body, nonce="endpoint-cleanup-uncertain-nonce"),
+    )
+
+    assert response.status_code == 503
+    signer.verify(response.content, response.headers)
+    error = AgentCommandResponse.model_validate_json(response.content)
+    assert error.request_id == command.request_id
+    assert error.accepted is False
+    assert error.observed_state == AgentWorkloadState.FAILED
+    assert error.observed_state != AgentWorkloadState.ABSENT
+    assert error.error_code == "runner_unavailable"
+    assert "inspect uncertain" not in (error.message or "")

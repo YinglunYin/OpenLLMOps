@@ -68,6 +68,10 @@ uv run pytest
 node-agent 合同为 `POST /v1/workloads/commands`。请求与响应都对规范化 JSON 原始字节执行
 HMAC-SHA256 签名，携带时间戳与一次性 nonce；动作由 `start`、`stop`、`status` 组成，
 `request_id` 和 `owner.generation` 提供重试幂等与迟到响应隔离。
+删除部署、训练或评测记录时，控制面会发送带严格
+`execution={"cleanup_terminal":true}` 的签名 `stop`：只有 Agent 幂等删除终态容器并返回
+`absent` 后，才在同一事务中释放残留租约和删除数据库记录。Agent 不可达、响应验签失败、
+容器仍 active 或删除结果不确定时均阻断数据库删除。
 
 ## 模型训练执行与产物合同
 
@@ -100,8 +104,8 @@ checkpoint/adapter/merged，其中 checkpoint 会递归剔除 optimizer、schedu
 再次校验 model.safetensors（或严格分片索引）、config、tokenizer，并拒绝 pickle、远程
 custom code 和不安全文件。文件先复制到 `MODEL_ROOT` 内 staging，校验一致后在跨进程锁下
 无覆盖原子重命名，数据库保存 `published_model_asset_id`；最终 ModelAsset 永不直接引用
-`CHECKPOINT_ROOT`。删除训练任务当前只删除控制面记录并保留训练目录，清理属于显式运维
-动作；checkpoint 下载不承诺包含 optimizer 状态，也不代表支持断点续训。
+`CHECKPOINT_ROOT`。删除训练任务会先清理已结束的容器，但始终保留宿主机训练目录；
+checkpoint 下载不承诺包含 optimizer 状态，也不代表支持断点续训。
 
 ## 模型评测执行合同
 
@@ -157,6 +161,11 @@ Docker Compose `.env` 传递 Argon2 哈希，应使用单引号包裹，避免�
 使用单条条件更新。worker 完成 Safetensors 与配置校验并原子移入 `MODEL_ROOT` 后，控制面
 才在同一事务中创建 `ready` 模型资产；失败或取消任务不会产生可部署资产。在线访问令牌
 只从只读文件临时读入执行线程，既不写入导入任务/资产记录，也不接受请求体传入。
+
+在线导入会先把用户填写的分支/标签解析为完整不可变 commit，再严格按该 commit 下载；任务
+字段继续保留 requested revision，模型资产的 `revision` 与 manifest 则记录 resolved commit，
+便于复现与审计。下载 SDK 运行在独立子进程中，管理员取消时会先终止并回收子进程再清理
+暂存目录；下载和逐块 SHA-256 校验都会持续回报字节进度并检查取消信号。
 
 协调器持续用 `claimed_at` 作为执行心跳。进程或主机硬崩后，超过
 `MODEL_IMPORT_CLAIM_TIMEOUT_SECONDS` 的 transferring/validating 任务会清理其固定 UUID

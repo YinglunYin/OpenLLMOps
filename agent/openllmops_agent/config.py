@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     runtime_network: str = "openllmops-runtime"
 
     vllm_allowed_images: str = VLLM_RUNTIME_IMAGE
+    inference_startup_timeout_seconds: int = Field(default=30 * 60, ge=60, le=2 * 60 * 60)
+    inference_unhealthy_timeout_seconds: int = Field(default=60, ge=15, le=10 * 60)
+    inference_failure_stop_timeout_seconds: int = Field(default=30, ge=1, le=300)
     llamafactory_allowed_images: str = HARDENED_LLAMAFACTORY_IMAGE
     evaluation_allowed_images: str = EVALUATION_RUNTIME_IMAGE
     workload_uid: int = Field(default=1000, ge=1)
@@ -44,8 +47,11 @@ class Settings(BaseSettings):
     @field_validator("node_agent_token")
     @classmethod
     def validate_token(cls, value: SecretStr) -> SecretStr:
-        if len(value.get_secret_value()) < 32:
-            raise ValueError("NODE_AGENT_TOKEN 至少需要 32 个字符")
+        secret = value.get_secret_value()
+        if len(secret) < 32 or secret.casefold().startswith(
+            ("replace-with-", "example-", "changeme", "change-me")
+        ):
+            raise ValueError("NODE_AGENT_TOKEN 必须是至少 32 字符的非示例随机密钥")
         return value
 
     @field_validator("runtime_network")

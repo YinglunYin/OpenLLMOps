@@ -5,6 +5,7 @@ import io
 import json
 import tarfile
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -125,21 +126,18 @@ def _job(
     )
 
 
-def test_training_create_uses_strict_server_derived_contract(client: TestClient) -> None:
+def test_training_create_uses_strict_server_derived_contract(
+    client: TestClient,
+    seed_model_asset: Callable[..., dict[str, str]],
+) -> None:
     settings = get_settings()
     model_path = settings.model_root / f"training-contract-{uuid.uuid4()}"
     _write_deployable_model(model_path)
-    model = client.post(
-        "/api/v1/model-assets",
-        json={
-            "name": f"training-contract-{uuid.uuid4()}",
-            "source_type": "manual",
-            "local_path": str(model_path),
-            "model_kind": "base",
-            "status": "ready",
-        },
+    model = seed_model_asset(
+        model_path,
+        kind="base",
+        name=f"training-contract-{uuid.uuid4()}",
     )
-    assert model.status_code == 201, model.text
     dataset = client.post(
         "/api/v1/datasets/upload",
         data={"name": f"training-contract-{uuid.uuid4()}", "dataset_type": "sft"},
@@ -154,7 +152,7 @@ def test_training_create_uses_strict_server_derived_contract(client: TestClient)
     assert dataset.status_code == 201, dataset.text
     payload = {
         "name": f"training-contract-{uuid.uuid4()}",
-        "model_asset_id": model.json()["id"],
+        "model_asset_id": model["id"],
         "dataset_id": dataset.json()["id"],
         "stage": "sft",
         "algorithm": "lora",
@@ -201,19 +199,14 @@ def test_training_create_uses_strict_server_derived_contract(client: TestClient)
 
     embedding_path = settings.model_root / f"training-embedding-{uuid.uuid4()}"
     _write_deployable_model(embedding_path)
-    embedding = client.post(
-        "/api/v1/model-assets",
-        json={
-            "name": f"training-embedding-{uuid.uuid4()}",
-            "source_type": "manual",
-            "local_path": str(embedding_path),
-            "model_kind": "embedding",
-            "status": "ready",
-        },
+    embedding = seed_model_asset(
+        embedding_path,
+        kind="embedding",
+        name=f"training-embedding-{uuid.uuid4()}",
     )
     embedding_job = client.post(
         "/api/v1/training-jobs",
-        json={**payload, "name": f"embedding-job-{uuid.uuid4()}", "model_asset_id": embedding.json()["id"]},
+        json={**payload, "name": f"embedding-job-{uuid.uuid4()}", "model_asset_id": embedding["id"]},
     )
     assert embedding_job.status_code == 422 and "Embedding" in embedding_job.text
 

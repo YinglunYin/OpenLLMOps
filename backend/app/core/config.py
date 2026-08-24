@@ -172,8 +172,23 @@ class Settings(BaseSettings):
             extract_parameters(self.admin_password_hash)
         except InvalidHashError as exc:
             raise ValueError("生产环境 ADMIN_PASSWORD_HASH 不是有效的 Argon2 哈希") from exc
-        if not self.session_signing_key or len(self.session_signing_key) < 32:
-            raise ValueError("生产环境 SESSION_SIGNING_KEY 至少需要 32 个字符")
+        production_secrets = {
+            "SESSION_SIGNING_KEY": self.session_signing_key,
+            "ADMIN_API_KEY": self.admin_api_key,
+            "API_KEY_PEPPER": self.api_key_pepper,
+            "NODE_AGENT_TOKEN": self.node_agent_token,
+        }
+        normalized_secrets: dict[str, str] = {}
+        for name, value in production_secrets.items():
+            if (
+                not value
+                or len(value) < 32
+                or value.casefold().startswith(("replace-with-", "example-", "changeme", "change-me"))
+            ):
+                raise ValueError(f"生产环境 {name} 必须是至少 32 字符的非示例随机密钥")
+            normalized_secrets[name] = value
+        if len(set(normalized_secrets.values())) != len(normalized_secrets):
+            raise ValueError("生产环境的会话、API 与节点密钥必须彼此独立")
         if not self.session_cookie_secure:
             raise ValueError("生产环境会话 Cookie 必须启用 Secure")
         if not self.cors_origins or "*" in self.cors_origins:

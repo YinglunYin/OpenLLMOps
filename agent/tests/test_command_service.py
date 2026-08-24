@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -29,6 +30,9 @@ class FakeRunner:
         self.training_requests: list[TrainingLaunchRequest] = []
         self.evaluation_requests: list[EvaluationLaunchRequest] = []
         self.stop_calls = 0
+        self.cleanup_calls: list[tuple[str, UUID, int]] = []
+        self.quiesce_calls: list[tuple[UUID, int, int]] = []
+        self.quiesce_result = True
         self.training_metadata_completed_calls: list[bool] = []
 
     def prepare_contract_start(
@@ -58,6 +62,7 @@ class FakeRunner:
             endpoint=f"http://runtime:{request.port}",
             port=request.port,
             generation=request.generation,
+            health_status="healthy",
         )
         self.workloads[("deployment", request.deployment_id)] = info
         return info
@@ -108,6 +113,33 @@ class FakeRunner:
         del self.workloads[(owner_type, workload_id)]
         return None
 
+    def cleanup_contract_workload(self, owner_type: str, workload_id: UUID, generation: int) -> None:
+        self.cleanup_calls.append((owner_type, workload_id, generation))
+        info = self.workloads.get((owner_type, workload_id))
+        if info is None:
+            return
+        if info.generation != generation:
+            raise WorkloadConflict("generation mismatch")
+        if info.status not in {"exited", "dead"}:
+            raise WorkloadConflict("not terminal")
+        del self.workloads[(owner_type, workload_id)]
+
+    def quiesce_failed_inference(
+        self,
+        workload_id: UUID,
+        generation: int,
+        *,
+        timeout_seconds: int,
+    ) -> bool:
+        self.quiesce_calls.append((workload_id, generation, timeout_seconds))
+        if self.quiesce_result:
+            key = ("deployment", workload_id)
+            if key in self.workloads:
+                self.workloads[key] = self.workloads[key].model_copy(
+                    update={"status": "exited", "exit_code": 1}
+                )
+        return self.quiesce_result
+
     def training_metadata(self, workload_id: UUID, *, completed: bool = False) -> dict:
         self.training_metadata_completed_calls.append(completed)
         return {"progress": 25.0, "current_step": 1, "total_steps": 4}
@@ -121,7 +153,7 @@ class FakeRunner:
         }
 
 
-def settings_for(tmp_path: Path) -> Settings:
+def settings_for(tmp_path: Path, **overrides) -> Settings:  # type: ignore[no-untyped-def]
     settings = Settings(
         node_agent_token="a" * 32,
         model_root=tmp_path / "models",
@@ -131,6 +163,7 @@ def settings_for(tmp_path: Path) -> Settings:
         checkpoint_root=tmp_path / "checkpoints",
         training_config_root=tmp_path / "configs",
         runtime_root=tmp_path / "runtime",
+        **overrides,
     )
     settings.ensure_layout()
     return settings
@@ -159,6 +192,145 @@ def deployment_command(
             "vllm_args": {"gpu_memory_utilization": 0.9},
         },
     )
+
+
+def cleanup_command(
+    owner_type: str,
+    owner_id: UUID,
+    *,
+    generation: int = 1,
+    execution: dict | None = None,
+) -> AgentCommand:
+    return AgentCommand(
+        action=AgentAction.STOP,
+        owner=AgentOwner(type=owner_type, id=owner_id, name="cleanup", generation=generation),  # type: ignore[arg-type]
+        resources=AgentResourceRequest(gpu_ids=[0]),
+        execution={"cleanup_terminal": True} if execution is None else execution,
+    )
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_terminal_cleanup_removes_success_or_failure_and_reports_absent(
+    tmp_path: Path,
+    exit_code: int,
+) -> None:
+    runner = FakeRunner()
+    processor = CommandProcessor(settings_for(tmp_path), runner)  # type: ignore[arg-type]
+    owner_id = uuid4()
+    runner.workloads[("training", owner_id)] = WorkloadInfo(
+        name=f"openllmops-training-{owner_id}",
+        workload_id=owner_id,
+        kind="training",
+        image="training:test",
+        status="exited",
+        exit_code=exit_code,
+        gpu_ids=[0],
+        generation=3,
+    )
+
+    result = processor.execute(cleanup_command("training", owner_id, generation=3))
+
+    assert result.status_code == 200
+    assert result.response.accepted is True
+    assert result.response.observed_state == AgentWorkloadState.ABSENT
+    assert ("training", owner_id) not in runner.workloads
+
+
+def test_terminal_cleanup_is_idempotent_when_target_is_already_absent(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner()
+    processor = CommandProcessor(settings_for(tmp_path), runner)  # type: ignore[arg-type]
+    owner_id = uuid4()
+
+    first = processor.execute(cleanup_command("evaluation", owner_id, generation=2))
+    repeated = processor.execute(cleanup_command("evaluation", owner_id, generation=2))
+
+    assert first.response.accepted is True
+    assert first.response.observed_state == AgentWorkloadState.ABSENT
+    assert repeated.response.accepted is True
+    assert repeated.response.observed_state == AgentWorkloadState.ABSENT
+    assert runner.cleanup_calls == [
+        ("evaluation", owner_id, 2),
+        ("evaluation", owner_id, 2),
+    ]
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        {"cleanup_terminal": False},
+        {"cleanup_terminal": 1},
+        {"cleanup_terminal": True, "force": True},
+        {"force": True},
+    ],
+)
+def test_terminal_cleanup_marker_is_exact_and_strict(
+    tmp_path: Path,
+    execution: dict,
+) -> None:
+    runner = FakeRunner()
+    processor = CommandProcessor(settings_for(tmp_path), runner)  # type: ignore[arg-type]
+
+    result = processor.execute(cleanup_command("training", uuid4(), execution=execution))
+
+    assert result.status_code == 422
+    assert result.response.accepted is False
+    assert result.response.error_code == "invalid_execution"
+    assert runner.cleanup_calls == []
+
+
+@pytest.mark.parametrize("status", ["created", "running", "restarting", "paused", "removing"])
+def test_terminal_cleanup_rejects_nonterminal_container_without_removing_it(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    runner = FakeRunner()
+    processor = CommandProcessor(settings_for(tmp_path), runner)  # type: ignore[arg-type]
+    owner_id = uuid4()
+    key = ("deployment", owner_id)
+    runner.workloads[key] = WorkloadInfo(
+        name=f"openllmops-inference-{owner_id}",
+        workload_id=owner_id,
+        kind="inference",
+        image="vllm:test",
+        status=status,
+        gpu_ids=[0],
+        generation=1,
+    )
+
+    result = processor.execute(cleanup_command("deployment", owner_id))
+
+    assert result.status_code == 409
+    assert result.response.accepted is False
+    assert result.response.observed_state != AgentWorkloadState.ABSENT
+    assert key in runner.workloads
+
+
+def test_terminal_cleanup_rejects_generation_mismatch_and_preserves_container(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner()
+    processor = CommandProcessor(settings_for(tmp_path), runner)  # type: ignore[arg-type]
+    owner_id = uuid4()
+    key = ("training", owner_id)
+    runner.workloads[key] = WorkloadInfo(
+        name=f"openllmops-training-{owner_id}",
+        workload_id=owner_id,
+        kind="training",
+        image="training:test",
+        status="exited",
+        exit_code=0,
+        gpu_ids=[0],
+        generation=2,
+    )
+
+    result = processor.execute(cleanup_command("training", owner_id, generation=3))
+
+    assert result.status_code == 409
+    assert result.response.accepted is False
+    assert result.response.observed_state != AgentWorkloadState.ABSENT
+    assert key in runner.workloads
 
 
 def test_request_and_generation_are_idempotent_and_stale_is_rejected(
@@ -201,6 +373,278 @@ def test_request_and_generation_are_idempotent_and_stale_is_rejected(
     # generation 水位持久化，构造新的处理器后仍拒绝旧命令。
     restarted = CommandProcessor(settings_for(tmp_path), runner)  # type: ignore[arg-type]
     assert restarted.execute(stale).response.error_code == "stale_generation"
+
+
+@pytest.mark.parametrize(
+    ("status", "health_status", "expected"),
+    [
+        ("running", None, AgentWorkloadState.STARTING),
+        ("running", "starting", AgentWorkloadState.STARTING),
+        ("running", "unhealthy", AgentWorkloadState.STARTING),
+        ("restarting", "unhealthy", AgentWorkloadState.STARTING),
+        ("paused", "healthy", AgentWorkloadState.STARTING),
+        ("running", "healthy", AgentWorkloadState.RUNNING),
+        ("exited", "unhealthy", AgentWorkloadState.FAILED),
+    ],
+)
+def test_inference_requires_healthy_container_before_reporting_running(
+    tmp_path: Path,
+    status: str,
+    health_status: str | None,
+    expected: AgentWorkloadState,
+) -> None:
+    runner = FakeRunner()
+    processor = CommandProcessor(settings_for(tmp_path), runner)  # type: ignore[arg-type]
+    owner_id = uuid4()
+    runner.workloads[("deployment", owner_id)] = WorkloadInfo(
+        name=f"openllmops-inference-{owner_id}",
+        workload_id=owner_id,
+        kind="inference",
+        image="vllm/vllm-openai:v0.27.1",
+        status=status,
+        health_status=health_status,  # type: ignore[arg-type]
+        gpu_ids=[0],
+        service_type="generate",
+        endpoint=f"http://openllmops-inference-{owner_id}:8000",
+        port=8000,
+        generation=1,
+        exit_code=1 if status == "exited" else None,
+        health_failing_streak=1 if health_status == "unhealthy" else 0,
+        created_at=datetime.now(UTC),
+    )
+    command = AgentCommand(
+        action="status",
+        owner=AgentOwner(type="deployment", id=owner_id, name="chat", generation=1),
+        resources=AgentResourceRequest(gpu_ids=[0]),
+        execution={},
+    )
+
+    result = processor.execute(command)
+
+    assert result.response.observed_state == expected
+    if expected == AgentWorkloadState.RUNNING:
+        assert result.response.metadata["endpoint"].endswith(":8000")
+    else:
+        assert "endpoint" not in result.response.metadata
+
+
+def test_inference_health_can_recover_without_restarting_or_releasing_gpu(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner()
+    processor = CommandProcessor(settings_for(tmp_path), runner)  # type: ignore[arg-type]
+    owner_id = uuid4()
+    key = ("deployment", owner_id)
+    runner.workloads[key] = WorkloadInfo(
+        name=f"openllmops-inference-{owner_id}",
+        workload_id=owner_id,
+        kind="inference",
+        image="vllm/vllm-openai:v0.27.1",
+        status="running",
+        health_status="unhealthy",
+        health_failing_streak=1,
+        created_at=datetime.now(UTC),
+        gpu_ids=[0],
+        service_type="generate",
+        endpoint=f"http://openllmops-inference-{owner_id}:8000",
+        port=8000,
+        generation=1,
+    )
+
+    def status_command() -> AgentCommand:
+        return AgentCommand(
+            action="status",
+            owner=AgentOwner(type="deployment", id=owner_id, name="chat", generation=1),
+            resources=AgentResourceRequest(gpu_ids=[0]),
+            execution={},
+        )
+
+    waiting = processor.execute(status_command())
+    runner.workloads[key] = runner.workloads[key].model_copy(update={"health_status": "healthy"})
+    ready = processor.execute(status_command())
+
+    assert waiting.response.observed_state == AgentWorkloadState.STARTING
+    assert "健康检查未通过" in (waiting.response.message or "")
+    assert ready.response.observed_state == AgentWorkloadState.RUNNING
+    assert len(runner.inference_requests) == 0
+
+
+@pytest.mark.parametrize(
+    ("health_status", "health_failing_streak", "message"),
+    [
+        ("starting", 0, "缺少可信启动时间"),
+        ("unhealthy", 0, "缺少可信连续失败计数"),
+    ],
+)
+def test_malformed_inference_probe_state_is_stopped_instead_of_waiting_forever(
+    tmp_path: Path,
+    health_status: str,
+    health_failing_streak: int,
+    message: str,
+) -> None:
+    runner = FakeRunner()
+    processor = CommandProcessor(settings_for(tmp_path), runner)  # type: ignore[arg-type]
+    owner_id = uuid4()
+    runner.workloads[("deployment", owner_id)] = WorkloadInfo(
+        name=f"openllmops-inference-{owner_id}",
+        workload_id=owner_id,
+        kind="inference",
+        image="vllm/vllm-openai:v0.27.1",
+        status="running",
+        health_status=health_status,  # type: ignore[arg-type]
+        health_failing_streak=health_failing_streak,
+        gpu_ids=[0],
+        generation=1,
+    )
+    command = AgentCommand(
+        action="status",
+        owner=AgentOwner(type="deployment", id=owner_id, name="chat", generation=1),
+        resources=AgentResourceRequest(gpu_ids=[0]),
+        execution={},
+    )
+
+    result = processor.execute(command)
+
+    assert runner.quiesce_calls == [(owner_id, 1, 30)]
+    assert result.response.observed_state == AgentWorkloadState.FAILED
+    assert message in (result.response.message or "")
+
+
+@pytest.mark.parametrize(
+    ("status", "health_status", "failing_streak", "restart_count", "age_seconds", "message"),
+    [
+        ("running", "unhealthy", 3, 0, 5, "连续健康检查失败"),
+        ("running", "starting", 0, 0, 61, "启动超过"),
+        ("restarting", "starting", 0, 1, 61, "启动超过"),
+        ("restarting", "starting", 0, 3, 1, "重启次数"),
+    ],
+)
+def test_bounded_inference_failure_stops_before_reporting_failed(
+    tmp_path: Path,
+    status: str,
+    health_status: str,
+    failing_streak: int,
+    restart_count: int,
+    age_seconds: int,
+    message: str,
+) -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    settings = settings_for(
+        tmp_path,
+        inference_startup_timeout_seconds=60,
+        inference_unhealthy_timeout_seconds=15,
+        inference_failure_stop_timeout_seconds=7,
+    )
+    runner = FakeRunner()
+    processor = CommandProcessor(settings, runner, clock=lambda: now)  # type: ignore[arg-type]
+    owner_id = uuid4()
+    runner.workloads[("deployment", owner_id)] = WorkloadInfo(
+        name=f"openllmops-inference-{owner_id}",
+        workload_id=owner_id,
+        kind="inference",
+        image="vllm/vllm-openai:v0.27.1",
+        status=status,
+        health_status=health_status,  # type: ignore[arg-type]
+        health_failing_streak=failing_streak,
+        restart_count=restart_count,
+        started_at=now - timedelta(seconds=age_seconds),
+        finished_at=now - timedelta(seconds=age_seconds),
+        gpu_ids=[0],
+        service_type="generate",
+        endpoint=f"http://openllmops-inference-{owner_id}:8000",
+        port=8000,
+        generation=2,
+    )
+    command = AgentCommand(
+        action="status",
+        owner=AgentOwner(type="deployment", id=owner_id, name="chat", generation=2),
+        resources=AgentResourceRequest(gpu_ids=[0]),
+        execution={},
+    )
+
+    result = processor.execute(command)
+
+    assert runner.quiesce_calls == [(owner_id, 2, 7)]
+    assert result.response.observed_state == AgentWorkloadState.FAILED
+    assert message in (result.response.message or "")
+    assert "endpoint" not in result.response.metadata
+
+
+def test_failed_inference_stop_uncertainty_keeps_starting_and_lease_semantics(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    settings = settings_for(
+        tmp_path,
+        inference_startup_timeout_seconds=60,
+    )
+    runner = FakeRunner()
+    runner.quiesce_result = False
+    processor = CommandProcessor(settings, runner, clock=lambda: now)  # type: ignore[arg-type]
+    owner_id = uuid4()
+    runner.workloads[("deployment", owner_id)] = WorkloadInfo(
+        name=f"openllmops-inference-{owner_id}",
+        workload_id=owner_id,
+        kind="inference",
+        image="vllm/vllm-openai:v0.27.1",
+        status="running",
+        health_status="starting",
+        started_at=now - timedelta(seconds=61),
+        gpu_ids=[0],
+        generation=1,
+    )
+    command = AgentCommand(
+        action="status",
+        owner=AgentOwner(type="deployment", id=owner_id, name="chat", generation=1),
+        resources=AgentResourceRequest(gpu_ids=[0]),
+        execution={},
+    )
+
+    result = processor.execute(command)
+
+    assert runner.quiesce_calls == [(owner_id, 1, 30)]
+    assert result.response.observed_state == AgentWorkloadState.STARTING
+    assert "停止结果尚未确认" in (result.response.message or "")
+
+
+def test_quiesced_failed_inference_can_be_cleaned_up_by_exact_generation(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    runner = FakeRunner()
+    processor = CommandProcessor(
+        settings_for(tmp_path, inference_startup_timeout_seconds=60),
+        runner,
+        clock=lambda: now,
+    )  # type: ignore[arg-type]
+    owner_id = uuid4()
+    key = ("deployment", owner_id)
+    runner.workloads[key] = WorkloadInfo(
+        name=f"openllmops-inference-{owner_id}",
+        workload_id=owner_id,
+        kind="inference",
+        image="vllm:test",
+        status="running",
+        health_status="starting",
+        started_at=now - timedelta(seconds=61),
+        gpu_ids=[0],
+        generation=4,
+    )
+    status = AgentCommand(
+        action="status",
+        owner=AgentOwner(type="deployment", id=owner_id, name="chat", generation=4),
+        resources=AgentResourceRequest(gpu_ids=[0]),
+        execution={},
+    )
+
+    failed = processor.execute(status)
+    cleaned = processor.execute(cleanup_command("deployment", owner_id, generation=4))
+
+    assert failed.response.observed_state == AgentWorkloadState.FAILED
+    assert runner.quiesce_calls == [(owner_id, 4, 30)]
+    assert cleaned.response.accepted is True
+    assert cleaned.response.observed_state == AgentWorkloadState.ABSENT
+    assert key not in runner.workloads
 
 
 def test_request_id_cannot_be_rebound(tmp_path: Path) -> None:
