@@ -206,6 +206,7 @@ while [ -n "$remaining_images" ]; do
             remaining_images=
             ;;
     esac
+    require_production_digest "$environment" "LLAMAFACTORY_ALLOWED_IMAGES" "$training_image"
     if ! docker image inspect "$training_image" >/dev/null 2>&1; then
         echo "训练镜像尚未构建或拉取：$training_image" >&2
         echo "请先构建安全镜像，或从内部仓库按 digest 拉取已审计镜像" >&2

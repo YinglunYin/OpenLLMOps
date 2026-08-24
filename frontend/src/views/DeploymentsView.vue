@@ -11,6 +11,7 @@ import StatCard from '@/components/StatCard.vue'
 import StatusPill from '@/components/StatusPill.vue'
 import { api } from '@/api/services'
 import { useMocks } from '@/api/client'
+import { loadDeploymentRefresh } from '@/api/view-loaders'
 import type { Deployment, GpuDevice, ModelAsset, StatusTone } from '@/types/domain'
 
 const rows = ref<Deployment[]>([])
@@ -123,11 +124,10 @@ async function refreshRows(preferredId?: string) {
   refreshRunning = true
   try {
     const selectedId = preferredId ?? selected.value?.id
-    // GPU 遥测可以独立退化；它不可阻断部署状态刷新和启停等控制面操作。
-    const [deploymentsResult, gpusResult] = await Promise.allSettled([api.deployments.list(), api.resources.gpus()])
-    if (gpusResult.status === 'fulfilled') gpuOptions.value = gpusResult.value
-    if (deploymentsResult.status === 'rejected') throw deploymentsResult.reason
-    rows.value = deploymentsResult.value
+    const result = await loadDeploymentRefresh(api.deployments.list, api.resources.gpus)
+    if (result.gpus) gpuOptions.value = result.gpus
+    if (!result.deployments) throw result.deploymentError
+    rows.value = result.deployments
     selected.value = rows.value.find((item) => item.id === selectedId) ?? rows.value[0] ?? null
   } finally {
     refreshRunning = false

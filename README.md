@@ -44,21 +44,21 @@ make check
 cp deploy/.env.example deploy/.env
 uv run --with argon2-cffi python scripts/generate_secrets.py
 sudo install -d -o 1000 -g 1000 \
-  /srv/openllmops/{models,inbox,model-staging,datasets,evaluation-datasets,evaluation-output,checkpoints,training-configs,runtime}
+  /srv/openllmops/{models,inbox,model-staging,upload-tmp,datasets,evaluation-datasets,evaluation-output,checkpoints,training-configs,runtime}
 ```
 
 将密钥生成器的每个值分别保存到 `deploy/.env`。Hugging Face/ModelScope token 不进入 `.env`，而应由 UID 1000 可读、不可写的独立文件映射到 `/run/secrets/model-sources`。管理员使用 SFTP 时，只负责把模型目录复制到 `/srv/openllmops/inbox`；平台不会保存 SFTP 账号或主动连接远程 SFTP 服务。
 
-首次启动前构建安全训练与评测运行时，并执行只读预检：
+首次启动前先按 `deploy/README.md` 拉取固定动态镜像、构建控制面与安全训练/评测运行时，并在生产环境完成 digest 推广。镜像准备完成后执行只读预检，预检后使用 `--no-build` 启动，避免启动阶段又替换刚校验的镜像：
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/compose.yaml \
-  --profile runtime-image build
+docker compose --env-file deploy/.env -f deploy/compose.yaml config --quiet
+# 按 deploy/README.md 的“vLLM 与评测镜像”和“训练镜像安全基线”完成 pull/build。
 sh deploy/scripts/preflight.sh deploy/.env
-docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --build
+docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --no-build
 ```
 
-正式环境应使用组织 CA 证书，并把动态工作负载镜像白名单改为内部仓库的不可变 `@sha256` 引用。详细安装、备份、恢复和排障步骤见 [`deploy/README.md`](deploy/README.md) 与 [`docs/operations`](docs/operations/deployment.md)。
+正式环境应使用组织 CA 证书，并把动态工作负载镜像白名单改为内部仓库的不可变 `@sha256` 引用。详细安装、备份、恢复和排障步骤见 [`deploy/README.md`](deploy/README.md) 与 [`docs/operations`](docs/operations/deployment.md)；最终 4 卡现场执行与签字使用[《裸金属验收手册》](docs/operations/bare-metal-acceptance.md)。
 
 ## 设计与接口资料
 
@@ -69,4 +69,4 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --build
 
 ## 当前验证边界
 
-所有 Python/前端单元测试、类型检查、静态检查和数据库迁移均可在无 GPU 开发机执行。Compose 与 NVIDIA 运行时仍必须在真实 Ubuntu/NVIDIA 主机完成最终验收；在该验收完成前，不应把“代码测试通过”解释为 4090D 上的模型加载、训练吞吐或多卡 NCCL 已通过。
+所有 Python/前端单元测试、类型检查、静态检查和数据库迁移均可在无 GPU 开发机执行。Compose 与 NVIDIA 运行时仍须按照[《4 卡裸金属现场验收手册》](docs/operations/bare-metal-acceptance.md)在最终 Ubuntu/NVIDIA 主机执行；在该验收完成并签字前，不应把“代码测试通过”解释为 4090D 上的模型加载、训练吞吐或多卡 NCCL 已通过。

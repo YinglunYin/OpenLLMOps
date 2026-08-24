@@ -9,6 +9,7 @@ import PanelCard from '@/components/PanelCard.vue'
 import StatusPill from '@/components/StatusPill.vue'
 import { api } from '@/api/services'
 import { useMocks } from '@/api/client'
+import { createLatestKeyedLoader } from '@/api/view-loaders'
 import type { Dataset, EvaluationComparisonScore, EvaluationRunDetail, EvaluationRunSummary, GpuDevice, ModelAsset, StatusTone } from '@/types/domain'
 
 const activeTab = ref('comparison')
@@ -26,7 +27,7 @@ const categoryPage = ref(1)
 const categoryPageSize = 20
 let refreshTimer: number | undefined
 let refreshRunning = false
-let detailRequestVersion = 0
+const detailLoader = createLatestKeyedLoader<EvaluationRunDetail>()
 const form = reactive({ name: '', baseModelAssetId: '', candidateModelAssetId: '', datasets: ['ceval', 'cmmlu'], customDatasetId: '', gpuIds: [0] as number[] })
 
 const rows = computed(() => selectedDetail.value?.results ?? [])
@@ -96,21 +97,19 @@ const categoryOption = computed(() => {
 })
 
 async function loadEvaluationDetail(id: string, showError = true) {
-  const version = ++detailRequestVersion
   // 切换任务时先移除旧结果，避免选择器已指向新任务却仍展示上一任务的分数。
   if (selectedTaskId.value === id && selectedDetail.value?.id !== id) selectedDetail.value = null
   detailLoading.value = true
-  try {
-    const detail = await api.evaluations.get(id)
-    if (version !== detailRequestVersion || selectedTaskId.value !== id) return
-    selectedDetail.value = detail
-  } catch (error) {
-    if (version !== detailRequestVersion) return
-    if (selectedTaskId.value === id) selectedDetail.value = null
-    if (showError) ElMessage.error(error instanceof Error ? error.message : '测评详情加载失败')
-  } finally {
-    if (version === detailRequestVersion) detailLoading.value = false
+  const result = await detailLoader.run(id, () => selectedTaskId.value, () => api.evaluations.get(id))
+  if (result.status === 'stale') return
+  detailLoading.value = false
+  if (result.status === 'success') {
+    selectedDetail.value = result.value
+    return
   }
+  // 当前选择加载失败时不能继续保留上一份成功报告，否则任务与结果会错配。
+  selectedDetail.value = null
+  if (showError) ElMessage.error(result.error instanceof Error ? result.error.message : '测评详情加载失败')
 }
 
 async function selectEvaluation(id: string, switchTab = false) {
@@ -131,6 +130,8 @@ async function refreshEvaluations(preferredId?: string) {
     if (!target) {
       selectedTaskId.value = ''
       selectedDetail.value = null
+      detailLoader.invalidate()
+      detailLoading.value = false
       return
     }
     selectedTaskId.value = target.id
@@ -215,7 +216,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  detailRequestVersion += 1
+  detailLoader.invalidate()
   if (refreshTimer !== undefined) window.clearInterval(refreshTimer)
 })
 </script>

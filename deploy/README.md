@@ -109,9 +109,10 @@ docker pull registry.internal/openllmops/llamafactory-secure@sha256:000000000000
 
 安全镜像入口是 `openllmops-training-runtime`，不会启动 WebUI。它使用参数数组执行 `llamafactory-cli train`，保持 Hugging Face、Datasets 和 Transformers 离线；多卡任务把 `NPROC_PER_NODE` 固定为租约整卡数并使用单机 torchrun。训练成功后会递归移除 Trainer 生成的 pickle optimizer/scheduler/RNG 状态，把 checkpoint 降格为可安全导出但不可恢复优化器的 Safetensors 快照；随后 LoRA/QLoRA 在同一容器中以未量化基础模型合并到 `output/merged`，Freeze 的 `output` 本身即完整模型。只有通过非链接普通文件、Safetensors、模型/adapter 配置与 tokenizer 载荷检查的目录才会上报控制面。容器收到 SIGTERM/SIGINT 时会转发到整个 torchrun 进程组、等待有限时间后强制清理，且不会继续合并或伪报成功。
 
-启动前执行只读预检，确认训练镜像、GPU 数量、NVIDIA Container Toolkit、受控目录对实际 `APP_UID/WORKLOAD_UID` 的读写权限、代理网段、可选令牌文件和 Compose 配置一致：
+运行时镜像和生产 digest 准备完成后，先构建本仓库控制面镜像，再执行只读预检。预检会确认训练镜像、GPU 数量、NVIDIA Container Toolkit、受控目录对实际 `APP_UID/WORKLOAD_UID` 的读写权限、代理网段、可选令牌文件和 Compose 配置一致：
 
 ```bash
+docker compose --env-file deploy/.env -f deploy/compose.yaml build api node-agent web
 sh deploy/scripts/preflight.sh deploy/.env
 ```
 
@@ -119,7 +120,8 @@ sh deploy/scripts/preflight.sh deploy/.env
 
 ```bash
 docker compose --env-file deploy/.env -f deploy/compose.yaml config
-docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --build
+# 镜像已在预检前按上文完成 pull/build；启动时禁止再次隐式重建。
+docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --no-build
 docker compose --env-file deploy/.env -f deploy/compose.yaml ps
 curl --insecure https://127.0.0.1/_gateway/health
 ```

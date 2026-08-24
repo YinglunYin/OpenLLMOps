@@ -149,9 +149,12 @@ def test_training_wrapper_fixed_build_context_and_preflight_guards_are_wired() -
     )
     assert agent_ignore.startswith("**\n") and "!workers/training_runtime/src/**" in agent_ignore
     assert training_ignore.startswith("**\n") and "!workers/training_config/src/**" in training_ignore
+    assert 'require_production_digest "$environment" "LLAMAFACTORY_ALLOWED_IMAGES"' in preflight
     assert 'require_production_digest "$environment" "VLLM_ALLOWED_IMAGES"' in preflight
     assert 'require_production_digest "$environment" "EVALUATION_ALLOWED_IMAGES"' in preflight
     assert 'require_production_digest "$environment" "EVALUATION_VLLM_BASE_IMAGE"' in preflight
+    assert "com.openllmops.security.ghsa-mwc7-mf87-v3mf" in preflight
+    assert "com.openllmops.security.trust-remote-code" in preflight
     assert "minimum_driver_version=580.95.05" in preflight
     assert "minimum_driver_version=575.57.08" in preflight
     assert "--query-gpu=index,driver_version" in preflight
@@ -551,6 +554,9 @@ def test_production_digest_policy_is_exact_and_development_allows_fixed_tags() -
     assert validate("production", "repo@sha256:" + "g" * 64).returncode != 0
     assert validate("production", "@sha256:" + "a" * 64).returncode != 0
     assert validate("development", "vllm/vllm-openai:v0.27.1").returncode == 0
+    hardened_training_tag = "openllmops/llamafactory-secure:0.9.6.dev0-c4e09c7-rcefix1"
+    assert validate("production", hardened_training_tag).returncode != 0
+    assert validate("development", hardened_training_tag).returncode == 0
 
 
 def test_preflight_dotenv_reader_normalizes_quotes_comments_and_rejects_indirection(
