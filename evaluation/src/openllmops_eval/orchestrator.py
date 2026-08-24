@@ -136,8 +136,8 @@ async def _wait_for_process_group_exit(
 async def _stop_process_group(
     process: asyncio.subprocess.Process,
     *,
-    term_timeout_seconds: float = 30,
-    kill_timeout_seconds: float = 5,
+    term_timeout_seconds: float = 20,
+    kill_timeout_seconds: float = 3,
 ) -> None:
     """确认 vLLM 整个进程组退出，而不只等待可能先退的组长。"""
 

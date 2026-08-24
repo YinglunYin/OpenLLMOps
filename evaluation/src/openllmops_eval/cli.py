@@ -6,7 +6,10 @@ import argparse
 import asyncio
 import json
 import os
+import signal
+from collections.abc import Coroutine
 from pathlib import Path
+from typing import Any
 
 from .benchmarks import convert_csv_directory
 from .builtin_benchmarks import BenchmarkPreparationError, prepare_builtin_benchmark
@@ -120,6 +123,43 @@ async def _run_pair(args: argparse.Namespace) -> None:
     )
 
 
+def _run_async(command: Coroutine[Any, Any, None]) -> None:
+    """把容器 SIGTERM 转成任务取消，让 vLLM 进程组清理逻辑获得执行机会。"""
+
+    async def managed() -> int | None:
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(command)
+        received_signal: int | None = None
+        registered: list[signal.Signals] = []
+
+        def request_stop(signum: signal.Signals) -> None:
+            nonlocal received_signal
+            # 第二个信号不重复取消 finally；Docker 超时后仍会用 SIGKILL 兜底。
+            if received_signal is None:
+                received_signal = int(signum)
+                task.cancel()
+
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(signum, request_stop, signum)
+            except NotImplementedError:  # pragma: no cover - 生产容器为 Linux。
+                continue
+            registered.append(signum)
+        try:
+            await task
+        except asyncio.CancelledError:
+            if received_signal is None:
+                raise
+        finally:
+            for signum in registered:
+                loop.remove_signal_handler(signum)
+        return received_signal
+
+    received_signal = asyncio.run(managed())
+    if received_signal is not None:
+        raise SystemExit(128 + received_signal)
+
+
 def main() -> None:
     args = _parser().parse_args()
     if args.command == "prepare-benchmark":
@@ -154,9 +194,9 @@ def main() -> None:
         print(f"已转换 {count} 条样本")
         return
     if args.command == "run-pair":
-        asyncio.run(_run_pair(args))
+        _run_async(_run_pair(args))
         return
-    asyncio.run(_run(args))
+    _run_async(_run(args))
 
 
 if __name__ == "__main__":
