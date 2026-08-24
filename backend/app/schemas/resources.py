@@ -12,6 +12,7 @@ from app.models.enums import (
     DeploymentTaskType,
     DesiredJobState,
     DesiredServiceState,
+    EvaluationTemplate,
     JobState,
     LeaseOwnerType,
     ModelKind,
@@ -20,6 +21,12 @@ from app.models.enums import (
     TrainingStage,
 )
 from app.schemas.common import TimestampedModel
+from app.schemas.evaluation import (
+    EmptyEvaluationResult,
+    EvaluationComparison,
+    EvaluationMetrics,
+    EvaluationWarning,
+)
 
 
 class ModelAssetCreate(BaseModel):
@@ -241,17 +248,24 @@ class TrainingJobRead(TimestampedModel):
 
 
 class EvaluationRunCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=128)
     base_model_asset_id: uuid.UUID
     candidate_model_asset_id: uuid.UUID
     custom_dataset_id: uuid.UUID | None = None
-    builtin_datasets: list[Literal["ceval", "cmmlu"]] = Field(default_factory=list)
-    gpu_ids: list[int] = Field(default_factory=lambda: [0], min_length=1)
+    builtin_datasets: list[Literal["ceval", "cmmlu"]] = Field(
+        default_factory=list,
+        max_length=2,
+    )
+    gpu_ids: list[int] = Field(default_factory=lambda: [0], min_length=1, max_length=16)
 
     @model_validator(mode="after")
     def validate_evaluation(self) -> "EvaluationRunCreate":
         if not self.builtin_datasets and self.custom_dataset_id is None:
             raise ValueError("至少选择 C-Eval、CMMLU 或一个自定义评测数据集")
+        if len(self.builtin_datasets) != len(set(self.builtin_datasets)):
+            raise ValueError("内置评测数据集不能重复")
         if len(self.gpu_ids) != len(set(self.gpu_ids)) or min(self.gpu_ids) < 0:
             raise ValueError("GPU 编号必须是互不重复的非负整数")
         return self
@@ -263,15 +277,27 @@ class EvaluationRunRead(TimestampedModel):
     candidate_model_asset_id: uuid.UUID
     custom_dataset_id: uuid.UUID | None
     builtin_datasets: list[str]
+    base_template: EvaluationTemplate
+    candidate_template: EvaluationTemplate
+    output_dir: str
+    tensor_parallel_size: int
+    gpu_memory_utilization: float
+    concurrency: int
+    max_tokens: int
     desired_state: DesiredJobState
     actual_state: JobState
     gpu_ids: list[int]
-    metrics: dict[str, Any]
-    comparison: dict[str, Any]
+    metrics: EvaluationMetrics | EmptyEvaluationResult
+    comparison: EvaluationComparison | EmptyEvaluationResult
+    result_path: str | None
+    dataset_manifest_path: str | None
+    warnings: list[EvaluationWarning]
     error_message: str | None
     queued_at: datetime | None
     state_version: int
     runtime_generation: int
+    started_at: datetime | None
+    finished_at: datetime | None
 
 
 class GPULeaseRead(BaseModel):

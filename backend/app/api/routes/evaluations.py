@@ -1,6 +1,7 @@
 import uuid
 from datetime import UTC, datetime
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +19,12 @@ from app.models.enums import (
 )
 from app.schemas import EvaluationRunCreate, EvaluationRunRead
 from app.services.crud import commit_or_conflict, get_or_404
+from app.services.evaluation_control import (
+    EvaluationControlError,
+    build_evaluation_execution,
+    derive_evaluation_output_dir,
+    template_for_model,
+)
 
 router = APIRouter(prefix="/evaluation-runs", tags=["模型评测"])
 TERMINAL_STATES = {JobState.CANCELED, JobState.SUCCEEDED, JobState.FAILED}
@@ -28,7 +35,8 @@ async def create_evaluation_run(
     payload: EvaluationRunCreate,
     session: AsyncSession = Depends(get_db),
 ) -> EvaluationRun:
-    invalid = [gpu_id for gpu_id in payload.gpu_ids if gpu_id >= get_settings().gpu_count]
+    settings = get_settings()
+    invalid = [gpu_id for gpu_id in payload.gpu_ids if gpu_id >= settings.gpu_count]
     if invalid:
         raise HTTPException(status_code=422, detail=f"GPU 编号超出本机范围：{invalid}")
     base = await get_or_404(session, ModelAsset, payload.base_model_asset_id, "基线模型")
@@ -37,16 +45,43 @@ async def create_evaluation_run(
         raise HTTPException(status_code=422, detail="基线模型和候选模型必须处于 ready 状态")
     if ModelKind.EMBEDDING in {base.model_kind, candidate.model_kind}:
         raise HTTPException(status_code=422, detail="Embedding 模型不支持生成式评测")
+    dataset: Dataset | None = None
     if payload.custom_dataset_id:
         dataset = await get_or_404(session, Dataset, payload.custom_dataset_id, "评测数据集")
         if dataset.dataset_type != DatasetType.EVALUATION or dataset.status != DatasetStatus.READY:
             raise HTTPException(status_code=422, detail="自定义数据集必须是 ready 的 evaluation 数据集")
 
-    run = EvaluationRun(
-        **payload.model_dump(),
-        actual_state=JobState.QUEUED,
-        queued_at=datetime.now(UTC),
-    )
+    run_id = uuid.uuid4()
+    try:
+        run = EvaluationRun(
+            id=run_id,
+            name=payload.name,
+            base_model_asset_id=payload.base_model_asset_id,
+            candidate_model_asset_id=payload.candidate_model_asset_id,
+            custom_dataset_id=payload.custom_dataset_id,
+            builtin_datasets=list(payload.builtin_datasets),
+            base_template=template_for_model(base.model_kind),
+            candidate_template=template_for_model(candidate.model_kind),
+            output_dir=str(derive_evaluation_output_dir(settings, run_id)),
+            tensor_parallel_size=len(payload.gpu_ids),
+            gpu_memory_utilization=settings.evaluation_gpu_memory_utilization,
+            concurrency=settings.evaluation_concurrency,
+            max_tokens=settings.evaluation_max_tokens,
+            actual_state=JobState.QUEUED,
+            gpu_ids=payload.gpu_ids,
+            queued_at=datetime.now(UTC),
+        )
+        # 创建时先给出同步、可读的配置错误；调度前仍会再次检查，防止文件随后被移动。
+        await anyio.to_thread.run_sync(
+            build_evaluation_execution,
+            run,
+            base,
+            candidate,
+            dataset,
+            settings,
+        )
+    except EvaluationControlError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     session.add(run)
     await commit_or_conflict(session, "评测任务名称已存在")
     await session.refresh(run)
@@ -83,6 +118,7 @@ async def cancel_evaluation_run(
     if run.actual_state in {JobState.CREATED, JobState.QUEUED}:
         run.actual_state = JobState.CANCELED
         run.queued_at = None
+        run.finished_at = datetime.now(UTC)
     elif run.actual_state not in TERMINAL_STATES | {JobState.CANCELING}:
         run.actual_state = JobState.CANCELING
     run.state_version += 1

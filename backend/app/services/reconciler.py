@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.config import Settings, get_settings
 from app.models import Deployment, EvaluationRun, GPULease, ModelAsset, TrainingJob
 from app.models.entities import Dataset
 from app.models.enums import (
@@ -26,6 +27,11 @@ from app.schemas.agent_contract import (
     AgentOwner,
     AgentResourceRequest,
     AgentWorkloadState,
+)
+from app.services.evaluation_control import (
+    EvaluationControlError,
+    build_evaluation_execution,
+    validate_evaluation_success_metadata,
 )
 from app.services.gpu_scheduler import GPULeaseManager, LeaseOwner
 from app.services.node_agent import NodeAgentError
@@ -63,6 +69,7 @@ class ScheduleOutcome(StrEnum):
     EMPTY = "empty"
     BLOCKED = "blocked"
     CLAIMED = "claimed"
+    PREFLIGHT_FAILED = "preflight_failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +86,7 @@ class ReconcileReport:
     blocked: int = 0
     agent_errors: int = 0
     terminal_leases_reaped: int = 0
+    preflight_failed: int = 0
 
 
 class StateReconciler:
@@ -96,12 +104,14 @@ class StateReconciler:
         *,
         interval_seconds: float = 2.0,
         clock: Callable[[], datetime] | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._agent = agent
         self._leases = lease_manager
         self._interval_seconds = interval_seconds
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._settings = settings or get_settings()
 
     async def run_once(self) -> ReconcileReport:
         report = ReconcileReport()
@@ -126,6 +136,9 @@ class StateReconciler:
             if attempt.outcome == ScheduleOutcome.BLOCKED:
                 report.blocked += 1
                 break
+            if attempt.outcome == ScheduleOutcome.PREFLIGHT_FAILED:
+                report.preflight_failed += 1
+                continue
             workload = attempt.workload
             if workload is None:  # pragma: no cover - 防御性检查，枚举已保证此分支不可达。
                 break
@@ -279,6 +292,18 @@ class StateReconciler:
                 candidates,
                 key=lambda item: self._queue_sort_key(item[0], item[1]),
             )
+            try:
+                execution = await self._build_execution(session, owner_type, row)
+            except EvaluationControlError as exc:
+                # 配置或受控文件失效必须成为可见终态；否则严格 FIFO 会被坏队首永久堵塞。
+                assert isinstance(row, EvaluationRun)
+                row.actual_state = JobState.FAILED
+                row.queued_at = None
+                row.runtime_generation = 0
+                row.finished_at = self._clock()
+                row.error_message = f"评测启动前检查失败：{exc}"
+                return ScheduleAttempt(ScheduleOutcome.PREFLIGHT_FAILED)
+
             # 新一轮实际运行沿用当前期望版本；后续 stop 只改变 state_version，
             # runtime_generation 保持不变，确保迟到的 start 响应无法影响下一代实例。
             row.runtime_generation = row.state_version
@@ -305,14 +330,13 @@ class StateReconciler:
             )
             row.queued_at = None
             row.error_message = None
-            execution = await self._build_execution(session, owner_type, row)
             return ScheduleAttempt(
                 ScheduleOutcome.CLAIMED,
                 workload=self._snapshot(row, owner_type, execution=execution),
             )
 
-    @staticmethod
     async def _build_execution(
+        self,
         session: AsyncSession,
         owner_type: LeaseOwnerType,
         row: Deployment | TrainingJob | EvaluationRun,
@@ -352,14 +376,15 @@ class StateReconciler:
         candidate = await session.get(ModelAsset, row.candidate_model_asset_id)
         dataset = await session.get(Dataset, row.custom_dataset_id) if row.custom_dataset_id else None
         if base is None or candidate is None:
-            raise RuntimeError("评测任务引用的模型资产不存在")
-        return {
-            "runner": "evaluation",
-            "base_model_path": base.local_path,
-            "candidate_model_path": candidate.local_path,
-            "custom_dataset_path": dataset.local_path if dataset else None,
-            "builtin_datasets": row.builtin_datasets,
-        }
+            raise EvaluationControlError("评测任务引用的模型资产不存在")
+        return await asyncio.to_thread(
+            build_evaluation_execution,
+            row,
+            base,
+            candidate,
+            dataset,
+            self._settings,
+        )
 
     async def _apply_observation(
         self,
@@ -450,24 +475,44 @@ class StateReconciler:
                 row.actual_state = JobState.FAILED
                 message = response.message or "运行实例意外消失，请人工重新创建任务"
             row.error_message = message
-            if isinstance(row, TrainingJob):
-                row.finished_at = self._clock()
+            row.finished_at = self._clock()
             return
         if observed in {AgentWorkloadState.SUCCEEDED, AgentWorkloadState.FAILED}:
-            row.actual_state = (
-                JobState.SUCCEEDED if observed == AgentWorkloadState.SUCCEEDED else JobState.FAILED
-            )
-            row.error_message = None if observed == AgentWorkloadState.SUCCEEDED else response.message
             if isinstance(row, TrainingJob):
+                row.actual_state = (
+                    JobState.SUCCEEDED if observed == AgentWorkloadState.SUCCEEDED else JobState.FAILED
+                )
+                row.error_message = None if observed == AgentWorkloadState.SUCCEEDED else response.message
                 row.finished_at = self._clock()
                 self._copy_training_outputs(row, response.metadata)
             elif observed == AgentWorkloadState.SUCCEEDED:
-                metrics = response.metadata.get("metrics")
-                comparison = response.metadata.get("comparison")
-                if isinstance(metrics, dict):
-                    row.metrics = metrics
-                if isinstance(comparison, dict):
-                    row.comparison = comparison
+                try:
+                    metadata = validate_evaluation_success_metadata(
+                        row,
+                        response.metadata,
+                        self._settings,
+                    )
+                except EvaluationControlError as exc:
+                    row.actual_state = JobState.FAILED
+                    row.error_message = f"评测成功产物校验失败：{exc}"
+                    row.metrics = {}
+                    row.comparison = {}
+                    row.result_path = None
+                    row.dataset_manifest_path = None
+                    row.warnings = []
+                else:
+                    row.actual_state = JobState.SUCCEEDED
+                    row.error_message = None
+                    row.metrics = metadata.metrics.model_dump(mode="json")
+                    row.comparison = metadata.comparison.model_dump(mode="json")
+                    row.result_path = metadata.result_path
+                    row.dataset_manifest_path = metadata.dataset_manifest_path
+                    row.warnings = list(metadata.warnings)
+                row.finished_at = self._clock()
+            else:
+                row.actual_state = JobState.FAILED
+                row.error_message = response.message or "评测运行失败"
+                row.finished_at = self._clock()
             await self._leases.release(session, owner)
             return
         if row.desired_state == DesiredJobState.TERMINATED:
@@ -482,6 +527,8 @@ class StateReconciler:
             if observed == AgentWorkloadState.RUNNING and row.started_at is None:
                 row.started_at = self._clock()
             self._copy_training_progress(row, response.metadata)
+        elif observed == AgentWorkloadState.RUNNING and row.started_at is None:
+            row.started_at = self._clock()
         row.error_message = None if response.accepted else response.message
 
     @staticmethod
@@ -523,7 +570,7 @@ class StateReconciler:
                 else JobState.FAILED
             )
             row.error_message = message
-            if isinstance(row, TrainingJob):
+            if isinstance(row, (TrainingJob, EvaluationRun)):
                 row.finished_at = self._clock()
             await self._leases.release(session, workload.owner)
 

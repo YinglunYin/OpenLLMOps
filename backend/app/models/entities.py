@@ -26,6 +26,7 @@ from app.models.enums import (
     DeploymentTaskType,
     DesiredJobState,
     DesiredServiceState,
+    EvaluationTemplate,
     JobState,
     LeaseOwnerType,
     ModelImportSource,
@@ -182,6 +183,14 @@ class EvaluationRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("datasets.id", ondelete="RESTRICT"), index=True
     )
     builtin_datasets: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # 下列执行参数均由控制面派生后固化，客户端不能传入路径或任意命令参数。
+    base_template: Mapped[EvaluationTemplate] = mapped_column(enum_type(EvaluationTemplate))
+    candidate_template: Mapped[EvaluationTemplate] = mapped_column(enum_type(EvaluationTemplate))
+    output_dir: Mapped[str] = mapped_column(String(1024))
+    tensor_parallel_size: Mapped[int] = mapped_column(Integer)
+    gpu_memory_utilization: Mapped[float] = mapped_column(Float)
+    concurrency: Mapped[int] = mapped_column(Integer)
+    max_tokens: Mapped[int] = mapped_column(Integer)
     desired_state: Mapped[DesiredJobState] = mapped_column(
         enum_type(DesiredJobState), default=DesiredJobState.RUNNING
     )
@@ -189,10 +198,15 @@ class EvaluationRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     gpu_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     metrics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     comparison: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result_path: Mapped[str | None] = mapped_column(String(1024))
+    dataset_manifest_path: Mapped[str | None] = mapped_column(String(1024))
+    warnings: Mapped[list[str]] = mapped_column(JSON, default=list)
     error_message: Mapped[str | None] = mapped_column(Text)
     queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     state_version: Mapped[int] = mapped_column(Integer, default=1)
     runtime_generation: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class GPULease(UUIDPrimaryKeyMixin, Base):

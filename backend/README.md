@@ -37,6 +37,12 @@ uv run pytest
 | `MODEL_IMPORT_CLAIM_TIMEOUT_SECONDS` | 导入 claim 心跳失效阈值，默认 120 秒；用于硬崩恢复 |
 | `HUGGINGFACE_TOKEN_FILE` / `MODELSCOPE_TOKEN_FILE` | 可选的仓库访问令牌只读 secret 文件路径，不接受令牌环境变量或 API 字段 |
 | `DATASET_ROOT` / `CHECKPOINT_ROOT` | 数据集和训练产物受控目录 |
+| `EVALUATION_DATASET_ROOT` | 管理员预制 C-Eval/CMMLU 的受控根目录；固定子目录布局见下文 |
+| `EVALUATION_OUTPUT_ROOT` | 评测产物根目录；每个任务只能使用 `<root>/<run UUID>` |
+| `NODE_AGENT_RUNTIME_ROOT` | 与 node-agent 共享的运行目录，用于严格校验数据 manifest 路径 |
+| `EVALUATION_GPU_MEMORY_UTILIZATION` | 评测执行器显存利用率，默认 `0.9`，范围 `0.1..0.95` |
+| `EVALUATION_CONCURRENCY` / `EVALUATION_MAX_TOKENS` | 评测并发数与生成上限，默认 `4` / `32` |
+| `EVALUATION_ALLOW_PARTIAL_BUILTINS` | 仅开发期可显式允许不完整内置集；默认 `false`，生产禁止开启 |
 | `GPU_COUNT` | 开发机通常为 2，目标生产机为 4 |
 | `NODE_AGENT_URL` / `NODE_AGENT_TOKEN` | 受限宿主机执行代理地址与双向 HMAC 共享密钥 |
 | `RECONCILER_ENABLED` / `RECONCILER_INTERVAL_SECONDS` | 状态协调器开关与轮询间隔 |
@@ -60,6 +66,28 @@ uv run pytest
 node-agent 合同为 `POST /v1/workloads/commands`。请求与响应都对规范化 JSON 原始字节执行
 HMAC-SHA256 签名，携带时间戳与一次性 nonce；动作由 `start`、`stop`、`status` 组成，
 `request_id` 和 `owner.generation` 提供重试幂等与迟到响应隔离。
+
+## 模型评测执行合同
+
+`POST /api/v1/evaluation-runs` 只接受模型、内置/自定义数据集和 GPU 选择。Base/Instruct
+模板由模型类型映射，tensor parallel 等于所选 GPU 数量；输出目录、显存利用率、并发数和
+最大生成长度均由控制面配置派生。请求中出现 `output_dir` 或其他 Agent/命令参数会返回
+422，不能借管理 API 注入路径或 shell 参数。
+
+内置基准集必须由 `openllmops-eval prepare-benchmark` 预制成：
+
+- `${EVALUATION_DATASET_ROOT}/ceval/ceval.jsonl` 与同目录 `ceval.manifest.json`；
+- `${EVALUATION_DATASET_ROOT}/cmmlu/cmmlu.jsonl` 与同目录 `cmmlu.manifest.json`。
+
+控制面在创建及实际调度前都会校验非软链接受控路径、manifest benchmark/schema/完整集
+标记、JSONL SHA-256、记录数、单文件与合计上限。文件在排队期间被移动或篡改时，任务会
+以可读错误转为 `failed`，不调用 Agent，也不会让坏任务永久阻塞 FIFO 队首。自定义数据集
+同样核对上传时保存的 SHA-256、大小和记录数；单源最多 256 MiB、全部源最多 512 MiB、
+合计最多 200000 条记录、单行最多 1 MiB。
+
+成功响应的 `metrics.baseline`、`metrics.candidate`、`comparison`、`result_path` 和
+`dataset_manifest_path` 会经过严格类型、计数关系、数据指纹、模板、百分比及系统派生路径
+校验后才落库。训练与评测实例消失后都不会自动重跑；失败或取消会释放整卡租约。
 
 ## 管理员密码与会话
 

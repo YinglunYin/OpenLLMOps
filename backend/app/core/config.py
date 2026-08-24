@@ -70,6 +70,13 @@ class Settings(BaseSettings):
     modelscope_token_file: Path | None = None
     dataset_root: Path = Path("/srv/openllmops/datasets")
     checkpoint_root: Path = Path("/srv/openllmops/checkpoints")
+    evaluation_dataset_root: Path = Path("/srv/openllmops/evaluation-datasets")
+    evaluation_output_root: Path = Path("/srv/openllmops/evaluation-output")
+    node_agent_runtime_root: Path = Path("/srv/openllmops/runtime")
+    evaluation_gpu_memory_utilization: float = Field(default=0.9, ge=0.1, le=0.95)
+    evaluation_concurrency: int = Field(default=4, ge=1, le=32)
+    evaluation_max_tokens: int = Field(default=32, ge=1, le=512)
+    evaluation_allow_partial_builtins: bool = False
     gpu_count: int = Field(default=2, ge=1, le=32)
     cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["http://localhost:5173"])
     proxy_timeout_seconds: float = Field(default=600.0, gt=0)
@@ -136,6 +143,17 @@ class Settings(BaseSettings):
             raise ValueError("PROMETHEUS_URL 必须是不含凭证、查询参数或片段的 HTTP(S) 地址")
         return normalized
 
+    @field_validator(
+        "evaluation_dataset_root",
+        "evaluation_output_root",
+        "node_agent_runtime_root",
+    )
+    @classmethod
+    def require_absolute_evaluation_roots(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("评测受控根目录必须使用绝对路径")
+        return value
+
     @model_validator(mode="after")
     def validate_production_auth(self) -> "Settings":
         if self.environment != "production":
@@ -157,6 +175,8 @@ class Settings(BaseSettings):
         for token_file in (self.huggingface_token_file, self.modelscope_token_file):
             if token_file is not None and not token_file.is_absolute():
                 raise ValueError("生产环境模型仓库 token file 必须使用绝对路径")
+        if self.evaluation_allow_partial_builtins:
+            raise ValueError("生产环境禁止启用 EVALUATION_ALLOW_PARTIAL_BUILTINS")
         return self
 
 

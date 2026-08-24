@@ -32,3 +32,8 @@ def test_prometheus_url_normalization_and_validation() -> None:
         Settings(_env_file=None, prometheus_url="http://admin:secret@prometheus:9090")
     with pytest.raises(ValidationError, match="端口无效"):
         Settings(_env_file=None, prometheus_url="http://prometheus:not-a-port")
+
+
+def test_evaluation_roots_require_absolute_paths() -> None:
+    with pytest.raises(ValidationError, match="评测受控根目录必须使用绝对路径"):
+        Settings(_env_file=None, evaluation_dataset_root="relative/evaluation-datasets")

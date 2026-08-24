@@ -13,11 +13,37 @@ from app.models.enums import DatasetType
 MAX_DATASET_BYTES = 5 * 1024 * 1024 * 1024
 MAX_LINE_BYTES = 16 * 1024 * 1024
 MAX_REPORTED_ERRORS = 20
+MAX_EVALUATION_SOURCE_FIELD_LENGTH = 191
+MAX_EVALUATION_DATASET_BYTES = 256 * 1024 * 1024
+MAX_EVALUATION_RECORDS = 200_000
 
 
 def _record_error(errors: list[dict[str, Any]], line: int, message: str) -> None:
     if len(errors) < MAX_REPORTED_ERRORS:
         errors.append({"line": line, "message": message})
+
+
+def _validate_evaluation_source_text(value: str, field: str) -> str | None:
+    if (
+        not value
+        or len(value) > MAX_EVALUATION_SOURCE_FIELD_LENGTH
+        or any(ord(character) < 32 for character in value)
+    ):
+        return f"评测字段 {field} 必须非空、不含控制字符且不超过 {MAX_EVALUATION_SOURCE_FIELD_LENGTH} 字符"
+    return None
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"JSON 不允许非有限数值：{value}")
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"JSON 对象包含重复字段：{key}")
+        result[key] = value
+    return result
 
 
 def _validate_shape(item: Any, dataset_type: DatasetType) -> str | None:
@@ -54,8 +80,13 @@ def validate_and_store_jsonl(
         with temporary_path.open("wb") as target:
             for line_number, raw_line in enumerate(source, start=1):
                 total_bytes += len(raw_line)
-                if total_bytes > MAX_DATASET_BYTES:
-                    raise ValueError("数据集超过 5 GiB 限制")
+                byte_limit = (
+                    MAX_EVALUATION_DATASET_BYTES
+                    if dataset_type == DatasetType.EVALUATION
+                    else MAX_DATASET_BYTES
+                )
+                if total_bytes > byte_limit:
+                    raise ValueError(f"数据集超过 {byte_limit} 字节限制")
                 line_limit = (
                     MAX_EVALUATION_LINE_BYTES if dataset_type == DatasetType.EVALUATION else MAX_LINE_BYTES
                 )
@@ -71,12 +102,18 @@ def validate_and_store_jsonl(
                         _record_error(errors, line_number, "不允许空行")
                     continue
                 try:
-                    item = json.loads(raw_line)
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    item = json.loads(
+                        raw_line,
+                        parse_constant=_reject_json_constant,
+                        object_pairs_hook=_unique_json_object,
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                     _record_error(errors, line_number, f"JSON 解析失败：{exc}")
                     continue
 
                 record_count += 1
+                if dataset_type == DatasetType.EVALUATION and record_count > MAX_EVALUATION_RECORDS:
+                    raise ValueError("评测数据集有效记录数超过 200000")
                 if isinstance(item, dict):
                     field_names.update(str(key) for key in item)
                 if dataset_type == DatasetType.EVALUATION and isinstance(item, dict):
@@ -85,6 +122,21 @@ def validate_and_store_jsonl(
                     except DatasetValidationError as exc:
                         _record_error(errors, line_number, str(exc))
                     else:
+                        if not isinstance(item.get("category", "default"), str):
+                            _record_error(errors, line_number, "评测字段 category 必须是字符串")
+                        metadata = item.get("metadata", {})
+                        if isinstance(metadata, dict) and "openllmops_source" in metadata:
+                            _record_error(
+                                errors,
+                                line_number,
+                                "评测 metadata 不能包含保留字段 openllmops_source",
+                            )
+                        for field, value in (
+                            ("id", sample.sample_id),
+                            ("category", sample.category),
+                        ):
+                            if source_error := _validate_evaluation_source_text(value, field):
+                                _record_error(errors, line_number, source_error)
                         if sample.sample_id in evaluation_sample_ids:
                             _record_error(errors, line_number, f"样本 ID 重复: {sample.sample_id}")
                         evaluation_sample_ids.add(sample.sample_id)

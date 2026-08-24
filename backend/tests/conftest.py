@@ -9,7 +9,15 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-TEST_ROOT = Path(tempfile.mkdtemp(prefix="openllmops-backend-tests-"))
+TEST_ROOT = Path(tempfile.mkdtemp(prefix="openllmops-backend-tests-")).resolve()
+for directory in (
+    TEST_ROOT / "models",
+    TEST_ROOT / "datasets",
+    TEST_ROOT / "evaluation-datasets",
+    TEST_ROOT / "evaluation-output",
+    TEST_ROOT / "runtime",
+):
+    directory.mkdir(parents=True, exist_ok=True)
 os.environ.update(
     {
         "ENVIRONMENT": "test",
@@ -20,6 +28,9 @@ os.environ.update(
         "MODEL_INBOX_ROOT": str(TEST_ROOT / "inbox"),
         "DATASET_ROOT": str(TEST_ROOT / "datasets"),
         "CHECKPOINT_ROOT": str(TEST_ROOT / "checkpoints"),
+        "EVALUATION_DATASET_ROOT": str(TEST_ROOT / "evaluation-datasets"),
+        "EVALUATION_OUTPUT_ROOT": str(TEST_ROOT / "evaluation-output"),
+        "NODE_AGENT_RUNTIME_ROOT": str(TEST_ROOT / "runtime"),
         "GPU_COUNT": "2",
     }
 )

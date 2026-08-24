@@ -122,3 +122,47 @@ def test_evaluation_duplicate_ids_and_runtime_line_limit_are_rejected(tmp_path: 
             tmp_path / "oversized.jsonl",
             DatasetType.EVALUATION,
         )
+
+
+@pytest.mark.parametrize("field", ["id", "category"])
+def test_evaluation_source_prefix_fields_are_limited_to_191_chars(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    row = {
+        "id": "sample",
+        "task_type": "short_qa",
+        "question": "问题",
+        "answer": "答案",
+        "category": "domain",
+        field: "x" * 192,
+    }
+    with pytest.raises(ValueError, match="191"):
+        validate_and_store_jsonl(
+            io.BytesIO(json.dumps(row, ensure_ascii=False).encode() + b"\n"),
+            tmp_path / f".{field}.part",
+            tmp_path / f"{field}.jsonl",
+            DatasetType.EVALUATION,
+        )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"id":"one","id":"two","task_type":"short_qa","question":"Q","answer":"A"}\n',
+        b'{"task_type":"short_qa","question":"Q","answer":"A","metadata":{"score":NaN}}\n',
+        b'{"task_type":"short_qa","question":"Q","answer":"A","category":123}\n',
+        (b'{"task_type":"short_qa","question":"Q","answer":"A","metadata":{"openllmops_source":{}}}\n'),
+    ],
+)
+def test_evaluation_rejects_ambiguous_or_reserved_json(
+    tmp_path: Path,
+    raw: bytes,
+) -> None:
+    with pytest.raises(ValueError):
+        validate_and_store_jsonl(
+            io.BytesIO(raw),
+            tmp_path / ".unsafe.part",
+            tmp_path / "unsafe.jsonl",
+            DatasetType.EVALUATION,
+        )

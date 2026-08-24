@@ -19,6 +19,13 @@ class ModelKind(StringEnum):
     EMBEDDING = "embedding"
 
 
+class EvaluationTemplate(StringEnum):
+    """评测执行器允许的两种提示模板。"""
+
+    BASE = "base"
+    INSTRUCT = "instruct"
+
+
 class ModelImportSource(StringEnum):
     HUGGINGFACE = "huggingface"
     MODELSCOPE = "modelscope"

@@ -45,6 +45,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             agent_client,
             GPULeaseManager(settings.gpu_lease_ttl_seconds),
             interval_seconds=settings.reconciler_interval_seconds,
+            settings=settings,
         )
         stop_event = asyncio.Event()
         reconciler_task = asyncio.create_task(
