@@ -1,0 +1,43 @@
+# macOS 与编辑器临时文件
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Node.js / Vue
+node_modules/
+dist/
+.vite/
+coverage/
+
+# 本地配置与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 运行期大文件不进入 Git
+data/
+artifacts/
+models/
+datasets/
+checkpoints/
+logs/
+tmp/
+
+# 数据库与监控本地卷
+postgres-data/
+prometheus-data/
+grafana-data/
+
