@@ -12,6 +12,7 @@ export interface GpuDevice {
   state: 'idle' | 'inference' | 'training' | 'reserved'
   task?: string
   telemetryAvailable?: boolean
+  telemetryReason?: string
 }
 
 export interface ModelAsset {

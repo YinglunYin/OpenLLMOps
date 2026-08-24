@@ -9,20 +9,26 @@ import PageHeader from '@/components/PageHeader.vue'
 import PanelCard from '@/components/PanelCard.vue'
 import StatCard from '@/components/StatCard.vue'
 import StatusPill from '@/components/StatusPill.vue'
-import { api } from '@/api/services'
+import { api, type GpuHistoryRange } from '@/api/services'
 import { useMocks } from '@/api/client'
+import type { BackendGpuHistory } from '@/api/contracts'
 import type { GpuDevice } from '@/types/domain'
 
 const gpus = ref<GpuDevice[]>([])
 const trendTimes = ref<string[]>([])
 const utilizationSeries = ref<number[][]>([])
-const range = ref('1h')
+const memorySeries = ref<number[][]>([])
+const thermalSeries = ref<number[][]>([])
+const range = ref<GpuHistoryRange>('1h')
 const refreshedAt = ref(new Date())
-const telemetryAvailable = computed(() => useMocks && gpus.value.some((gpu) => gpu.telemetryAvailable !== false))
+const refreshBusy = ref(false)
 
 const utilizationOption = computed(() => makeLineOption(utilizationSeries.value, '%'))
-const memoryOption = computed(() => makeLineOption([[7.2,7.8,7.6,7.7,7.5,7.8,7.6],[17.2,18.2,18.5,18.1,18.4,18.1,18.3],[3,3.1,3.2,3,3.3,3.1,3.2],[.2,.2,.2,.2,.2,.2,.2]], ' GB', 24))
-const thermalOption = computed(() => makeLineOption([[51,52,54,53,52,54,52],[65,68,69,68,70,69,68],[44,45,46,46,45,47,46],[37,38,38,39,38,38,38]], '°C', 100))
+const memoryOption = computed(() => makeLineOption(memorySeries.value, ' GB', Math.max(24, ...gpus.value.map((gpu) => Math.ceil(gpu.memoryTotal)))))
+const thermalOption = computed(() => makeLineOption(thermalSeries.value, '°C', 100))
+const hasUtilizationHistory = computed(() => utilizationSeries.value.some((series) => series.length))
+const hasMemoryHistory = computed(() => memorySeries.value.some((series) => series.length))
+const hasThermalHistory = computed(() => thermalSeries.value.some((series) => series.length))
 
 function makeLineOption(series: number[][], suffix: string, max = 100) {
   const colors = ['#12a865','#1769f5','#ed8a16','#7c3aed']
@@ -30,17 +36,39 @@ function makeLineOption(series: number[][], suffix: string, max = 100) {
 }
 
 async function refresh() {
+  refreshBusy.value = true
   try {
     if (import.meta.env.VITE_USE_MOCKS === 'true' && !trendTimes.value.length) {
       const mockData = await import('@/mock/data')
       trendTimes.value = mockData.trendTimes
       utilizationSeries.value = mockData.utilizationSeries
+      memorySeries.value = [[7.2,7.8,7.6,7.7,7.5,7.8,7.6],[17.2,18.2,18.5,18.1,18.4,18.1,18.3],[3,3.1,3.2,3,3.3,3.1,3.2],[.2,.2,.2,.2,.2,.2,.2]]
+      thermalSeries.value = [[51,52,54,53,52,54,52],[65,68,69,68,70,69,68],[44,45,46,46,45,47,46],[37,38,38,39,38,38,38]]
     }
     gpus.value = await api.resources.gpus()
+    if (!useMocks) {
+      const indexes = gpus.value.map((gpu) => gpu.index)
+      const [utilization, memory, thermal] = await Promise.all([
+        api.resources.history('utilization', range.value, indexes),
+        api.resources.history('memory_used_mib', range.value, indexes),
+        api.resources.history('temperature_celsius', range.value, indexes),
+      ])
+      utilizationSeries.value = historyValues(utilization)
+      memorySeries.value = historyValues(memory, (value) => Number((value / 1024).toFixed(2)))
+      thermalSeries.value = historyValues(thermal)
+      const timeline = [utilization, memory, thermal].flat().find((item) => item.points.length)?.points ?? []
+      trendTimes.value = timeline.map((point) => new Date(point.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }))
+    }
     refreshedAt.value = new Date()
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : 'GPU 资源加载失败')
+  } finally {
+    refreshBusy.value = false
   }
+}
+
+function historyValues(rows: BackendGpuHistory[], transform: (value: number) => number = (value) => value): number[][] {
+  return rows.sort((left, right) => left.gpu_index - right.gpu_index).map((row) => row.points.map((point) => transform(point.value)))
 }
 onMounted(refresh)
 </script>
@@ -48,8 +76,8 @@ onMounted(refresh)
 <template>
   <div>
     <PageHeader title="资源监控" subtitle="NVIDIA GPU、主机资源、独占租约与硬件健康状态">
-      <el-select v-model="range" style="width:145px"><el-option label="最近 1 小时" value="1h"/><el-option label="最近 6 小时" value="6h"/><el-option label="最近 24 小时" value="24h"/></el-select>
-      <el-button :icon="Refresh" @click="refresh">5 秒刷新</el-button>
+      <el-select v-model="range" style="width:145px" @change="refresh"><el-option label="最近 1 小时" value="1h"/><el-option label="最近 6 小时" value="6h"/><el-option label="最近 24 小时" value="24h"/></el-select>
+      <el-button :icon="Refresh" :loading="refreshBusy" @click="refresh">刷新</el-button>
     </PageHeader>
 
     <div class="stats-grid five">
@@ -64,14 +92,14 @@ onMounted(refresh)
     <PanelCard v-if="!gpus.length" class="section-gap"><el-empty description="暂无 GPU 能力或租约数据" /></PanelCard>
 
     <div class="monitor-charts section-gap">
-      <PanelCard title="GPU 利用率"><BaseChart v-if="telemetryAvailable" :option="utilizationOption" height="210px"/><el-empty v-else description="实时遥测端点尚未接入" :image-size="54"/></PanelCard>
-      <PanelCard title="显存占用"><BaseChart v-if="telemetryAvailable" :option="memoryOption" height="210px"/><el-empty v-else description="实时遥测端点尚未接入" :image-size="54"/></PanelCard>
-      <PanelCard title="温度趋势"><BaseChart v-if="telemetryAvailable" :option="thermalOption" height="210px"/><el-empty v-else description="实时遥测端点尚未接入" :image-size="54"/></PanelCard>
+      <PanelCard title="GPU 利用率"><BaseChart v-if="hasUtilizationHistory" :option="utilizationOption" height="210px"/><el-empty v-else description="该时间范围暂无利用率数据" :image-size="54"/></PanelCard>
+      <PanelCard title="显存占用"><BaseChart v-if="hasMemoryHistory" :option="memoryOption" height="210px"/><el-empty v-else description="该时间范围暂无显存数据" :image-size="54"/></PanelCard>
+      <PanelCard title="温度趋势"><BaseChart v-if="hasThermalHistory" :option="thermalOption" height="210px"/><el-empty v-else description="该时间范围暂无温度数据" :image-size="54"/></PanelCard>
     </div>
 
     <div class="monitor-bottom section-gap">
       <PanelCard title="GPU 资源租约" flush>
-        <el-table :data="gpus" size="small"><el-table-column label="GPU" width="70"><template #default="{row}">GPU {{ row.index }}</template></el-table-column><el-table-column prop="task" label="占用任务" min-width="180"><template #default="{row}">{{ row.task ?? '—' }}</template></el-table-column><el-table-column label="任务类型" width="95"><template #default="{row}"><StatusPill :text="row.state==='training'?'训练':row.state==='inference'?'推理':row.state==='reserved'?'预留':'空闲'" :tone="row.state==='training'?'warning':row.state==='inference'?'primary':row.state==='reserved'?'info':'success'"/></template></el-table-column><el-table-column label="显存" width="105"><template #default="{row}">{{ row.telemetryAvailable === false ? '未接入' : `${row.memoryUsed} / 24 GB` }}</template></el-table-column><el-table-column label="状态" width="90"><template #default="{row}"><StatusPill :text="row.state==='idle'?'空闲':'运行中'" :tone="row.state==='idle'?'info':'success'"/></template></el-table-column></el-table>
+        <el-table :data="gpus" size="small"><el-table-column label="GPU" width="70"><template #default="{row}">GPU {{ row.index }}</template></el-table-column><el-table-column prop="task" label="占用任务" min-width="180"><template #default="{row}">{{ row.task ?? '—' }}</template></el-table-column><el-table-column label="任务类型" width="95"><template #default="{row}"><StatusPill :text="row.state==='training'?'训练':row.state==='inference'?'推理':row.state==='reserved'?'预留':'空闲'" :tone="row.state==='training'?'warning':row.state==='inference'?'primary':row.state==='reserved'?'info':'success'"/></template></el-table-column><el-table-column label="显存" width="125"><template #default="{row}">{{ row.telemetryAvailable === false ? '遥测不可用' : `${row.memoryUsed} / ${row.memoryTotal} GB` }}</template></el-table-column><el-table-column label="状态" width="90"><template #default="{row}"><StatusPill :text="row.state==='idle'?'空闲':'运行中'" :tone="row.state==='idle'?'info':'success'"/></template></el-table-column></el-table>
       </PanelCard>
       <PanelCard title="系统资源">
         <div v-if="useMocks" class="host-metrics"><div><span><el-icon><Cpu/></el-icon>CPU 利用率<b>28%</b></span><el-progress :percentage="28" :show-text="false" :stroke-width="7"/></div><div><span><el-icon><Monitor/></el-icon>系统内存<b>71.7 / 128 GB</b></span><el-progress :percentage="56" :show-text="false" :stroke-width="7"/></div><div><span><el-icon><Files/></el-icon>磁盘（/）<b>842 / 2000 GB</b></span><el-progress :percentage="42" :show-text="false" :stroke-width="7"/></div><div><span><el-icon><Connection/></el-icon>网络（eno1）<b>↑ 1.2 ↓ 1.5 Gbps</b></span><el-progress :percentage="52" :show-text="false" :stroke-width="7"/></div></div><el-empty v-else description="主机资源端点尚未接入" :image-size="54"/>

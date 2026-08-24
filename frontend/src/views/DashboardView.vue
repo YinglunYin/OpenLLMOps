@@ -54,7 +54,15 @@ onMounted(async () => {
     }
     const [summaryResult, gpuResult, activityResult] = await Promise.allSettled([api.dashboard.summary(), api.resources.gpus(), api.dashboard.activities()])
     if (summaryResult.status === 'fulfilled') summary.value = summaryResult.value
-    if (gpuResult.status === 'fulfilled') gpus.value = gpuResult.value
+    if (gpuResult.status === 'fulfilled') {
+      gpus.value = gpuResult.value
+      if (!useMocks) {
+        const histories = await api.resources.history('utilization', '1h', gpus.value.map((gpu) => gpu.index))
+        utilizationSeries.value = histories.map((history) => history.points.map((point) => point.value))
+        const timeline = histories.find((history) => history.points.length)?.points ?? []
+        trendTimes.value = timeline.map((point) => new Date(point.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }))
+      }
+    }
     if (activityResult.status === 'fulfilled') activities.value = activityResult.value
     if (summaryResult.status === 'rejected' && gpuResult.status === 'rejected') ElMessage.error('总览核心数据加载失败，请检查控制面连接')
     if (!useMocks) {
@@ -97,7 +105,7 @@ onMounted(async () => {
     </PanelCard>
 
     <div class="dashboard-middle section-gap">
-      <PanelCard title="GPU 利用率"><BaseChart v-if="useMocks" :option="chartOption" height="213px" /><el-empty v-else description="实时遥测端点尚未接入" :image-size="62" /></PanelCard>
+      <PanelCard title="GPU 利用率"><BaseChart v-if="utilizationSeries.some((series) => series.length)" :option="chartOption" height="213px" /><el-empty v-else description="最近一小时暂无 GPU 遥测" :image-size="62" /></PanelCard>
       <PanelCard title="任务队列" flush>
         <el-table :data="tasks" size="small">
           <el-table-column prop="type" label="类型" width="70">

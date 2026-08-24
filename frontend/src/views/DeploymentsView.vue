@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { CircleCheck, Clock, CloseBold, CopyDocument, Plus, Promotion, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -21,6 +21,8 @@ const createVisible = ref(false)
 const configMode = ref<'simple' | 'advanced'>('simple')
 const createBusy = ref(false)
 const form = reactive({ name: '', servedModelName: '', modelAssetId: '', serviceType: 'generation', gpuCount: 1, maxModelLen: 32768, gpuMemoryUtilization: .9, dtype: 'auto', advancedArgs: '--enable-prefix-caching\n--max-num-seqs 64' })
+
+watch(() => form.serviceType, () => { form.modelAssetId = '' })
 
 const counts = computed(() => ({
   running: rows.value.filter((item) => item.status === 'running').length,
@@ -156,7 +158,7 @@ onMounted(async () => {
           <el-form-item label="服务类型"><el-select v-model="form.serviceType" style="width:100%"><el-option label="文本生成" value="generation" /><el-option label="Embedding" value="embedding" /></el-select></el-form-item>
         </div>
         <div class="two-column-form">
-          <el-form-item label="模型资产" required><el-select v-model="form.modelAssetId" filterable placeholder="选择已校验的模型" style="width:100%"><el-option v-for="model in modelOptions.filter((item) => item.status === 'available')" :key="model.id" :label="model.name" :value="model.id" /></el-select></el-form-item>
+          <el-form-item label="模型资产" required><el-select v-model="form.modelAssetId" filterable placeholder="选择已校验且类型匹配的模型" style="width:100%"><el-option v-for="model in modelOptions.filter((item) => item.status === 'available' && (form.serviceType === 'embedding' ? item.type === 'embedding' : item.type === 'generation'))" :key="model.id" :label="model.name" :value="model.id" /></el-select></el-form-item>
           <el-form-item label="对外模型名"><el-input v-model="form.servedModelName" placeholder="留空则使用部署名称" /></el-form-item>
         </div>
         <template v-if="configMode === 'simple'">

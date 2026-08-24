@@ -22,6 +22,33 @@ export interface BackendModelAsset extends TimestampedResource {
   metadata_json: Record<string, unknown>
 }
 
+export interface BackendModelImport extends TimestampedResource {
+  name: string
+  source: 'huggingface' | 'modelscope' | 'controlled_directory'
+  repository: string | null
+  revision: string | null
+  source_directory: string | null
+  model_kind: 'base' | 'instruct' | 'embedding'
+  status: 'pending' | 'transferring' | 'validating' | 'ready' | 'failed' | 'canceling' | 'canceled'
+  progress_completed: number
+  progress_total: number | null
+  progress_percent: number | null
+  started_at: string | null
+  finished_at: string | null
+  result_asset_id: string | null
+  manifest_json: Record<string, unknown> | null
+  error_message: string | null
+}
+
+export interface BackendInboxCandidate {
+  name: string
+  path: string
+  file_count: number
+  size_bytes: number
+  ready_for_import: boolean
+  reason: string | null
+}
+
 export interface BackendDeployment extends TimestampedResource {
   name: string
   served_model_name: string
@@ -93,6 +120,66 @@ export interface BackendGpuLease {
   owner_id: string
   owner_name: string
   acquired_at: string
+}
+
+export interface BackendGpuStatus {
+  index: number
+  name: string | null
+  memory_total_mib: number | null
+  memory_used_mib: number | null
+  memory_free_mib: number | null
+  utilization_percent: number | null
+  temperature_celsius: number | null
+  power_watts: number | null
+  telemetry_available: boolean
+  degraded_reason: string | null
+  owner_type: 'deployment' | 'training' | 'evaluation' | null
+  owner_id: string | null
+  owner_name: string | null
+  lease_expires_at: string | null
+}
+
+export type BackendGpuHistoryMetric = 'utilization' | 'memory_used_mib' | 'memory_free_mib' | 'temperature_celsius' | 'power_watts'
+
+export interface BackendGpuHistory {
+  gpu_index: number
+  metric: BackendGpuHistoryMetric
+  unit: string
+  start: string
+  end: string
+  step_seconds: number
+  telemetry_available: boolean
+  degraded_reason: string | null
+  points: Array<{ timestamp: string; value: number }>
+}
+
+interface BackendDashboardWorkloadSummary {
+  total: number
+  running: number
+  queued: number
+  failed: number
+}
+
+export interface BackendDashboardSummary {
+  generated_at: string
+  models: { total: number; ready: number; importing: number; failed: number }
+  deployments: BackendDashboardWorkloadSummary
+  training_jobs: BackendDashboardWorkloadSummary
+  evaluation_runs: BackendDashboardWorkloadSummary
+  queue: { total: number; deployments: number; training_jobs: number; evaluation_runs: number; model_imports: number }
+  gpus: {
+    total: number
+    leased: number
+    free: number
+    leases: Array<{ gpu_index: number; owner_type: 'deployment' | 'training' | 'evaluation'; owner_id: string; owner_name: string; expires_at: string }>
+  }
+  recent_activity: Array<{
+    resource_type: 'model_asset' | 'model_import' | 'deployment' | 'training_job' | 'evaluation_run'
+    resource_id: string
+    name: string
+    status: string
+    occurred_at: string
+  }>
 }
 
 export interface BackendCapabilities {

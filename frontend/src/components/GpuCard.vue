@@ -6,7 +6,7 @@ const props = withDefaults(defineProps<{ gpu: GpuDevice; compact?: boolean }>(),
 
 const stateText = computed(() => ({ idle: '空闲', inference: '推理', training: '训练', reserved: '预留' })[props.gpu.state])
 const stateClass = computed(() => `state-${props.gpu.state}`)
-const memoryPercent = computed(() => Math.round((props.gpu.memoryUsed / props.gpu.memoryTotal) * 100))
+const memoryPercent = computed(() => props.gpu.memoryTotal > 0 ? Math.round((props.gpu.memoryUsed / props.gpu.memoryTotal) * 100) : 0)
 </script>
 
 <template>
@@ -16,7 +16,7 @@ const memoryPercent = computed(() => Math.round((props.gpu.memoryUsed / props.gp
       <span :class="['gpu-state', stateClass]"><i />{{ stateText }}</span>
     </div>
     <div v-if="gpu.telemetryAvailable === false" class="telemetry-unavailable">
-      当前仅有租约状态，实时遥测端点尚未接入
+      {{ gpu.telemetryReason ?? '当前仅有租约状态，实时遥测不可用' }}
     </div>
     <template v-else>
     <div class="metric-row"><span>利用率</span><b>{{ gpu.utilization }}%</b></div>

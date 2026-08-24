@@ -1,16 +1,19 @@
-import { toApiKey, toDashboardActivity, toDataset, toDeployment, toEvaluationRunSummary, toEvaluationSummaries, toGpuDevices, toModelAsset, toTrainingJob } from './adapters'
+import { formatDateTime, toApiKey, toDataset, toDeployment, toEvaluationRunSummary, toEvaluationSummaries, toGpuDevice, toModelAsset, toTrainingJob } from './adapters'
 import { http, setCsrfToken, useMocks } from './client'
 import type {
   BackendAdminIdentity,
-  BackendAuditLog,
-  BackendCapabilities,
   BackendApiKey,
   BackendCreatedApiKey,
+  BackendDashboardSummary,
   BackendDataset,
   BackendDeployment,
   BackendEvaluationRun,
-  BackendGpuLease,
+  BackendGpuHistory,
+  BackendGpuHistoryMetric,
+  BackendGpuStatus,
+  BackendInboxCandidate,
   BackendModelAsset,
+  BackendModelImport,
   BackendTrainingJob,
 } from './contracts'
 import { createOpenAIStreamParser } from './sse'
@@ -91,12 +94,31 @@ async function listTrainingJobs(): Promise<TrainingJob[]> {
 
 async function listGpus(): Promise<GpuDevice[]> {
   if (useMocks) return clone((await loadMockData()).gpuDevices)
-  // 后端当前只暴露卡数与独占租约；不能把 0% 伪装成实时遥测，适配器会标记 telemetryAvailable=false。
-  const [{ data: capabilities }, { data: leases }] = await Promise.all([
-    http.get<BackendCapabilities>('/v1/system/capabilities'),
-    http.get<BackendGpuLease[]>('/v1/system/gpu-leases'),
-  ])
-  return toGpuDevices(capabilities.gpu_count, leases)
+  const { data } = await http.get<BackendGpuStatus[]>('/v1/system/gpus')
+  return data.map(toGpuDevice)
+}
+
+export type GpuHistoryRange = '1h' | '6h' | '24h'
+
+async function listGpuHistory(metric: BackendGpuHistoryMetric, range: GpuHistoryRange, gpuIndexes: number[]): Promise<BackendGpuHistory[]> {
+  if (useMocks) return []
+  const durationSeconds = { '1h': 3_600, '6h': 21_600, '24h': 86_400 }[range]
+  const stepSeconds = { '1h': 15, '6h': 60, '24h': 300 }[range]
+  const end = new Date()
+  const start = new Date(end.getTime() - durationSeconds * 1_000)
+  return Promise.all(gpuIndexes.map(async (index) => (await http.get<BackendGpuHistory>(`/v1/system/gpus/${index}/history`, {
+    params: { metric, start: start.toISOString(), end: end.toISOString(), step_seconds: stepSeconds },
+  })).data))
+}
+
+let dashboardRequest: Promise<BackendDashboardSummary> | undefined
+
+function loadDashboardSummary(): Promise<BackendDashboardSummary> {
+  // 总览摘要与活动在同一响应中；并行调用复用同一个在途请求，避免重复聚合数据库。
+  dashboardRequest ??= http.get<BackendDashboardSummary>('/v1/dashboard/summary')
+    .then(({ data }) => data)
+    .finally(() => { dashboardRequest = undefined })
+  return dashboardRequest
 }
 
 async function evaluationComparison(): Promise<EvaluationSummary[]> {
@@ -122,20 +144,17 @@ async function listEvaluationRuns(): Promise<EvaluationRunSummary[]> {
 }
 
 function normalizeModelImport(payload: Record<string, unknown>) {
-  const source = String(payload.source ?? 'inbox')
-  const sourceType = ({ huggingface: 'huggingface', modelscope: 'modelscope', sftp: 'sftp', inbox: 'manual' } as const)[source as 'huggingface' | 'modelscope' | 'sftp' | 'inbox'] ?? 'manual'
+  const source = String(payload.source ?? 'controlled_directory')
   const repository = String(payload.repository ?? '')
-  const name = String(payload.name || repository.split('/').at(-1) || '待导入模型')
+  const sourceDirectory = String(payload.sourceDirectory ?? '')
+  const name = String(payload.name || repository.split('/').at(-1) || sourceDirectory || '待导入模型')
   return {
     name,
-    source_type: sourceType,
-    source_uri: repository || null,
-    revision: payload.revision || null,
-    local_path: String(payload.localPath || `/srv/openllmops/models/${name}`),
+    source,
+    repository: source === 'controlled_directory' ? null : repository,
+    revision: source === 'controlled_directory' ? null : payload.revision || null,
+    source_directory: source === 'controlled_directory' ? sourceDirectory : null,
     model_kind: payload.modelKind || 'instruct',
-    format: 'safetensors',
-    status: 'importing',
-    metadata_json: {},
   }
 }
 
@@ -173,7 +192,7 @@ function normalizeTraining(payload: Record<string, unknown>) {
       per_device_train_batch_size: payload.batchSize,
       gradient_accumulation_steps: payload.gradientAccumulation,
       lora_rank: payload.loraRank,
-      output_mode: payload.outputMode,
+      ...(payload.stage === 'SFT' ? { template: payload.template } : {}),
     },
     output_dir: `/srv/openllmops/checkpoints/${name}`,
   }
@@ -191,12 +210,23 @@ function normalizeEvaluation(payload: Record<string, unknown>) {
   }
 }
 
-function parseAdvancedArgs(value: string): Record<string, string | boolean> {
-  const result: Record<string, string | boolean> = {}
+export function parseAdvancedArgs(value: string): Record<string, string | number | boolean | null> {
+  const result: Record<string, string | number | boolean | null> = {}
   for (const line of value.split('\n').map((item) => item.trim()).filter(Boolean)) {
     const [rawKey, ...rest] = line.split(/\s+/)
-    if (!rawKey) continue
-    result[rawKey.replace(/^--/, '').replaceAll('-', '_')] = rest.length ? rest.join(' ') : true
+    if (!rawKey?.startsWith('--')) throw new Error(`vLLM 参数必须以 -- 开头：${line}`)
+    const key = rawKey.slice(2).replaceAll('-', '_')
+    if (!/^[a-z][a-z0-9_]*$/.test(key)) throw new Error(`vLLM 参数名无效：${rawKey}`)
+    if (Object.hasOwn(result, key)) throw new Error(`vLLM 参数重复：${rawKey}`)
+    if (!rest.length) {
+      result[key] = true
+      continue
+    }
+    const rawValue = rest.join(' ')
+    if (/^(true|false|null)$/.test(rawValue)) result[key] = JSON.parse(rawValue) as boolean | null
+    else if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(rawValue)) result[key] = Number(rawValue)
+    else if (/^"(?:[^"\\]|\\.)*"$/.test(rawValue)) result[key] = JSON.parse(rawValue) as string
+    else result[key] = rawValue
   }
   return result
 }
@@ -224,13 +254,13 @@ export const api = {
   dashboard: {
     async summary(): Promise<DashboardSummary> {
       if (useMocks) return clone((await loadMockData()).dashboardSummary)
-      const [models, deployments, jobs, gpus] = await Promise.all([listModels(), listDeployments(), listTrainingJobs(), listGpus()])
+      const data = await loadDashboardSummary()
       return {
-        modelCount: models.length,
-        runningDeployments: deployments.filter((item) => item.status === 'running').length,
-        runningTrainingJobs: jobs.filter((item) => item.status === 'running').length,
-        availableGpus: gpus.filter((item) => item.state === 'idle').length,
-        totalGpus: gpus.length,
+        modelCount: data.models.total,
+        runningDeployments: data.deployments.running,
+        runningTrainingJobs: data.training_jobs.running,
+        availableGpus: data.gpus.free,
+        totalGpus: data.gpus.total,
       }
     },
     async activities(): Promise<DashboardActivity[]> {
@@ -239,18 +269,36 @@ export const api = {
         { id: 'activity-eval', time: '10:58:41', text: '测评任务已创建', detail: 'llama3-8b 评测已加入队列', tone: 'warning' },
         { id: 'activity-failed', time: '10:38:07', text: '训练任务失败', detail: 'internlm2-20b 显存不足', tone: 'danger' },
       ] satisfies DashboardActivity[])
-      const { data } = await http.get<BackendAuditLog[]>('/v1/audit-logs', { params: { limit: 5 } })
-      return data.map(toDashboardActivity)
+      const data = await loadDashboardSummary()
+      const resourceLabels = { model_asset: '模型资产', model_import: '模型导入', deployment: '推理部署', training_job: '训练任务', evaluation_run: '测评任务' }
+      return data.recent_activity.map((item) => ({
+        id: `${item.resource_type}-${item.resource_id}`,
+        time: formatDateTime(item.occurred_at).slice(11),
+        text: `${resourceLabels[item.resource_type]} · ${item.status}`,
+        detail: item.name,
+        tone: ['failed', 'invalid'].includes(item.status) ? 'danger' : ['ready', 'running', 'succeeded'].includes(item.status) ? 'success' : ['pending', 'queued', 'transferring', 'validating'].includes(item.status) ? 'warning' : 'info',
+      }))
     },
   },
   models: {
     list: listModels,
     import: async (payload: Record<string, unknown>) => useMocks
       ? mockMutation({ id: crypto.randomUUID() })
-      : (await http.post<BackendModelAsset>('/v1/model-assets', normalizeModelImport(payload))).data,
-    async scanInbox(): Promise<CapabilityResult<string[]>> {
-      if (useMocks) return { supported: true, data: ['/inbox/Qwen2-7B-Instruct', '/inbox/BGE-M3'] }
-      return { supported: false, data: [], reason: '控制面尚未提供受控目录扫描端点' }
+      : (await http.post<BackendModelImport>('/v1/model-imports', normalizeModelImport(payload))).data,
+    async imports(): Promise<BackendModelImport[]> {
+      if (useMocks) return []
+      return (await http.get<BackendModelImport[]>('/v1/model-imports')).data
+    },
+    async cancelImport(id: string): Promise<BackendModelImport> {
+      if (useMocks) return mockMutation({ id, status: 'canceled' } as BackendModelImport)
+      return (await http.post<BackendModelImport>(`/v1/model-imports/${id}/cancel`)).data
+    },
+    async scanInbox(): Promise<BackendInboxCandidate[]> {
+      if (useMocks) return [
+        { name: 'Qwen2-7B-Instruct', path: '/inbox/Qwen2-7B-Instruct', file_count: 12, size_bytes: 15_032_385_536, ready_for_import: true, reason: null },
+        { name: 'BGE-M3', path: '/inbox/BGE-M3', file_count: 9, size_bytes: 2_274_918_400, ready_for_import: true, reason: null },
+      ]
+      return (await http.get<BackendInboxCandidate[]>('/v1/model-inbox')).data
     },
     remove: async (id: string) => useMocks ? mockMutation(true) : (await http.delete(`/v1/model-assets/${id}`), true),
   },
@@ -316,7 +364,7 @@ export const api = {
       return toApiKey((await http.post<BackendApiKey>(`/v1/api-keys/${id}/revoke`)).data)
     },
   },
-  resources: { gpus: listGpus },
+  resources: { gpus: listGpus, history: listGpuHistory },
 }
 
 interface StreamChatOptions {

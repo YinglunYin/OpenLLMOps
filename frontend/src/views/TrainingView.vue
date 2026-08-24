@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { CircleCheck, CloseBold, Clock, Download, Plus, VideoPlay, Warning } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -20,7 +20,12 @@ const modelOptions = ref<ModelAsset[]>([])
 const datasetOptions = ref<Dataset[]>([])
 const createVisible = ref(false)
 const createBusy = ref(false)
-const form = reactive({ name: '', stage: 'SFT', algorithm: 'LoRA', modelAssetId: '', datasetId: '', gpuCount: 1, epochs: 3, learningRate: '2e-4', batchSize: 2, gradientAccumulation: 8, loraRank: 8, outputMode: ['adapter', 'merged'] })
+const form = reactive({ name: '', stage: 'SFT', algorithm: 'LoRA', modelAssetId: '', datasetId: '', gpuCount: 1, epochs: 3, learningRate: 0.0002, batchSize: 2, gradientAccumulation: 8, loraRank: 8, template: 'qwen' })
+
+watch(() => form.stage, (stage) => {
+  if (stage === 'CPT') form.algorithm = 'LoRA'
+  form.datasetId = ''
+})
 
 const counts = computed(() => ({
   running: rows.value.filter((item) => item.status === 'running').length,
@@ -142,9 +147,10 @@ onMounted(async () => {
         <div class="two-column-form"><el-form-item label="任务名称" required><el-input v-model="form.name" placeholder="例如 sft-qlora-finance" /></el-form-item><el-form-item label="训练阶段"><el-radio-group v-model="form.stage"><el-radio-button value="CPT">继续预训练 CPT</el-radio-button><el-radio-button value="SFT">指令微调 SFT</el-radio-button></el-radio-group></el-form-item></div>
         <div class="two-column-form"><el-form-item label="基础模型" required><el-select v-model="form.modelAssetId" style="width:100%" placeholder="选择已校验模型"><el-option v-for="model in modelOptions.filter((item) => item.status === 'available' && item.type === 'generation')" :key="model.id" :label="model.name" :value="model.id"/></el-select></el-form-item><el-form-item label="数据集版本" required><el-select v-model="form.datasetId" style="width:100%" placeholder="选择匹配用途的数据集"><el-option v-for="dataset in datasetOptions.filter((item) => item.status === 'available' && item.purpose === form.stage)" :key="dataset.id" :label="`${dataset.name} ${dataset.version}`" :value="dataset.id"/></el-select></el-form-item></div>
         <el-form-item label="训练算法"><el-radio-group v-model="form.algorithm"><el-radio-button value="LoRA">LoRA</el-radio-button><el-radio-button v-if="form.stage==='SFT'" value="QLoRA">QLoRA</el-radio-button><el-radio-button v-if="form.stage==='SFT'" value="Freeze">Freeze</el-radio-button></el-radio-group><p v-if="form.stage==='CPT'" class="form-help">继续预训练在本版本固定使用 LoRA。</p></el-form-item>
-        <div class="four-column-form"><el-form-item label="整卡数量"><el-input-number v-model="form.gpuCount" :min="1" :max="4"/></el-form-item><el-form-item label="Epoch"><el-input-number v-model="form.epochs" :min="1"/></el-form-item><el-form-item label="学习率"><el-input v-model="form.learningRate"/></el-form-item><el-form-item label="批大小"><el-input-number v-model="form.batchSize" :min="1"/></el-form-item></div>
+        <div class="four-column-form"><el-form-item label="整卡数量"><el-input-number v-model="form.gpuCount" :min="1" :max="4"/></el-form-item><el-form-item label="Epoch"><el-input-number v-model="form.epochs" :min="1"/></el-form-item><el-form-item label="学习率"><el-input-number v-model="form.learningRate" :min="0.0000001" :max="1" :step="0.0001" :precision="7"/></el-form-item><el-form-item label="批大小"><el-input-number v-model="form.batchSize" :min="1"/></el-form-item></div>
         <div class="two-column-form"><el-form-item label="梯度累积"><el-input-number v-model="form.gradientAccumulation" :min="1"/></el-form-item><el-form-item v-if="form.algorithm!=='Freeze'" label="LoRA Rank"><el-input-number v-model="form.loraRank" :min="1"/></el-form-item></div>
-        <el-form-item label="训练产物"><el-checkbox-group v-model="form.outputMode"><el-checkbox value="adapter">Adapter / 原始 Checkpoint</el-checkbox><el-checkbox value="merged">合并模型（可直接部署）</el-checkbox></el-checkbox-group></el-form-item>
+        <el-form-item v-if="form.stage === 'SFT'" label="LLaMA-Factory 模板"><el-select v-model="form.template" style="width:100%"><el-option label="Qwen / Qwen2" value="qwen"/><el-option label="Llama 3" value="llama3"/><el-option label="ChatML" value="chatml"/><el-option label="Gemma" value="gemma"/></el-select><p class="form-help">模板必须与基础模型的对话格式一致，否则训练样本会被错误编码。</p></el-form-item>
+        <el-alert title="训练产物" description="系统保存原始 checkpoint，并在 LoRA/QLoRA 任务完成后提供 Adapter；合并模型由受控产物流程生成后才能部署。" type="info" :closable="false" show-icon />
         <el-alert title="GPU 调度提示" description="训练任务非抢占式排队。GPU 不足时，需要管理员手动停止推理服务后才会自动启动。" type="warning" :closable="false" show-icon />
       </el-form>
       <template #footer><el-button @click="createVisible=false">取消</el-button><el-button type="primary" :loading="createBusy" @click="createJob">创建任务</el-button></template>

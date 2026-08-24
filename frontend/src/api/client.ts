@@ -29,6 +29,12 @@ http.interceptors.response.use(
   (response) => response,
   (error: unknown) => {
     if (axios.isAxiosError(error)) {
+      if (error.response?.status === 401 && window.location.pathname !== '/login') {
+        setCsrfToken(null)
+        const redirect = `${window.location.pathname}${window.location.search}${window.location.hash}`
+        // 会话过期时硬导航到登录页，同时清空当前内存中的 CSRF，避免继续发送失效令牌。
+        window.location.assign(`/login?redirect=${encodeURIComponent(redirect)}`)
+      }
       const detail = error.response?.data?.detail
       if (typeof detail === 'string') return Promise.reject(new Error(detail))
       if (Array.isArray(detail)) return Promise.reject(new Error(detail.map((item) => item?.msg).filter(Boolean).join('；') || error.message))

@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
-import { toApiKey, toDashboardActivity, toDataset, toDeployment, toEvaluationRunSummary, toEvaluationSummaries, toGpuDevices, toModelAsset, toTrainingJob } from './adapters'
+import { toApiKey, toDashboardActivity, toDataset, toDeployment, toEvaluationRunSummary, toEvaluationSummaries, toGpuDevice, toGpuDevices, toModelAsset, toTrainingJob } from './adapters'
 import type {
   BackendApiKey,
   BackendAuditLog,
   BackendDataset,
   BackendDeployment,
   BackendEvaluationRun,
+  BackendGpuStatus,
   BackendModelAsset,
   BackendTrainingJob,
 } from './contracts'
@@ -67,6 +68,14 @@ describe('FastAPI 资源适配器', () => {
     expect(devices).toHaveLength(2)
     expect(devices[0]).toMatchObject({ state: 'idle', telemetryAvailable: false })
     expect(devices[1]).toMatchObject({ state: 'training', task: 'sft-job', telemetryAvailable: false })
+
+    const status = {
+      index: 0, name: 'NVIDIA RTX 4090 D', memory_total_mib: 24_576, memory_used_mib: 12_288,
+      memory_free_mib: 12_288, utilization_percent: 51, temperature_celsius: 62, power_watts: 318,
+      telemetry_available: true, degraded_reason: null, owner_type: 'deployment', owner_id: 'deploy',
+      owner_name: 'qwen-chat', lease_expires_at: '2026-08-24T11:01:00Z',
+    } satisfies BackendGpuStatus
+    expect(toGpuDevice(status)).toMatchObject({ memoryTotal: 24, memoryUsed: 12, utilization: 51, state: 'inference', task: 'qwen-chat', telemetryAvailable: true })
   })
 
   it('将 API Key 的布尔状态与时间字段映射为视图模型', () => {

@@ -5,6 +5,7 @@ import type {
   BackendDeployment,
   BackendEvaluationRun,
   BackendGpuLease,
+  BackendGpuStatus,
   BackendModelAsset,
   BackendTrainingJob,
 } from './contracts'
@@ -213,6 +214,29 @@ export function toGpuDevices(gpuCount: number, leases: BackendGpuLease[]): GpuDe
       telemetryAvailable: false,
     }
   })
+}
+
+export function toGpuDevice(item: BackendGpuStatus): GpuDevice {
+  const completeTelemetry = item.telemetry_available
+    && item.utilization_percent !== null
+    && item.memory_used_mib !== null
+    && item.memory_total_mib !== null
+    && item.temperature_celsius !== null
+    && item.power_watts !== null
+  return {
+    index: item.index,
+    name: item.name ?? `NVIDIA GPU ${item.index}`,
+    utilization: item.utilization_percent ?? 0,
+    memoryUsed: item.memory_used_mib === null ? 0 : Number((item.memory_used_mib / 1024).toFixed(2)),
+    memoryTotal: item.memory_total_mib === null ? 0 : Number((item.memory_total_mib / 1024).toFixed(2)),
+    temperature: item.temperature_celsius ?? 0,
+    power: item.power_watts ?? 0,
+    powerLimit: 425,
+    state: item.owner_type === 'training' ? 'training' : item.owner_type === 'deployment' ? 'inference' : item.owner_type ? 'reserved' : 'idle',
+    task: item.owner_name ?? undefined,
+    telemetryAvailable: completeTelemetry,
+    telemetryReason: item.degraded_reason ?? undefined,
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
