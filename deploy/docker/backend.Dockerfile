@@ -17,6 +17,11 @@ COPY workers/model_importer/pyproject.toml /opt/model-importer/pyproject.toml
 COPY workers/model_importer/src /opt/model-importer/src
 RUN pip install "/opt/model-importer[huggingface,modelscope]"
 
+# backend 与短生命周期评测容器复用同一 JSONL 解析器，避免上传与运行规则漂移。
+COPY evaluation/pyproject.toml /opt/evaluation/pyproject.toml
+COPY evaluation/src /opt/evaluation/src
+RUN pip install /opt/evaluation
+
 COPY backend/pyproject.toml ./pyproject.toml
 COPY backend/README.md ./README.md
 COPY backend/alembic.ini ./alembic.ini

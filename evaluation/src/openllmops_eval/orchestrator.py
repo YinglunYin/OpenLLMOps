@@ -7,6 +7,7 @@ import json
 import os
 import re
 import signal
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -86,7 +87,6 @@ def build_vllm_command(
         str(gpu_memory_utilization),
         "--load-format",
         "safetensors",
-        "--disable-log-requests",
     ]
 
 
@@ -106,17 +106,69 @@ async def _wait_until_ready(process: asyncio.subprocess.Process, port: int, time
     raise EvaluationRuntimeError(f"vLLM 在 {timeout:.0f} 秒内未就绪")
 
 
-async def _stop_process_group(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # 在隔离容器中权限异常也意味着进程组仍存在，不能冒险启动下一个模型。
+        return True
+    return True
+
+
+async def _wait_for_process_group_exit(
+    process_group_id: int,
+    leader_wait: asyncio.Task[int],
+    timeout_seconds: float,
+) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while _process_group_exists(process_group_id):
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.1, remaining))
+    # 进程组消失后再回收组长，避免遗留 asyncio 子进程 transport。
+    await asyncio.wait_for(asyncio.shield(leader_wait), timeout=max(1.0, timeout_seconds))
+    return True
+
+
+async def _stop_process_group(
+    process: asyncio.subprocess.Process,
+    *,
+    term_timeout_seconds: float = 30,
+    kill_timeout_seconds: float = 5,
+) -> None:
+    """确认 vLLM 整个进程组退出，而不只等待可能先退的组长。"""
+
+    process_group_id = process.pid
+    leader_wait = asyncio.create_task(process.wait())
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        await leader_wait
+        return
+    if await _wait_for_process_group_exit(
+        process_group_id,
+        leader_wait,
+        term_timeout_seconds,
+    ):
         return
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-        await asyncio.wait_for(process.wait(), timeout=30)
+        os.killpg(process_group_id, signal.SIGKILL)
     except ProcessLookupError:
+        await leader_wait
         return
-    except TimeoutError:
-        os.killpg(process.pid, signal.SIGKILL)
-        await process.wait()
+    if await _wait_for_process_group_exit(
+        process_group_id,
+        leader_wait,
+        kill_timeout_seconds,
+    ):
+        return
+    leader_wait.cancel()
+    with suppress(asyncio.CancelledError):
+        await leader_wait
+    raise EvaluationRuntimeError("vLLM 进程组在强制终止后仍未释放")
 
 
 async def _evaluate_target(

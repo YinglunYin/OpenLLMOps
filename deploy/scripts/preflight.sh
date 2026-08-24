@@ -101,6 +101,59 @@ while [ -n "$remaining_images" ]; do
     fi
 done
 
+# vLLM 仅允许已审计的 0.27.1 固定变体或仓库 digest，且必须由管理员预拉取。
+vllm_images=$(read_env_value VLLM_ALLOWED_IMAGES)
+vllm_images=${vllm_images:-vllm/vllm-openai:v0.27.1}
+vllm_images=$(PYTHONPATH="$project_root/agent" python3 -m openllmops_agent.vllm_image_policy "$vllm_images")
+remaining_images=$vllm_images
+while [ -n "$remaining_images" ]; do
+    case "$remaining_images" in
+        *,*)
+            vllm_image=${remaining_images%%,*}
+            remaining_images=${remaining_images#*,}
+            ;;
+        *)
+            vllm_image=$remaining_images
+            remaining_images=
+            ;;
+    esac
+    if ! docker image inspect "$vllm_image" >/dev/null 2>&1; then
+        echo "vLLM 镜像尚未拉取：$vllm_image" >&2
+        echo "请由管理员先按固定版本或 digest 拉取，任务不会隐式拉取镜像" >&2
+        exit 1
+    fi
+done
+
+# 评测镜像除引用白名单外，还要核对构建标签，防止同名镜像替换执行器。
+evaluation_images=$(read_env_value EVALUATION_ALLOWED_IMAGES)
+evaluation_images=${evaluation_images:-openllmops/evaluation:0.1.0-vllm0.27.1}
+evaluation_images=$(PYTHONPATH="$project_root/agent" python3 -m openllmops_agent.evaluation_image_policy "$evaluation_images")
+remaining_images=$evaluation_images
+while [ -n "$remaining_images" ]; do
+    case "$remaining_images" in
+        *,*)
+            evaluation_image=${remaining_images%%,*}
+            remaining_images=${remaining_images#*,}
+            ;;
+        *)
+            evaluation_image=$remaining_images
+            remaining_images=
+            ;;
+    esac
+    if ! docker image inspect "$evaluation_image" >/dev/null 2>&1; then
+        echo "评测镜像尚未构建或拉取：$evaluation_image" >&2
+        exit 1
+    fi
+    runner_label=$(docker image inspect --format '{{ index .Config.Labels "com.openllmops.runner" }}' "$evaluation_image")
+    remote_code_label=$(docker image inspect --format '{{ index .Config.Labels "com.openllmops.security.trust-remote-code" }}' "$evaluation_image")
+    base_label=$(docker image inspect --format '{{ index .Config.Labels "com.openllmops.base.vllm" }}' "$evaluation_image")
+    if [ "$runner_label" != "evaluation-pair-v1" ] || [ "$remote_code_label" != "disabled" ] || \
+        [ "$base_label" != "v0.27.1" ]; then
+        echo "评测镜像缺少可验证的顺序运行/禁用远程代码/vLLM 版本标签：$evaluation_image" >&2
+        exit 1
+    fi
+done
+
 configured_gpu_count=$(read_env_value GPU_COUNT)
 configured_gpu_count=${configured_gpu_count:-4}
 detected_gpu_count=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')
@@ -132,7 +185,20 @@ if [ "$storage_root" = "/" ] || [ "$storage_root" = "$HOME" ]; then
     exit 1
 fi
 
-for child in models inbox model-staging datasets checkpoints training-configs runtime; do
+app_uid=$(read_env_value APP_UID)
+app_uid=${app_uid:-1000}
+app_gid=$(read_env_value APP_GID)
+app_gid=${app_gid:-1000}
+workload_uid=$(read_env_value WORKLOAD_UID)
+workload_uid=${workload_uid:-1000}
+workload_gid=$(read_env_value WORKLOAD_GID)
+workload_gid=${workload_gid:-1000}
+if [ "$app_uid:$app_gid" != "$workload_uid:$workload_gid" ]; then
+    echo "APP_UID:APP_GID 必须与 WORKLOAD_UID:WORKLOAD_GID 一致，否则评测容器无法读取合并数据或写入产物" >&2
+    exit 1
+fi
+
+for child in models inbox model-staging datasets evaluation-datasets evaluation-output checkpoints training-configs runtime; do
     target="$storage_root/$child"
     if [ ! -d "$target" ] || [ ! -w "$target" ]; then
         echo "受控目录不存在或当前用户不可写：$target" >&2
@@ -194,4 +260,4 @@ validate_model_token_file() {
 validate_model_token_file HUGGINGFACE_TOKEN_FILE
 validate_model_token_file MODELSCOPE_TOKEN_FILE
 
-echo "预检通过：GPU=$detected_gpu_count，storage=$storage_root，训练镜像与 Compose 配置有效"
+echo "预检通过：GPU=$detected_gpu_count，storage=$storage_root，推理/训练/评测镜像与 Compose 配置有效"

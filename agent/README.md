@@ -29,7 +29,7 @@ node-agent 是单机 GPU 节点的最小特权执行面。控制面负责期望�
 
 - `deployment -> vllm`：支持 `service_type=generate|embedding`，返回 `endpoint`、`port` 和 `service_type`。
 - `training -> llamafactory`：agent 根据受控 JSONL 数据集生成配置，状态响应尽可能返回 `progress`、步数、metrics、checkpoint、adapter 和合并模型路径。
-- `evaluation -> evaluation`：当前合同没有安全的输出目录字段，agent 会返回签名的 `422 unsupported_runner`，不会伪造启动成功。
+- `evaluation -> evaluation`：要求基线/候选模型、模板、1–16 个已准备 JSONL、系统派生输出目录及有界的 TP/显存比/并发/max_tokens。agent 确定性合并多数据集，再在同一整卡组上先基线、后候选顺序运行；成功返回前后 metrics、overall/category_changes、`result_path` 和 `dataset_manifest_path`。
 
 `stop` 和 `status` 的 `execution` 必须是空对象。停止成功会删除已停止容器并返回 `absent`，控制面只有看到该状态后才能释放整卡租约。
 
@@ -39,6 +39,8 @@ node-agent 是单机 GPU 节点的最小特权执行面。控制面负责期望�
 
 训练只允许继续预训练 `stage=pt + LoRA`，以及 SFT 的 Freeze、LoRA、4-bit QLoRA。训练容器只执行 `llamafactory-cli train`，不启动 WebUI；模型、数据集和配置只读挂载，checkpoint 与任务缓存按任务单独可写，并固定离线环境和 `trust_remote_code=false`。
 
+评测模型只能来自 `MODEL_ROOT` 下的非链接普通目录，数据只能来自 `DATASET_ROOT`/`EVALUATION_DATASET_ROOT` 下的非链接 JSONL。合并产物位于 agent runtime，输出只允许 `EVALUATION_OUTPUT_ROOT/<run UUID>`。评测容器断网、只读根文件系统，`pair-report.json` 必须通过大小、有限数、计数、分类汇总与数据指纹绑定校验才会上报 `succeeded`。
+
 动态容器固定为非 root、只读根文件系统、丢弃全部 capabilities、启用 `no-new-privileges`，且不能使用宿主机网络、特权模式或任意挂载。GPU 分配在单 worker 内串行完成，并结合受管容器标签与 NVML 外部进程检查实现整卡独占；任何不确定状态均拒绝启动，不自动抢占运行中的推理服务。
 
 ## LLaMAFactory 镜像基线
@@ -46,3 +48,5 @@ node-agent 是单机 GPU 节点的最小特权执行面。控制面负责期望�
 LLaMAFactory `0.9.5` 及以前受 `GHSA-mwc7-mf87-v3mf` 影响。agent 禁止直接使用上游 `hiyouga/llamafactory`、`latest` 和生产环境可变 tag；默认只接受项目固定安全衍生版 `openllmops/llamafactory-secure:0.9.6.dev0-c4e09c7-rcefix1`。其他引用必须是 `registry/repository@sha256:...`，而且镜像必须预先存在并携带匹配的安全构建标签。
 
 agent 在校验后使用不可变 Docker image ID 启动容器，避免 tag 在检查与启动之间被替换。构建、校验与生产 digest 推广步骤见 `deploy/README.md`。
+
+vLLM 默认固定为 `v0.27.1`，只允许该官方标签、官方 `v0.27.1-cu129` 或仓库 digest，永久拒绝 `latest` 和旧版默认值。推理与评测的 vLLM 实例均固定 `--load-format safetensors`、禁止远程模型代码，并在启动前解析为不可变 image ID。

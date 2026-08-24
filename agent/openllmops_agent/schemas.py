@@ -11,7 +11,7 @@ JsonScalar = str | int | float | bool
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
 class InferenceLaunchRequest(StrictModel):
@@ -54,6 +54,31 @@ class TrainingLaunchRequest(StrictModel):
         return value
 
 
+class EvaluationLaunchRequest(StrictModel):
+    run_id: UUID
+    generation: int = Field(default=1, ge=1)
+    image: str = Field(min_length=1, max_length=255)
+    gpu_ids: list[int] = Field(min_length=1, max_length=16)
+    baseline_model_path: Path
+    candidate_model_path: Path
+    dataset_path: Path
+    dataset_manifest_path: Path
+    output_path: Path
+    base_template: Literal["base", "instruct"]
+    candidate_template: Literal["base", "instruct"]
+    tensor_parallel_size: int = Field(ge=1, le=16)
+    gpu_memory_utilization: float = Field(default=0.9, ge=0.1, le=0.95)
+    concurrency: int = Field(default=4, ge=1, le=32)
+    max_tokens: int = Field(default=32, ge=1, le=512)
+
+    @field_validator("gpu_ids")
+    @classmethod
+    def unique_evaluation_gpu_ids(cls, value: list[int]) -> list[int]:
+        if len(value) != len(set(value)):
+            raise ValueError("gpu_ids 不能重复")
+        return value
+
+
 class StopRequest(StrictModel):
     timeout_seconds: int = Field(default=30, ge=1, le=300)
 
@@ -61,7 +86,7 @@ class StopRequest(StrictModel):
 class WorkloadInfo(StrictModel):
     name: str
     workload_id: UUID
-    kind: Literal["inference", "training"]
+    kind: Literal["inference", "training", "evaluation"]
     image: str
     status: str
     gpu_ids: list[int]

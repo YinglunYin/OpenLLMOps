@@ -12,7 +12,7 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .agent_contract import (
     AgentAction,
@@ -28,7 +28,17 @@ from .docker_runner import (
     WorkloadConflict,
     WorkloadNotFound,
 )
-from .schemas import InferenceLaunchRequest, TrainingLaunchRequest, WorkloadInfo
+from .evaluation_runtime import (
+    DatasetSource,
+    EvaluationInputError,
+    prepare_evaluation_workspace,
+)
+from .schemas import (
+    EvaluationLaunchRequest,
+    InferenceLaunchRequest,
+    TrainingLaunchRequest,
+    WorkloadInfo,
+)
 
 MAX_CACHED_REQUESTS = 2048
 STATE_VERSION = 1
@@ -47,7 +57,7 @@ PROTECTED_TRAINING_KEYS = frozenset(
 
 
 class ExecutionModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
 class VLLMExecution(ExecutionModel):
@@ -69,6 +79,32 @@ class LLaMAFactoryExecution(ExecutionModel):
     algorithm: Literal["freeze", "lora", "qlora"]
     training_config: dict[str, Any] = Field(default_factory=dict)
     output_dir: Path
+
+
+class EvaluationDatasetExecution(ExecutionModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    path: Path
+
+
+class EvaluationExecution(ExecutionModel):
+    runner: Literal["evaluation"]
+    base_model_path: Path
+    candidate_model_path: Path
+    base_template: Literal["base", "instruct"]
+    candidate_template: Literal["base", "instruct"]
+    datasets: list[EvaluationDatasetExecution] = Field(min_length=1, max_length=16)
+    output_dir: Path
+    tensor_parallel_size: int = Field(ge=1, le=16)
+    gpu_memory_utilization: float = Field(default=0.9, ge=0.1, le=0.95)
+    concurrency: int = Field(default=4, ge=1, le=32)
+    max_tokens: int = Field(default=32, ge=1, le=512)
+
+    @model_validator(mode="after")
+    def unique_dataset_names(self) -> EvaluationExecution:
+        names = [dataset.name for dataset in self.datasets]
+        if len(names) != len(set(names)):
+            raise ValueError("evaluation datasets.name 不能重复")
+        return self
 
 
 @dataclass(frozen=True)
@@ -305,14 +341,6 @@ class CommandProcessor:
         }[command.owner.type]
         if runner_name != expected_runner:
             raise InvalidWorkload(f"{command.owner.type} 只能使用 execution.runner={expected_runner}")
-        if command.owner.type == "evaluation":
-            return self._rejected(
-                command.request_id,
-                422,
-                "本版 node-agent 尚未配置安全的 evaluation 输出路径，拒绝伪造启动成功",
-                "unsupported_runner",
-            )
-
         existing = self.runner.prepare_contract_start(
             command.owner.type, command.owner.id, command.owner.generation
         )
@@ -337,7 +365,7 @@ class CommandProcessor:
                     vllm_args=arguments,
                 )
             )
-        else:
+        elif command.owner.type == "training":
             execution = LLaMAFactoryExecution.model_validate(command.execution)
             config_path, dataset_dir = self._materialize_training_files(command, execution)
             info = self.runner.launch_training(
@@ -353,11 +381,45 @@ class CommandProcessor:
                     output_path=execution.output_dir,
                 )
             )
+        else:
+            execution = EvaluationExecution.model_validate(command.execution)
+            if execution.tensor_parallel_size != len(command.resources.gpu_ids):
+                raise InvalidWorkload("tensor_parallel_size 必须等于 gpu_ids 数量")
+            try:
+                workspace = prepare_evaluation_workspace(
+                    run_id=command.owner.id,
+                    generation=command.owner.generation,
+                    sources=[DatasetSource(dataset.name, dataset.path) for dataset in execution.datasets],
+                    dataset_root=self.settings.dataset_root,
+                    evaluation_dataset_root=self.settings.evaluation_dataset_root,
+                    evaluation_output_root=self.settings.evaluation_output_root,
+                    requested_output_path=execution.output_dir,
+                    runtime_root=self.settings.runtime_root,
+                )
+            except EvaluationInputError as exc:
+                raise InvalidWorkload(str(exc)) from exc
+            info = self.runner.launch_evaluation(
+                EvaluationLaunchRequest(
+                    run_id=command.owner.id,
+                    generation=command.owner.generation,
+                    image=self.settings.evaluation_runtime_image,
+                    gpu_ids=command.resources.gpu_ids,
+                    baseline_model_path=execution.base_model_path,
+                    candidate_model_path=execution.candidate_model_path,
+                    dataset_path=workspace.dataset_path,
+                    dataset_manifest_path=workspace.dataset_manifest_path,
+                    output_path=workspace.output_path,
+                    base_template=execution.base_template,
+                    candidate_template=execution.candidate_template,
+                    tensor_parallel_size=execution.tensor_parallel_size,
+                    gpu_memory_utilization=execution.gpu_memory_utilization,
+                    concurrency=execution.concurrency,
+                    max_tokens=execution.max_tokens,
+                )
+            )
         return self._response_from_info(command, info, accepted=True)
 
     def _stop(self, command: AgentCommand) -> CommandResult:
-        if command.owner.type == "evaluation":
-            return self._accepted_absent(command.request_id)
         with suppress(WorkloadNotFound):
             self.runner.stop_contract_workload(
                 command.owner.type,
@@ -367,8 +429,6 @@ class CommandProcessor:
         return self._accepted_absent(command.request_id)
 
     def _observe(self, command: AgentCommand, *, accepted: bool) -> CommandResult:
-        if command.owner.type == "evaluation":
-            return self._accepted_absent(command.request_id)
         try:
             info = self.runner.get_contract_workload(command.owner.type, command.owner.id)
         except WorkloadNotFound:
@@ -391,6 +451,8 @@ class CommandProcessor:
             metadata = {key: value for key, value in metadata.items() if value is not None}
         elif command.owner.type == "training":
             metadata = self.runner.training_metadata(command.owner.id)
+        elif command.owner.type == "evaluation" and state == AgentWorkloadState.SUCCEEDED:
+            metadata = self.runner.evaluation_metadata(command.owner.id)
         message = None
         if state == AgentWorkloadState.FAILED:
             message = (
@@ -416,7 +478,7 @@ class CommandProcessor:
             return AgentWorkloadState.RUNNING
         if info.status == "removing":
             return AgentWorkloadState.STOPPING
-        if info.status == "exited" and info.kind == "training" and info.exit_code == 0:
+        if info.status == "exited" and info.kind in {"training", "evaluation"} and info.exit_code == 0:
             return AgentWorkloadState.SUCCEEDED
         return AgentWorkloadState.FAILED
 

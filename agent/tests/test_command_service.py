@@ -14,6 +14,7 @@ from openllmops_agent.command_service import CommandProcessor, CommandStateStore
 from openllmops_agent.config import Settings
 from openllmops_agent.docker_runner import WorkloadConflict, WorkloadNotFound
 from openllmops_agent.schemas import (
+    EvaluationLaunchRequest,
     InferenceLaunchRequest,
     TrainingLaunchRequest,
     WorkloadInfo,
@@ -25,6 +26,7 @@ class FakeRunner:
         self.workloads: dict[tuple[str, UUID], WorkloadInfo] = {}
         self.inference_requests: list[InferenceLaunchRequest] = []
         self.training_requests: list[TrainingLaunchRequest] = []
+        self.evaluation_requests: list[EvaluationLaunchRequest] = []
         self.stop_calls = 0
 
     def prepare_contract_start(
@@ -72,6 +74,20 @@ class FakeRunner:
         self.workloads[("training", request.job_id)] = info
         return info
 
+    def launch_evaluation(self, request: EvaluationLaunchRequest) -> WorkloadInfo:
+        self.evaluation_requests.append(request)
+        info = WorkloadInfo(
+            name=f"openllmops-evaluation-{request.run_id}",
+            workload_id=request.run_id,
+            kind="evaluation",
+            image=request.image,
+            status="running",
+            gpu_ids=request.gpu_ids,
+            generation=request.generation,
+        )
+        self.workloads[("evaluation", request.run_id)] = info
+        return info
+
     def get_contract_workload(self, owner_type: str, workload_id: UUID) -> WorkloadInfo:
         try:
             return self.workloads[(owner_type, workload_id)]
@@ -88,12 +104,22 @@ class FakeRunner:
     def training_metadata(self, workload_id: UUID) -> dict:
         return {"progress": 25.0, "current_step": 1, "total_steps": 4}
 
+    def evaluation_metadata(self, workload_id: UUID) -> dict:
+        return {
+            "metrics": {"baseline": {"accuracy_percent": 50.0}},
+            "comparison": {"percentage_point_change": 25.0},
+            "result_path": f"/evaluations/{workload_id}/pair-report.json",
+            "dataset_manifest_path": f"/runtime/{workload_id}/dataset-manifest.json",
+        }
+
 
 def settings_for(tmp_path: Path) -> Settings:
     settings = Settings(
         node_agent_token="a" * 32,
         model_root=tmp_path / "models",
         dataset_root=tmp_path / "datasets",
+        evaluation_dataset_root=tmp_path / "evaluation-datasets",
+        evaluation_output_root=tmp_path / "evaluation-output",
         checkpoint_root=tmp_path / "checkpoints",
         training_config_root=tmp_path / "configs",
         runtime_root=tmp_path / "runtime",
@@ -254,21 +280,71 @@ def test_alpaca_dataset_without_input_does_not_declare_query(tmp_path: Path) -> 
     assert info["columns"] == {"prompt": "instruction", "response": "output"}
 
 
-def test_evaluation_start_returns_controlled_unsupported(tmp_path: Path) -> None:
-    processor = CommandProcessor(
-        settings_for(tmp_path),
-        FakeRunner(),  # type: ignore[arg-type]
+def test_evaluation_start_status_and_stop_use_real_runner(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    base_model = settings.model_root / "base"
+    candidate_model = settings.model_root / "candidate"
+    base_model.mkdir()
+    candidate_model.mkdir()
+    dataset = settings.dataset_root / "domain.jsonl"
+    dataset.write_text(
+        '{"id":"q1","question":"1+1?","choices":{"A":"1","B":"2"},"answer":"B"}\n',
+        encoding="utf-8",
     )
+    runner = FakeRunner()
+    processor = CommandProcessor(settings, runner)  # type: ignore[arg-type]
+    run_id = uuid4()
     command = AgentCommand(
         action="start",
-        owner=AgentOwner(type="evaluation", id=uuid4(), name="eval", generation=1),
+        owner=AgentOwner(type="evaluation", id=run_id, name="eval", generation=1),
         resources=AgentResourceRequest(gpu_ids=[0]),
-        execution={"runner": "evaluation"},
+        execution={
+            "runner": "evaluation",
+            "base_model_path": str(base_model),
+            "candidate_model_path": str(candidate_model),
+            "base_template": "base",
+            "candidate_template": "instruct",
+            "datasets": [{"name": "domain", "path": str(dataset)}],
+            "output_dir": str(settings.evaluation_output_root / str(run_id)),
+            "tensor_parallel_size": 1,
+            "gpu_memory_utilization": 0.85,
+            "concurrency": 2,
+            "max_tokens": 64,
+        },
     )
 
     result = processor.execute(command)
 
-    assert result.status_code == 422
-    assert not result.response.accepted
-    assert result.response.observed_state == AgentWorkloadState.FAILED
-    assert result.response.error_code == "unsupported_runner"
+    assert result.status_code == 200
+    assert result.response.observed_state == AgentWorkloadState.RUNNING
+    request = runner.evaluation_requests[0]
+    assert request.dataset_path.read_text(encoding="utf-8").startswith(
+        '{"answer":"B","category":"domain/default","choices"'
+    )
+    assert request.dataset_manifest_path.is_file()
+    assert request.output_path == settings.evaluation_output_root / str(run_id)
+
+    runner.workloads[("evaluation", run_id)] = runner.workloads[("evaluation", run_id)].model_copy(
+        update={"status": "exited", "exit_code": 0}
+    )
+    status = processor.execute(
+        AgentCommand(
+            action="status",
+            owner=AgentOwner(type="evaluation", id=run_id, name="eval", generation=1),
+            resources=AgentResourceRequest(gpu_ids=[0]),
+            execution={},
+        )
+    )
+    assert status.response.observed_state == AgentWorkloadState.SUCCEEDED
+    assert status.response.metadata["comparison"]["percentage_point_change"] == 25.0
+
+    stopped = processor.execute(
+        AgentCommand(
+            action="stop",
+            owner=AgentOwner(type="evaluation", id=run_id, name="eval", generation=1),
+            resources=AgentResourceRequest(gpu_ids=[0]),
+            execution={},
+        )
+    )
+    assert stopped.response.observed_state == AgentWorkloadState.ABSENT
+    assert runner.stop_calls == 1

@@ -17,9 +17,25 @@ from docker.models.containers import Container
 from docker.types import DeviceRequest
 
 from .config import Settings
+from .evaluation_image_policy import (
+    UnsafeEvaluationImage,
+    validate_evaluation_image_labels,
+)
+from .evaluation_runtime import (
+    EvaluationInputError,
+    load_dataset_manifest_summary,
+    load_pair_report_metadata,
+    prepare_output_directory,
+    strict_existing_path,
+)
 from .gpu import NVMLUnavailable, read_busy_gpu_ids
 from .image_policy import UnsafeTrainingImage, validate_hardening_labels
-from .schemas import InferenceLaunchRequest, TrainingLaunchRequest, WorkloadInfo
+from .schemas import (
+    EvaluationLaunchRequest,
+    InferenceLaunchRequest,
+    TrainingLaunchRequest,
+    WorkloadInfo,
+)
 
 MANAGED_LABEL = "com.openllmops.managed"
 KIND_LABEL = "com.openllmops.kind"
@@ -30,6 +46,7 @@ SERVICE_TYPE_LABEL = "com.openllmops.service-type"
 GENERATION_LABEL = "com.openllmops.generation"
 OWNER_TYPE_LABEL = "com.openllmops.owner-type"
 OUTPUT_PATH_LABEL = "com.openllmops.output-path"
+DATASET_MANIFEST_PATH_LABEL = "com.openllmops.dataset-manifest-path"
 PORT_LABEL = "com.openllmops.port"
 
 ACTIVE_STATES = frozenset({"created", "running", "restarting", "paused"})
@@ -40,7 +57,6 @@ VLLM_ARGUMENT_ALLOWLIST = frozenset(
         "block-size",
         "cpu-offload-gb",
         "disable-custom-all-reduce",
-        "disable-log-requests",
         "disable-log-stats",
         "distributed-executor-backend",
         "dtype",
@@ -48,7 +64,6 @@ VLLM_ARGUMENT_ALLOWLIST = frozenset(
         "enable-prefix-caching",
         "enforce-eager",
         "gpu-memory-utilization",
-        "guided-decoding-backend",
         "kv-cache-dtype",
         "max-logprobs",
         "max-model-len",
@@ -56,9 +71,7 @@ VLLM_ARGUMENT_ALLOWLIST = frozenset(
         "max-num-seqs",
         "pipeline-parallel-size",
         "quantization",
-        "rope-scaling",
         "seed",
-        "swap-space",
         "tokenizer-mode",
     }
 )
@@ -66,7 +79,6 @@ VLLM_ARGUMENT_ALLOWLIST = frozenset(
 VLLM_BOOLEAN_ARGUMENTS = frozenset(
     {
         "disable-custom-all-reduce",
-        "disable-log-requests",
         "disable-log-stats",
         "enable-chunked-prefill",
         "enable-prefix-caching",
@@ -75,14 +87,19 @@ VLLM_BOOLEAN_ARGUMENTS = frozenset(
 )
 VLLM_POSITIVE_INTEGER_ARGUMENTS = frozenset(
     {
-        "block-size",
         "max-model-len",
         "max-num-batched-tokens",
         "max-num-seqs",
     }
 )
+VLLM_POSITIVE_INTEGER_LIMITS = {
+    # 目标节点最多 4 张 24 GiB 4090D；限制异常配置先于 vLLM OOM 失败。
+    "max-model-len": 131_072,
+    "max-num-batched-tokens": 65_536,
+    "max-num-seqs": 1_024,
+}
 VLLM_NONNEGATIVE_INTEGER_ARGUMENTS = frozenset({"max-logprobs", "seed"})
-VLLM_NONNEGATIVE_NUMBER_ARGUMENTS = frozenset({"cpu-offload-gb", "swap-space"})
+VLLM_NONNEGATIVE_NUMBER_ARGUMENTS = frozenset({"cpu-offload-gb"})
 VLLM_ENUM_ARGUMENTS: dict[str, frozenset[str]] = {
     "distributed-executor-backend": frozenset({"mp"}),
     "dtype": frozenset({"auto", "half", "float16", "bfloat16", "float", "float32"}),
@@ -109,7 +126,7 @@ TRAINING_ENV_ALLOWLIST = frozenset(
         "WANDB_DISABLED",
     }
 )
-SAFE_NAME = re.compile(r"^openllmops-(inference|training)-[0-9a-f-]{36}$")
+SAFE_NAME = re.compile(r"^openllmops-(inference|training|evaluation)-[0-9a-f-]{36}$")
 
 
 class RunnerError(RuntimeError):
@@ -154,7 +171,11 @@ class DockerRunner:
 
     @staticmethod
     def contract_workload_name(owner_type: str, workload_id: UUID) -> str:
-        kind = {"deployment": "inference", "training": "training"}.get(owner_type)
+        kind = {
+            "deployment": "inference",
+            "training": "training",
+            "evaluation": "evaluation",
+        }.get(owner_type)
         if kind is None:
             raise InvalidWorkload(f"不支持的工作负载类型：{owner_type}")
         return DockerRunner._workload_name(kind, workload_id)
@@ -260,9 +281,41 @@ class DockerRunner:
             metadata["merged_model_path"] = str(merged_path)
         return metadata
 
+    def evaluation_metadata(self, workload_id: UUID) -> dict[str, Any]:
+        container = self._managed_container(self._workload_name("evaluation", workload_id))
+        raw_output = container.labels.get(OUTPUT_PATH_LABEL)
+        raw_manifest = container.labels.get(DATASET_MANIFEST_PATH_LABEL)
+        if not raw_output or not raw_manifest:
+            raise InvalidWorkload("评测容器缺少受控产物标签")
+        try:
+            output_path, _ = strict_existing_path(
+                Path(raw_output),
+                (self.settings.evaluation_output_root,),
+                directory=True,
+            )
+            expected_output = self.settings.evaluation_output_root.resolve(strict=True) / str(workload_id)
+            if output_path != expected_output:
+                raise EvaluationInputError("评测产物目录与 run UUID 不一致")
+            manifest_path, _ = strict_existing_path(
+                Path(raw_manifest),
+                (self.settings.runtime_root,),
+                directory=False,
+            )
+            dataset_sha256, record_count = load_dataset_manifest_summary(manifest_path)
+            metadata = load_pair_report_metadata(
+                output_path,
+                expected_dataset_sha256=dataset_sha256,
+                expected_total=record_count,
+            )
+        except EvaluationInputError as exc:
+            raise InvalidWorkload(f"评测产物无效：{exc}") from exc
+        metadata["dataset_manifest_path"] = str(manifest_path)
+        return metadata
+
     def launch_inference(self, request: InferenceLaunchRequest) -> WorkloadInfo:
         if request.image not in self.settings.vllm_images:
             raise InvalidWorkload("推理镜像未命中 VLLM_ALLOWED_IMAGES 白名单")
+        verified_image_id = self._verified_vllm_image_id(request.image)
         model_path = self._existing_path(request.model_path, self.settings.model_root, directory=True)
         gpu_ids = self._validate_gpu_ids(request.gpu_ids)
         name = self._workload_name("inference", request.deployment_id)
@@ -274,6 +327,9 @@ class DockerRunner:
             {
                 "HF_HOME": "/workspace/cache/huggingface",
                 "TRITON_CACHE_DIR": "/workspace/cache/triton",
+                "TORCHINDUCTOR_CACHE_DIR": "/workspace/cache/torchinductor",
+                "VLLM_CACHE_ROOT": "/workspace/cache/vllm",
+                "XDG_CACHE_HOME": "/workspace/cache/xdg",
                 "VLLM_NO_USAGE_STATS": "1",
             }
         )
@@ -284,7 +340,8 @@ class DockerRunner:
             self._assert_gpus_available(gpu_ids)
             container = self._run_container(
                 name=name,
-                image=request.image,
+                # 白名单校验后使用不可变 image ID，避免 tag 在窗口期被替换。
+                image=verified_image_id,
                 command=command,
                 gpu_ids=gpu_ids,
                 kind="inference",
@@ -360,6 +417,128 @@ class DockerRunner:
             )
         return self._to_info(container)
 
+    def launch_evaluation(self, request: EvaluationLaunchRequest) -> WorkloadInfo:
+        if request.image not in self.settings.evaluation_images:
+            raise InvalidWorkload("评测镜像未命中 EVALUATION_ALLOWED_IMAGES 白名单")
+        verified_image_id = self._verified_evaluation_image_id(request.image)
+        try:
+            baseline_path, _ = strict_existing_path(
+                request.baseline_model_path,
+                (self.settings.model_root,),
+                directory=True,
+            )
+            candidate_path, _ = strict_existing_path(
+                request.candidate_model_path,
+                (self.settings.model_root,),
+                directory=True,
+            )
+            dataset_path, _ = strict_existing_path(
+                request.dataset_path,
+                (self.settings.runtime_root,),
+                directory=False,
+            )
+            manifest_path, _ = strict_existing_path(
+                request.dataset_manifest_path,
+                (self.settings.runtime_root,),
+                directory=False,
+            )
+            if (
+                dataset_path.name != "evaluation.jsonl"
+                or manifest_path.name != "dataset-manifest.json"
+                or dataset_path.parent != manifest_path.parent
+            ):
+                raise EvaluationInputError("评测合并数据与 manifest 必须位于同一系统派生目录")
+            output_path = prepare_output_directory(
+                request.output_path,
+                self.settings.evaluation_output_root,
+                request.run_id,
+            )
+        except EvaluationInputError as exc:
+            raise InvalidWorkload(str(exc)) from exc
+        gpu_ids = self._validate_gpu_ids(request.gpu_ids)
+        if request.tensor_parallel_size != len(gpu_ids):
+            raise InvalidWorkload("评测 tensor_parallel_size 必须等于 gpu_ids 数量")
+        name = self._workload_name("evaluation", request.run_id)
+        baseline_container_path = "/workspace/models/baseline"
+        candidate_container_path = "/workspace/models/candidate"
+        volumes = {
+            str(baseline_path): {"bind": baseline_container_path, "mode": "ro"},
+            str(dataset_path.parent): {"bind": "/workspace/dataset", "mode": "ro"},
+            str(output_path): {"bind": "/workspace/output", "mode": "rw"},
+        }
+        if baseline_path == candidate_path:
+            candidate_container_path = baseline_container_path
+        else:
+            volumes[str(candidate_path)] = {"bind": candidate_container_path, "mode": "ro"}
+        command = [
+            "run-pair",
+            "--dataset",
+            "/workspace/dataset/evaluation.jsonl",
+            "--output-dir",
+            "/workspace/output",
+            "--baseline-path",
+            baseline_container_path,
+            "--baseline-name",
+            "baseline",
+            "--baseline-template",
+            request.base_template,
+            "--candidate-path",
+            candidate_container_path,
+            "--candidate-name",
+            "candidate",
+            "--candidate-template",
+            request.candidate_template,
+            "--tensor-parallel-size",
+            str(request.tensor_parallel_size),
+            "--gpu-memory-utilization",
+            str(request.gpu_memory_utilization),
+            "--concurrency",
+            str(request.concurrency),
+            "--max-tokens",
+            str(request.max_tokens),
+        ]
+        environment = self._offline_environment()
+        environment.update(
+            {
+                "HF_HOME": "/tmp/huggingface",
+                "TRITON_CACHE_DIR": "/tmp/triton",
+                "TORCHINDUCTOR_CACHE_DIR": "/tmp/torchinductor",
+                "VLLM_CACHE_ROOT": "/tmp/vllm",
+                "XDG_CACHE_HOME": "/tmp/xdg",
+                "VLLM_NO_USAGE_STATS": "1",
+            }
+        )
+
+        with self._allocation_lock:
+            self._assert_name_available(name)
+            self._assert_gpus_available(gpu_ids)
+            container = self._run_container(
+                name=name,
+                image=verified_image_id,
+                command=command,
+                gpu_ids=gpu_ids,
+                kind="evaluation",
+                workload_id=request.run_id,
+                environment=environment,
+                volumes=volumes,
+                generation=request.generation,
+                owner_type="evaluation",
+                output_path=output_path,
+                dataset_manifest_path=manifest_path,
+                restart_policy={"Name": "no"},
+                network_mode="none",
+            )
+        return self._to_info(container)
+
+    def _verified_vllm_image_id(self, reference: str) -> str:
+        try:
+            image = self.client.images.get(reference)
+        except ImageNotFound as exc:
+            raise InvalidWorkload("vLLM 镜像尚未预拉取；节点禁止任务请求隐式拉取动态镜像") from exc
+        if not isinstance(image.id, str) or not image.id.startswith("sha256:"):
+            raise InvalidWorkload("Docker 未返回可验证的 vLLM 镜像 ID")
+        return image.id
+
     def _verified_training_image_id(self, reference: str) -> str:
         try:
             image = self.client.images.get(reference)
@@ -375,6 +554,19 @@ class DockerRunner:
             raise InvalidWorkload("Docker 未返回可验证的训练镜像 ID")
         return image.id
 
+    def _verified_evaluation_image_id(self, reference: str) -> str:
+        try:
+            image = self.client.images.get(reference)
+        except ImageNotFound as exc:
+            raise InvalidWorkload("评测镜像尚未预构建/预拉取；节点禁止在任务请求中隐式拉取评测镜像") from exc
+        try:
+            validate_evaluation_image_labels(image.labels)
+        except UnsafeEvaluationImage as exc:
+            raise InvalidWorkload(str(exc)) from exc
+        if not isinstance(image.id, str) or not image.id.startswith("sha256:"):
+            raise InvalidWorkload("Docker 未返回可验证的评测镜像 ID")
+        return image.id
+
     def start(self, name: str) -> WorkloadInfo:
         with self._allocation_lock:
             container = self._managed_container(name)
@@ -385,17 +577,15 @@ class DockerRunner:
                 raise WorkloadConflict("工作负载处于 paused 状态，禁止用 start 隐式改变状态")
             self._assert_gpus_available(info.gpu_ids, exclude_name=name)
             container.start()
-            container.reload()
             return self._to_info(container)
 
     def stop(self, name: str, timeout_seconds: int) -> WorkloadInfo:
         with self._allocation_lock:
             container = self._managed_container(name)
-            container.reload()
-            if container.status not in ACTIVE_STATES:
-                return self._to_info(container)
+            info = self._to_info(container)
+            if info.status not in ACTIVE_STATES:
+                return info
             container.stop(timeout=timeout_seconds)
-            container.reload()
             return self._to_info(container)
 
     def delete(self, name: str, force: bool = False) -> None:
@@ -437,8 +627,10 @@ class DockerRunner:
         generation: int = 1,
         owner_type: str | None = None,
         output_path: Path | None = None,
+        dataset_manifest_path: Path | None = None,
         port: int | None = None,
         entrypoint: list[str] | None = None,
+        network_mode: str | None = None,
     ) -> Container:
         labels = {
             MANAGED_LABEL: "true",
@@ -455,16 +647,23 @@ class DockerRunner:
             labels[SERVICE_TYPE_LABEL] = service_type
         if output_path:
             labels[OUTPUT_PATH_LABEL] = str(output_path)
+        if dataset_manifest_path:
+            labels[DATASET_MANIFEST_PATH_LABEL] = str(dataset_manifest_path)
         if port is not None:
             labels[PORT_LABEL] = str(port)
         try:
+            network_arguments = (
+                {"network_mode": network_mode}
+                if network_mode is not None
+                else {"network": self.settings.runtime_network}
+            )
             return self.client.containers.run(
                 image=image,
                 name=name,
                 command=command,
                 entrypoint=entrypoint,
                 detach=True,
-                network=self.settings.runtime_network,
+                **network_arguments,
                 device_requests=[
                     DeviceRequest(
                         device_ids=[str(item) for item in gpu_ids],
@@ -537,16 +736,25 @@ class DockerRunner:
         if key in VLLM_POSITIVE_INTEGER_ARGUMENTS:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise InvalidWorkload(f"vLLM 参数 {key} 必须是正整数")
+            if value > VLLM_POSITIVE_INTEGER_LIMITS[key]:
+                raise InvalidWorkload(f"vLLM 参数 {key} 超出节点安全上限 {VLLM_POSITIVE_INTEGER_LIMITS[key]}")
             return
         if key in VLLM_NONNEGATIVE_INTEGER_ARGUMENTS:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise InvalidWorkload(f"vLLM 参数 {key} 必须是非负整数")
+            upper_bound = 100 if key == "max-logprobs" else 2**32 - 1
+            if value > upper_bound:
+                raise InvalidWorkload(f"vLLM 参数 {key} 超出节点安全上限 {upper_bound}")
             return
         if key in VLLM_NONNEGATIVE_NUMBER_ARGUMENTS:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
                 raise InvalidWorkload(f"vLLM 参数 {key} 必须是非负数")
-            if value > 512:
-                raise InvalidWorkload(f"vLLM 参数 {key} 超出单机安全上限 512 GiB")
+            if value > 16:
+                raise InvalidWorkload(f"vLLM 参数 {key} 超出每 GPU 安全上限 16 GiB")
+            return
+        if key == "block-size":
+            if isinstance(value, bool) or not isinstance(value, int) or value not in {8, 16, 32}:
+                raise InvalidWorkload("block-size 在 CUDA 节点仅允许 8、16 或 32")
             return
         if key == "gpu-memory-utilization":
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.1 <= value <= 0.98:
@@ -556,22 +764,12 @@ class DockerRunner:
             if isinstance(value, bool) or not isinstance(value, int) or value != 1:
                 raise InvalidWorkload("首版单机调度固定 pipeline-parallel-size=1")
             return
-        if key == "rope-scaling":
-            if not isinstance(value, str):
-                raise InvalidWorkload("rope-scaling 必须是 JSON 字符串")
-            try:
-                decoded = json.loads(value)
-            except json.JSONDecodeError as exc:
-                raise InvalidWorkload("rope-scaling 不是有效 JSON") from exc
-            if not isinstance(decoded, dict):
-                raise InvalidWorkload("rope-scaling JSON 顶层必须是对象")
-            return
         allowed_values = VLLM_ENUM_ARGUMENTS.get(key)
         if allowed_values is not None:
             if not isinstance(value, str) or value.lower() not in allowed_values:
                 raise InvalidWorkload(f"vLLM 参数 {key} 仅允许：{', '.join(sorted(allowed_values))}")
             return
-        if key in {"guided-decoding-backend", "quantization"}:
+        if key == "quantization":
             if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value):
                 raise InvalidWorkload(f"vLLM 参数 {key} 的值格式不安全")
             return

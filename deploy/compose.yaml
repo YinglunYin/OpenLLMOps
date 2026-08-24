@@ -72,13 +72,18 @@ services:
       MODEL_IMPORT_COORDINATOR_ENABLED: ${MODEL_IMPORT_COORDINATOR_ENABLED:-true}
       MODEL_IMPORT_POLL_INTERVAL_SECONDS: ${MODEL_IMPORT_POLL_INTERVAL_SECONDS:-1}
       MODEL_IMPORT_CONCURRENCY: ${MODEL_IMPORT_CONCURRENCY:-1}
+      MODEL_IMPORT_CLAIM_TIMEOUT_SECONDS: ${MODEL_IMPORT_CLAIM_TIMEOUT_SECONDS:-120}
       HUGGINGFACE_TOKEN_FILE: ${HUGGINGFACE_TOKEN_FILE:-}
       MODELSCOPE_TOKEN_FILE: ${MODELSCOPE_TOKEN_FILE:-}
       DATASET_ROOT: /srv/openllmops/datasets
+      EVALUATION_DATASET_ROOT: /srv/openllmops/evaluation-datasets
+      EVALUATION_OUTPUT_ROOT: /srv/openllmops/evaluation-output
+      NODE_AGENT_RUNTIME_ROOT: /srv/openllmops/runtime
       CHECKPOINT_ROOT: /srv/openllmops/checkpoints
       GPU_COUNT: ${GPU_COUNT:-4}
       CORS_ORIGINS: '${CORS_ORIGINS:-["https://localhost"]}'
       PROMETHEUS_URL: http://prometheus:9090
+      PROMETHEUS_TIMEOUT_SECONDS: ${PROMETHEUS_TIMEOUT_SECONDS:-3}
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
@@ -134,12 +139,15 @@ services:
       GPU_COUNT: ${GPU_COUNT:-4}
       MODEL_ROOT: /srv/openllmops/models
       DATASET_ROOT: /srv/openllmops/datasets
+      EVALUATION_DATASET_ROOT: /srv/openllmops/evaluation-datasets
+      EVALUATION_OUTPUT_ROOT: /srv/openllmops/evaluation-output
       CHECKPOINT_ROOT: /srv/openllmops/checkpoints
       TRAINING_CONFIG_ROOT: /srv/openllmops/training-configs
       RUNTIME_ROOT: /srv/openllmops/runtime
       RUNTIME_NETWORK: ${RUNTIME_NETWORK:-openllmops-runtime}
-      VLLM_ALLOWED_IMAGES: ${VLLM_ALLOWED_IMAGES:-vllm/vllm-openai:v0.10.2}
+      VLLM_ALLOWED_IMAGES: ${VLLM_ALLOWED_IMAGES:-vllm/vllm-openai:v0.27.1}
       LLAMAFACTORY_ALLOWED_IMAGES: ${LLAMAFACTORY_ALLOWED_IMAGES:-openllmops/llamafactory-secure:0.9.6.dev0-c4e09c7-rcefix1}
+      EVALUATION_ALLOWED_IMAGES: ${EVALUATION_ALLOWED_IMAGES:-openllmops/evaluation:0.1.0-vllm0.27.1}
       WORKLOAD_UID: ${WORKLOAD_UID:-1000}
       WORKLOAD_GID: ${WORKLOAD_GID:-1000}
       WORKLOAD_SHM_SIZE: ${WORKLOAD_SHM_SIZE:-16g}
@@ -283,6 +291,23 @@ services:
       context: ..
       dockerfile: deploy/docker/llamafactory-secure.Dockerfile
     image: ${LLAMAFACTORY_SECURE_IMAGE:-openllmops/llamafactory-secure:0.9.6.dev0-c4e09c7-rcefix1}
+    entrypoint: ["/bin/true"]
+    restart: "no"
+    network_mode: none
+    read_only: true
+    logging: *default-logging
+    <<: *service-security
+
+  # 仅用于显式构建顺序评测运行时，不属于常驻控制面。
+  # 该镜像在同一容器内先基线、后候选，不会同时驻留两份模型。
+  evaluation-runtime-image:
+    profiles: ["runtime-image"]
+    build:
+      context: ../evaluation
+      dockerfile: Dockerfile
+      args:
+        VLLM_BASE_IMAGE: ${EVALUATION_VLLM_BASE_IMAGE:-vllm/vllm-openai:v0.27.1}
+    image: ${EVALUATION_IMAGE:-openllmops/evaluation:0.1.0-vllm0.27.1}
     entrypoint: ["/bin/true"]
     restart: "no"
     network_mode: none

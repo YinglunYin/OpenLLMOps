@@ -5,7 +5,12 @@ from pathlib import Path
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .evaluation_image_policy import (
+    EVALUATION_RUNTIME_IMAGE,
+    validate_evaluation_image_list,
+)
 from .image_policy import HARDENED_LLAMAFACTORY_IMAGE, validate_training_image_list
+from .vllm_image_policy import VLLM_RUNTIME_IMAGE, validate_vllm_image_list
 
 
 class Settings(BaseSettings):
@@ -20,13 +25,16 @@ class Settings(BaseSettings):
 
     model_root: Path = Path("/srv/openllmops/models")
     dataset_root: Path = Path("/srv/openllmops/datasets")
+    evaluation_dataset_root: Path = Path("/srv/openllmops/evaluation-datasets")
+    evaluation_output_root: Path = Path("/srv/openllmops/evaluation-output")
     checkpoint_root: Path = Path("/srv/openllmops/checkpoints")
     training_config_root: Path = Path("/srv/openllmops/training-configs")
     runtime_root: Path = Path("/srv/openllmops/runtime")
     runtime_network: str = "openllmops-runtime"
 
-    vllm_allowed_images: str = "vllm/vllm-openai:v0.10.2"
+    vllm_allowed_images: str = VLLM_RUNTIME_IMAGE
     llamafactory_allowed_images: str = HARDENED_LLAMAFACTORY_IMAGE
+    evaluation_allowed_images: str = EVALUATION_RUNTIME_IMAGE
     workload_uid: int = Field(default=1000, ge=1)
     workload_gid: int = Field(default=1000, ge=1)
     workload_shm_size: str = "16g"
@@ -61,6 +69,16 @@ class Settings(BaseSettings):
     def validate_llamafactory_images(cls, value: str) -> str:
         return validate_training_image_list(value)
 
+    @field_validator("evaluation_allowed_images")
+    @classmethod
+    def validate_evaluation_images(cls, value: str) -> str:
+        return validate_evaluation_image_list(value)
+
+    @field_validator("vllm_allowed_images")
+    @classmethod
+    def validate_vllm_images(cls, value: str) -> str:
+        return validate_vllm_image_list(value)
+
     @staticmethod
     def _image_set(raw: str) -> frozenset[str]:
         return frozenset(item.strip() for item in raw.split(",") if item.strip())
@@ -84,12 +102,22 @@ class Settings(BaseSettings):
     def llamafactory_runtime_image(self) -> str:
         return self.llamafactory_allowed_images.split(",", maxsplit=1)[0].strip()
 
+    @property
+    def evaluation_images(self) -> frozenset[str]:
+        return self._image_set(self.evaluation_allowed_images)
+
+    @property
+    def evaluation_runtime_image(self) -> str:
+        return self.evaluation_allowed_images.split(",", maxsplit=1)[0].strip()
+
     def ensure_layout(self) -> None:
         """创建受控目录；后续所有挂载都必须位于这些根目录内。"""
 
         for directory in (
             self.model_root,
             self.dataset_root,
+            self.evaluation_dataset_root,
+            self.evaluation_output_root,
             self.checkpoint_root,
             self.training_config_root,
             self.runtime_root,
