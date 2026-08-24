@@ -46,7 +46,9 @@ def test_comparison_uses_percentage_points_and_relative_change() -> None:
 def test_different_dataset_fingerprint_is_not_comparable() -> None:
     result = [score_answer(_sample("1"), "A")]
     baseline = aggregate_results(result, dataset_sha256="a", model_name="base", template="base")
-    candidate = aggregate_results(result, dataset_sha256="b", model_name="candidate", template="base")
+    candidate = aggregate_results(
+        result, dataset_sha256="b", model_name="candidate", template="base"
+    )
 
     comparison = compare_reports(baseline, candidate)
 

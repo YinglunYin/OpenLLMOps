@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 from .benchmarks import convert_csv_directory
+from .builtin_benchmarks import BenchmarkPreparationError, prepare_builtin_benchmark
 from .client import CompatibleClient
 from .dataset import load_jsonl
 from .orchestrator import ModelTarget, evaluate_pair
@@ -33,6 +34,37 @@ def _parser() -> argparse.ArgumentParser:
     convert.add_argument("--source-dir", type=Path, required=True)
     convert.add_argument("--output", type=Path, required=True)
     convert.add_argument("--benchmark", choices=("ceval", "cmmlu"), required=True)
+
+    prepare = subparsers.add_parser(
+        "prepare-benchmark",
+        help="从固定官方在线制品或管理员提供的离线来源准备内置评测集",
+    )
+    prepare.add_argument("--benchmark", choices=("ceval", "cmmlu"), required=True)
+    prepare.add_argument("--output-dir", type=Path, required=True)
+    source_group = prepare.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--online", action="store_true", help="下载内置的固定官方 revision")
+    source_group.add_argument("--source", type=Path, help="官方 CSV 目录或 ZIP/TAR 归档")
+    prepare.add_argument(
+        "--source-revision",
+        help="离线来源的官方 commit、tag 或发布版本（由管理员声明）",
+    )
+    prepare.add_argument(
+        "--accept-non-commercial-license",
+        action="store_true",
+        help="确认接受 CC BY-NC-SA 4.0；在线下载必须提供",
+    )
+    prepare.add_argument(
+        "--split",
+        action="append",
+        choices=("dev", "val", "test"),
+        help="可重复；不指定时使用该评测集有答案的默认 split",
+    )
+    prepare.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="允许科目不完整的测试子集；正式内置数据不应使用",
+    )
+    prepare.add_argument("--overwrite", action="store_true", help="显式替换既有输出")
 
     pair = subparsers.add_parser("run-pair", help="顺序启动 vLLM 并比较训练前后模型")
     pair.add_argument("--dataset", type=Path, required=True)
@@ -68,7 +100,9 @@ async def _run(args: argparse.Namespace) -> None:
         )
     finally:
         await client.close()
-    args.output.write_text(json.dumps(report.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    args.output.write_text(
+        json.dumps(report.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 async def _run_pair(args: argparse.Namespace) -> None:
@@ -88,6 +122,33 @@ async def _run_pair(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = _parser().parse_args()
+    if args.command == "prepare-benchmark":
+        try:
+            result = prepare_builtin_benchmark(
+                args.benchmark,
+                args.output_dir,
+                online=args.online,
+                source=args.source,
+                source_revision=args.source_revision,
+                accept_noncommercial_license=args.accept_non_commercial_license,
+                splits=tuple(args.split) if args.split else None,
+                allow_partial=args.allow_partial,
+                overwrite=args.overwrite,
+            )
+        except BenchmarkPreparationError as exc:
+            raise SystemExit(f"准备评测集失败：{exc}") from exc
+        print(
+            json.dumps(
+                {
+                    "jsonl": str(result.jsonl_path),
+                    "manifest": str(result.manifest_path),
+                    "record_count": result.record_count,
+                    "sha256": result.jsonl_sha256,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
     if args.command == "convert-benchmark":
         count = convert_csv_directory(args.source_dir, args.output, args.benchmark)
         print(f"已转换 {count} 条样本")

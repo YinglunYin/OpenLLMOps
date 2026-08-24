@@ -28,7 +28,9 @@ class CompatibleClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def generate(self, *, model: str, prompt: str, template: str, max_tokens: int) -> Generation:
+    async def generate(
+        self, *, model: str, prompt: str, template: str, max_tokens: int
+    ) -> Generation:
         started = time.perf_counter()
         if template == "instruct":
             response = await self._client.post(

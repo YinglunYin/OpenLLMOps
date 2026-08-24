@@ -12,4 +12,3 @@ __all__ = [
     "compare_reports",
     "score_answer",
 ]
-

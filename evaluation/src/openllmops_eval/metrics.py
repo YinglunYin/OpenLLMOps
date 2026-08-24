@@ -92,7 +92,9 @@ def aggregate_results(
         correct=correct,
         invalid=sum(not result.valid for result in materialized),
         accuracy_percent=_percent(correct, len(materialized)),
-        average_latency_ms=round(sum(result.latency_ms for result in materialized) / len(materialized), 3),
+        average_latency_ms=round(
+            sum(result.latency_ms for result in materialized) / len(materialized), 3
+        ),
         categories=categories,
         sample_ids=tuple(sorted(result.sample_id for result in materialized)),
     )

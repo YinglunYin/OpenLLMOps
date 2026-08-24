@@ -55,4 +55,3 @@ async def evaluate(
         model_name=model_name,
         template=template,
     )
-

@@ -92,4 +92,3 @@ class ComparisonReport:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
-
