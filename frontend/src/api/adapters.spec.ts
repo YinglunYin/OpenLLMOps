@@ -64,6 +64,16 @@ describe('FastAPI 资源适配器', () => {
     expect(toEvaluationSummaries(run)[0]).toMatchObject({ dataset: 'C-Eval', samples: 100, before: 60, after: 63, pointChange: 3, relativeChange: 5 })
     expect(toEvaluationRunSummary(run, '领域模型')).toMatchObject({ name: 'compare', model: '领域模型', datasets: 'C-Eval', progress: 100, status: 'completed' })
 
+    const realRun = {
+      ...run,
+      metrics: {
+        baseline: { categories: [{ category: 'ceval/law', total: 40, correct: 20 }, { category: 'ceval/math', total: 60, correct: 30 }] },
+        candidate: { categories: [{ category: 'ceval/law', total: 40, correct: 24 }, { category: 'ceval/math', total: 60, correct: 36 }] },
+      },
+      comparison: { baseline_percent: 50, candidate_percent: 60, percentage_point_change: 10, category_changes: [] },
+    } satisfies BackendEvaluationRun
+    expect(toEvaluationSummaries(realRun)).toEqual([{ dataset: 'C-Eval', samples: 100, before: 50, after: 60, pointChange: 10, relativeChange: 20 }])
+
     const devices = toGpuDevices(2, [{ id: 'lease', gpu_index: 1, owner_type: 'training', owner_id: 'job', owner_name: 'sft-job', acquired_at: timestamps.created_at }])
     expect(devices).toHaveLength(2)
     expect(devices[0]).toMatchObject({ state: 'idle', telemetryAvailable: false })

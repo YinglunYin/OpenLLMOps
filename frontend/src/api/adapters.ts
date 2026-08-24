@@ -157,6 +157,43 @@ export function toDashboardActivity(item: BackendAuditLog): DashboardActivity {
 }
 
 export function toEvaluationSummaries(run: BackendEvaluationRun): EvaluationSummary[] {
+  const baseline = isRecord(run.metrics.baseline) ? run.metrics.baseline : undefined
+  const candidateMetric = isRecord(run.metrics.candidate) ? run.metrics.candidate : undefined
+  const baselineCategories = Array.isArray(baseline?.categories) ? baseline.categories.filter(isRecord) : []
+  const candidateCategories = Array.isArray(candidateMetric?.categories) ? candidateMetric.categories.filter(isRecord) : []
+  if (baselineCategories.length && candidateCategories.length) {
+    const candidateByCategory = new Map(candidateCategories.map((item) => [String(item.category), item]))
+    const grouped = new Map<string, { total: number; baselineCorrect: number; candidateCorrect: number }>()
+    for (const category of baselineCategories) {
+      const categoryName = String(category.category ?? '')
+      const candidateCategory = candidateByCategory.get(categoryName)
+      const total = numberFrom(category.total)
+      const baselineCorrect = numberFrom(category.correct)
+      const candidateCorrect = numberFrom(candidateCategory?.correct)
+      if (!categoryName || total === undefined || baselineCorrect === undefined || candidateCorrect === undefined) continue
+      const source = categoryName.split('/', 1)[0] || 'unknown'
+      const current = grouped.get(source) ?? { total: 0, baselineCorrect: 0, candidateCorrect: 0 }
+      current.total += total
+      current.baselineCorrect += baselineCorrect
+      current.candidateCorrect += candidateCorrect
+      grouped.set(source, current)
+    }
+    const order = (name: string) => name === 'ceval' ? 0 : name === 'cmmlu' ? 1 : 2
+    return [...grouped.entries()].sort(([left], [right]) => order(left) - order(right) || left.localeCompare(right)).map(([source, value]) => {
+      const before = roundScore(value.baselineCorrect * 100 / value.total)
+      const after = roundScore(value.candidateCorrect * 100 / value.total)
+      const pointChange = roundScore(after - before)
+      return {
+        dataset: source === 'ceval' ? 'C-Eval' : source === 'cmmlu' ? 'CMMLU' : '自定义领域集',
+        samples: value.total,
+        before,
+        after,
+        pointChange,
+        relativeChange: before ? roundScore(pointChange * 100 / before) : 0,
+      }
+    })
+  }
+
   const candidate = run.comparison.results ?? run.comparison.datasets ?? run.comparison.summary
   const entries: Array<[string, Record<string, unknown>]> = Array.isArray(candidate)
     ? candidate.map((value, index) => [String((value as Record<string, unknown>).dataset ?? index), value as Record<string, unknown>])
@@ -177,6 +214,10 @@ export function toEvaluationSummaries(run: BackendEvaluationRun): EvaluationSumm
       relativeChange: numberFrom(value.relative_change) ?? (before ? (pointChange / before) * 100 : 0),
     }
   })
+}
+
+function roundScore(value: number): number {
+  return Math.round(value * 10_000) / 10_000
 }
 
 export function toEvaluationRunSummary(run: BackendEvaluationRun, modelName?: string, customDatasetName?: string): EvaluationRunSummary {

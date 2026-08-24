@@ -20,10 +20,12 @@ const createVisible = ref(false)
 const createBusy = ref(false)
 const form = reactive({ name: '', modelKind: 'instruct', baseModelAssetId: '', candidateModelAssetId: '', datasets: ['ceval', 'cmmlu'], customDatasetId: '', temperature: 0, maxTokens: 512 })
 
-const generalRows = computed(() => rows.value.slice(0, 2))
-const generalBefore = computed(() => generalRows.value.length ? generalRows.value.reduce((sum, item) => sum + item.before, 0) / generalRows.value.length : 0)
-const generalAfter = computed(() => generalRows.value.length ? generalRows.value.reduce((sum, item) => sum + item.after, 0) / generalRows.value.length : 0)
-const domain = computed<EvaluationSummary>(() => rows.value.at(-1) ?? { dataset: '领域测试集', samples: 0, before: 0, after: 0, pointChange: 0, relativeChange: 0 })
+const generalRows = computed(() => rows.value.filter((item) => ['C-Eval', 'CMMLU'].includes(item.dataset)))
+const generalSamples = computed(() => generalRows.value.reduce((sum, item) => sum + item.samples, 0))
+const generalBefore = computed(() => generalSamples.value ? generalRows.value.reduce((sum, item) => sum + item.before * item.samples, 0) / generalSamples.value : 0)
+const generalAfter = computed(() => generalSamples.value ? generalRows.value.reduce((sum, item) => sum + item.after * item.samples, 0) / generalSamples.value : 0)
+const domain = computed<EvaluationSummary | undefined>(() => rows.value.find((item) => item.dataset === '自定义领域集'))
+const signed = (value: number) => `${value > 0 ? '+' : ''}${value}`
 const taskStatusMap: Record<EvaluationRunSummary['status'], { text: string; tone: StatusTone }> = {
   queued: { text: '等待 GPU', tone: 'warning' }, running: { text: '测评中', tone: 'primary' }, completed: { text: '已完成', tone: 'success' }, failed: { text: '失败', tone: 'danger' }, stopping: { text: '取消中', tone: 'info' }, terminated: { text: '已取消', tone: 'info' },
 }
@@ -120,9 +122,9 @@ onMounted(async () => {
 
         <div class="score-grid section-gap">
           <div class="score-card"><span>通用能力</span><strong><i>{{ generalBefore.toFixed(1) }}%</i><b>→</b><em>{{ generalAfter.toFixed(1) }}%</em></strong></div>
-          <div class="score-card"><span>领域能力</span><strong><i>{{ domain.before }}%</i><b>→</b><em>{{ domain.after }}%</em></strong></div>
-          <div class="score-card"><span>通用变化</span><strong class="change">+{{ (generalAfter-generalBefore).toFixed(1) }} <small>个百分点</small></strong></div>
-          <div class="score-card"><span>领域提升</span><strong class="change">+{{ domain.pointChange }} <small>个百分点</small></strong></div>
+          <div class="score-card"><span>领域能力</span><strong v-if="domain"><i>{{ domain.before }}%</i><b>→</b><em>{{ domain.after }}%</em></strong><strong v-else>—</strong></div>
+          <div class="score-card"><span>通用变化</span><strong class="change">{{ signed(Number((generalAfter-generalBefore).toFixed(1))) }} <small>个百分点</small></strong></div>
+          <div class="score-card"><span>领域变化</span><strong class="change">{{ domain ? signed(domain.pointChange) : '—' }} <small v-if="domain">个百分点</small></strong></div>
         </div>
 
         <div class="evaluation-charts section-gap">
@@ -136,7 +138,7 @@ onMounted(async () => {
         </div>
 
         <PanelCard title="测评结果汇总" class="section-gap" flush>
-          <el-table :data="rows"><el-table-column prop="dataset" label="数据集" min-width="180"/><el-table-column prop="samples" label="样本数" width="130"><template #default="{row}">{{ row.samples.toLocaleString() }}</template></el-table-column><el-table-column prop="before" label="训练前" width="140"><template #default="{row}"><b class="number-primary">{{ row.before }}%</b></template></el-table-column><el-table-column prop="after" label="训练后" width="140"><template #default="{row}"><b class="number-positive">{{ row.after }}%</b></template></el-table-column><el-table-column prop="pointChange" label="百分点变化" width="150"><template #default="{row}"><b class="number-positive">+{{ row.pointChange }}</b></template></el-table-column><el-table-column prop="relativeChange" label="相对变化" width="150"><template #default="{row}"><b class="number-positive">+{{ row.relativeChange }}%</b></template></el-table-column></el-table>
+          <el-table :data="rows"><el-table-column prop="dataset" label="数据集" min-width="180"/><el-table-column prop="samples" label="样本数" width="130"><template #default="{row}">{{ row.samples.toLocaleString() }}</template></el-table-column><el-table-column prop="before" label="训练前" width="140"><template #default="{row}"><b class="number-primary">{{ row.before }}%</b></template></el-table-column><el-table-column prop="after" label="训练后" width="140"><template #default="{row}"><b class="number-positive">{{ row.after }}%</b></template></el-table-column><el-table-column prop="pointChange" label="百分点变化" width="150"><template #default="{row}"><b :class="row.pointChange >= 0 ? 'number-positive' : 'danger-link'">{{ signed(row.pointChange) }}</b></template></el-table-column><el-table-column prop="relativeChange" label="相对变化" width="150"><template #default="{row}"><b :class="row.relativeChange >= 0 ? 'number-positive' : 'danger-link'">{{ signed(row.relativeChange) }}%</b></template></el-table-column></el-table>
           <div class="method-note">ⓘ 所有对比使用相同数据集、提示模板与推理参数；不设置通过/失败阈值。</div>
         </PanelCard>
         </template>
