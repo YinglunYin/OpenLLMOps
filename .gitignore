@@ -6,6 +6,7 @@
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -28,16 +29,15 @@ coverage/
 *.key
 
 # 运行期大文件不进入 Git
-data/
-artifacts/
-models/
-datasets/
-checkpoints/
-logs/
-tmp/
+/data/
+/artifacts/
+/models/
+/datasets/
+/checkpoints/
+/logs/
+/tmp/
 
 # 数据库与监控本地卷
-postgres-data/
-prometheus-data/
-grafana-data/
-
+/postgres-data/
+/prometheus-data/
+/grafana-data/
