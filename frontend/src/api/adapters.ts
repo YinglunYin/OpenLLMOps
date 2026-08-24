@@ -1,0 +1,226 @@
+import type {
+  BackendApiKey,
+  BackendAuditLog,
+  BackendDataset,
+  BackendDeployment,
+  BackendEvaluationRun,
+  BackendGpuLease,
+  BackendModelAsset,
+  BackendTrainingJob,
+} from './contracts'
+import type { ApiKeySummary, DashboardActivity, Dataset, Deployment, EvaluationRunSummary, EvaluationSummary, GpuDevice, ModelAsset, TrainingJob } from '@/types/domain'
+
+export function formatBytes(value: number | null): string {
+  if (value === null) return '—'
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GB`
+  return `${(value / 1024 ** 2).toFixed(1)} MB`
+}
+
+export function formatDateTime(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+export function toModelAsset(item: BackendModelAsset): ModelAsset {
+  const sourceMap: Record<BackendModelAsset['source_type'], ModelAsset['source']> = {
+    huggingface: 'Hugging Face',
+    modelscope: 'ModelScope',
+    sftp: 'SFTP',
+    manual: '受控目录',
+    trained: '训练产物',
+  }
+  return {
+    id: item.id,
+    name: item.name,
+    version: String(item.metadata_json.version ?? item.revision ?? '—'),
+    type: item.model_kind === 'embedding' ? 'embedding' : 'generation',
+    source: sourceMap[item.source_type],
+    format: 'Safetensors',
+    size: formatBytes(item.size_bytes),
+    status: item.status === 'ready' ? 'available' : item.status,
+    updatedAt: formatDateTime(item.updated_at),
+    contextLength: Number(item.metadata_json.context_length ?? 0) || undefined,
+    path: item.local_path,
+  }
+}
+
+export function toDeployment(item: BackendDeployment): Deployment {
+  const stateMap: Record<BackendDeployment['actual_state'], Deployment['status']> = {
+    created: 'stopped',
+    queued: 'queued',
+    starting: 'starting',
+    running: 'running',
+    stopping: 'stopped',
+    stopped: 'stopped',
+    failed: 'error',
+  }
+  return {
+    id: item.id,
+    name: item.name,
+    model: item.served_model_name,
+    serviceType: item.task_type === 'generate' ? 'generation' : 'embedding',
+    gpuLabel: item.gpu_ids.length ? item.gpu_ids.map((gpu) => `GPU ${gpu}`).join('、') : '等待资源',
+    parallelism: item.tensor_parallel_size > 1 ? `TP ×${item.tensor_parallel_size}` : '单卡',
+    status: stateMap[item.actual_state],
+    endpoint: item.internal_url ?? undefined,
+    qps: numberFrom(item.simplified_config.qps),
+    ttft: numberFrom(item.simplified_config.ttft),
+    kvHitRate: numberFrom(item.simplified_config.kv_hit_rate),
+    simplifiedConfig: item.simplified_config,
+    vllmArgs: item.vllm_args,
+    updatedAt: formatDateTime(item.updated_at),
+  }
+}
+
+export function toDataset(item: BackendDataset): Dataset {
+  const purposeMap: Record<BackendDataset['dataset_type'], Dataset['purpose']> = {
+    cpt: 'CPT',
+    sft: 'SFT',
+    evaluation: 'Evaluation',
+  }
+  return {
+    id: item.id,
+    name: item.name,
+    version: String(item.schema_summary.version ?? 'v1.0.0'),
+    purpose: purposeMap[item.dataset_type],
+    format: 'JSONL',
+    samples: item.record_count ?? 0,
+    tokens: numberFrom(item.schema_summary.token_count) ?? 0,
+    status: item.status === 'ready' ? 'available' : item.status === 'invalid' ? 'failed' : 'validating',
+    updatedAt: formatDateTime(item.updated_at),
+    fileName: item.file_name,
+    size: formatBytes(item.size_bytes),
+    sha256: item.sha256 ?? undefined,
+    validationErrors: item.validation_errors,
+    schemaSummary: item.schema_summary,
+  }
+}
+
+export function toTrainingJob(item: BackendTrainingJob, modelName?: string): TrainingJob {
+  const stateMap: Record<BackendTrainingJob['actual_state'], TrainingJob['status']> = {
+    created: 'queued',
+    queued: 'queued',
+    starting: 'queued',
+    running: 'running',
+    canceling: 'stopping',
+    canceled: 'terminated',
+    succeeded: 'completed',
+    failed: 'failed',
+  }
+  return {
+    id: item.id,
+    name: item.name,
+    stage: item.stage.toUpperCase() as TrainingJob['stage'],
+    algorithm: ({ freeze: 'Freeze', lora: 'LoRA', qlora: 'QLoRA' } as const)[item.algorithm],
+    baseModel: modelName ?? item.model_asset_id,
+    gpuLabel: item.gpu_ids.length ? item.gpu_ids.map((gpu) => `GPU ${gpu}`).join('、') : '等待资源',
+    progress: Math.round(item.progress),
+    status: stateMap[item.actual_state],
+    step: item.current_step ?? 0,
+    totalSteps: item.total_steps ?? 0,
+    epoch: String(item.metrics.epoch ?? '—'),
+    eta: typeof item.metrics.eta === 'string' ? item.metrics.eta : undefined,
+    metrics: item.metrics,
+    outputDir: item.output_dir,
+    checkpointPath: item.checkpoint_path ?? undefined,
+    adapterPath: item.adapter_path ?? undefined,
+    mergedModelPath: item.merged_model_path ?? undefined,
+    updatedAt: formatDateTime(item.updated_at),
+  }
+}
+
+export function toApiKey(item: BackendApiKey): ApiKeySummary {
+  return {
+    id: item.id,
+    name: item.name,
+    prefix: item.prefix,
+    active: item.is_active,
+    createdAt: formatDateTime(item.created_at),
+    lastUsedAt: item.last_used_at ? formatDateTime(item.last_used_at) : '从未使用',
+  }
+}
+
+export function toDashboardActivity(item: BackendAuditLog): DashboardActivity {
+  const operation = item.action.includes('.') ? item.action.split('.').at(-1) : item.action
+  return {
+    id: item.id,
+    time: formatDateTime(item.occurred_at).slice(11),
+    text: operation || `${item.method} 请求`,
+    detail: `${item.method} ${item.path} · HTTP ${item.status_code}`,
+    tone: item.succeeded ? 'success' : 'danger',
+  }
+}
+
+export function toEvaluationSummaries(run: BackendEvaluationRun): EvaluationSummary[] {
+  const candidate = run.comparison.results ?? run.comparison.datasets ?? run.comparison.summary
+  const entries: Array<[string, Record<string, unknown>]> = Array.isArray(candidate)
+    ? candidate.map((value, index) => [String((value as Record<string, unknown>).dataset ?? index), value as Record<string, unknown>])
+    : isRecord(candidate)
+      ? Object.entries(candidate).filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]))
+      : []
+
+  return entries.map(([dataset, value]) => {
+    const before = numberFrom(value.before ?? value.base_score) ?? 0
+    const after = numberFrom(value.after ?? value.candidate_score) ?? 0
+    const pointChange = numberFrom(value.point_change) ?? after - before
+    return {
+      dataset,
+      samples: numberFrom(value.samples ?? value.sample_count) ?? 0,
+      before,
+      after,
+      pointChange,
+      relativeChange: numberFrom(value.relative_change) ?? (before ? (pointChange / before) * 100 : 0),
+    }
+  })
+}
+
+export function toEvaluationRunSummary(run: BackendEvaluationRun, modelName?: string, customDatasetName?: string): EvaluationRunSummary {
+  const statusMap: Record<string, EvaluationRunSummary['status']> = {
+    created: 'queued', queued: 'queued', starting: 'queued', running: 'running',
+    canceling: 'stopping', canceled: 'terminated', succeeded: 'completed', failed: 'failed',
+  }
+  const datasets = [
+    ...run.builtin_datasets.map((item) => ({ ceval: 'C-Eval', cmmlu: 'CMMLU' })[item] ?? item),
+    ...(run.custom_dataset_id ? [customDatasetName ?? run.custom_dataset_id] : []),
+  ]
+  return {
+    id: run.id,
+    name: run.name,
+    model: modelName ?? run.candidate_model_asset_id,
+    datasets: datasets.join(' / '),
+    progress: Math.round(numberFrom(run.metrics.progress) ?? (run.actual_state === 'succeeded' ? 100 : 0)),
+    status: statusMap[run.actual_state] ?? 'queued',
+    updatedAt: formatDateTime(run.updated_at),
+  }
+}
+
+export function toGpuDevices(gpuCount: number, leases: BackendGpuLease[]): GpuDevice[] {
+  return Array.from({ length: gpuCount }, (_, index) => {
+    const lease = leases.find((item) => item.gpu_index === index)
+    return {
+      index,
+      name: 'RTX 4090D',
+      utilization: 0,
+      memoryUsed: 0,
+      memoryTotal: 24,
+      temperature: 0,
+      power: 0,
+      powerLimit: 425,
+      state: lease?.owner_type === 'training' ? 'training' : lease?.owner_type === 'deployment' ? 'inference' : lease ? 'reserved' : 'idle',
+      task: lease?.owner_name,
+      telemetryAvailable: false,
+    }
+  })
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function numberFrom(value: unknown): number | undefined {
+  if (value === null || value === undefined || value === '') return undefined
+  const number = Number(value)
+  return Number.isFinite(number) ? number : undefined
+}
