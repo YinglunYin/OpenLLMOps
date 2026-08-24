@@ -37,7 +37,9 @@ node-agent 是单机 GPU 节点的最小特权执行面。控制面负责期望�
 
 推理详细参数采用节点侧白名单。`--model`、`--host`、`--port`、`--served-model-name`、`--runner`、`--convert`、`--load-format safetensors` 和 `--tensor-parallel-size` 都由 agent 构造，调用方不能覆盖；`trust_remote_code` 永久不在白名单中。embedding 服务固定使用 vLLM pooling/embed 模式。
 
-训练只允许继续预训练 `stage=pt + LoRA`，以及 SFT 的 Freeze、LoRA、4-bit QLoRA。训练容器只执行 `llamafactory-cli train`，不启动 WebUI；模型、数据集和配置只读挂载，checkpoint 与任务缓存按任务单独可写，并固定离线环境和 `trust_remote_code=false`。
+训练只允许继续预训练 `stage=pt + LoRA`，以及 SFT 的 Freeze、LoRA、4-bit QLoRA。控制面参数使用严格 Pydantic 白名单，输出必须精确为 `CHECKPOINT_ROOT/<job UUID>`。训练容器通过 `openllmops-training-runtime` 以参数数组执行 `llamafactory-cli train`，不启动 WebUI；模型、JSONL、dataset_info 和配置分别固定只读挂载到 `/workspace`，容器断网并固定离线环境、`trust_remote_code=false`。多卡 world size 等于整卡租约数；LoRA/QLoRA 成功后顺序合并至 `output/merged`，Freeze 输出本身可部署。
+
+wrapper 在容器 tini 之后监管 torchrun 进程组，SIGTERM/SIGINT 会先转发、超时再清理，终止任务不会继续合并。成功训练会递归删除 pickle optimizer/scheduler/RNG 状态，checkpoint 仅作为不可恢复优化器的安全 Safetensors 快照。节点只上报通过软链接、特殊文件、Safetensors、索引、模型/adapter 配置和 tokenizer 载荷安全校验的目录；LoRA/QLoRA 上报 `adapter_path=output` 与 `merged_model_path=output/merged`，Freeze 上报 `merged_model_path=output`。
 
 评测模型只能来自 `MODEL_ROOT` 下的非链接普通目录，数据只能来自 `DATASET_ROOT`/`EVALUATION_DATASET_ROOT` 下的非链接 JSONL。合并产物位于 agent runtime，输出只允许 `EVALUATION_OUTPUT_ROOT/<run UUID>`。评测容器断网、只读根文件系统，`pair-report.json` 必须通过大小、有限数、计数、分类汇总与数据指纹绑定校验才会上报 `succeeded`。
 

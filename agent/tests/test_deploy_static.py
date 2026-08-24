@@ -1,3 +1,5 @@
+import os
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -120,3 +122,107 @@ def test_evaluation_runtime_and_controlled_paths_are_wired() -> None:
     dockerfile = (PROJECT_ROOT / "evaluation/Dockerfile").read_text(encoding="utf-8")
     assert "vllm.__version__ == '0.27.1'" in dockerfile
     assert 'com.openllmops.security.trust-remote-code="disabled"' in dockerfile
+
+
+def test_training_wrapper_fixed_build_context_and_preflight_guards_are_wired() -> None:
+    compose = yaml.safe_load((DEPLOY_ROOT / "compose.yaml").read_text(encoding="utf-8"))
+    agent_build = compose["services"]["node-agent"]["build"]
+    training_image = compose["services"]["llamafactory-secure-image"]
+    dockerfile = (DEPLOY_ROOT / "docker/llamafactory-secure.Dockerfile").read_text(encoding="utf-8")
+    preflight = (DEPLOY_ROOT / "scripts/preflight.sh").read_text(encoding="utf-8")
+
+    assert agent_build == {"context": "..", "dockerfile": "agent/Dockerfile"}
+    assert training_image["build"]["context"] == ".."
+    assert "COPY workers/training_runtime" in dockerfile
+    assert 'ENTRYPOINT ["openllmops-training-runtime"]' in dockerfile
+    assert 'com.openllmops.runner="training-wrapper-v1"' in dockerfile
+    assert 'com.openllmops.artifacts="safetensors-validated-v1"' in dockerfile
+    agent_ignore = (PROJECT_ROOT / "agent/Dockerfile.dockerignore").read_text(encoding="utf-8")
+    training_ignore = (DEPLOY_ROOT / "docker/llamafactory-secure.Dockerfile.dockerignore").read_text(
+        encoding="utf-8"
+    )
+    assert agent_ignore.startswith("**\n") and "!workers/training_runtime/src/**" in agent_ignore
+    assert training_ignore.startswith("**\n") and "!workers/training_config/src/**" in training_ignore
+    assert 'require_production_digest "$environment" "VLLM_ALLOWED_IMAGES"' in preflight
+    assert 'require_production_digest "$environment" "EVALUATION_ALLOWED_IMAGES"' in preflight
+    permission_check = DEPLOY_ROOT / "scripts/check-storage-permissions.py"
+    permission_source = permission_check.read_text(encoding="utf-8")
+    assert "os.setuid(uid)" in permission_source and "os.access(target" in permission_source
+    subprocess.run(
+        ["sh", "-n", str(DEPLOY_ROOT / "scripts/preflight.sh")],
+        check=True,
+    )
+    subprocess.run(
+        ["sh", "-n", str(DEPLOY_ROOT / "scripts/image-reference-policy.sh")],
+        check=True,
+    )
+
+
+def test_production_digest_policy_is_exact_and_development_allows_fixed_tags() -> None:
+    policy = DEPLOY_ROOT / "scripts/image-reference-policy.sh"
+
+    def validate(environment: str, reference: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "sh",
+                "-c",
+                '. "$1"; require_production_digest "$2" TEST "$3"',
+                "openllmops-image-policy-test",
+                str(policy),
+                environment,
+                reference,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    valid = "registry.internal/openllmops/runtime@sha256:" + "a" * 64
+    assert validate("production", valid).returncode == 0
+    assert validate("production", "repo@sha256:ab").returncode != 0
+    assert validate("production", "repo@sha256:" + "g" * 64).returncode != 0
+    assert validate("production", "@sha256:" + "a" * 64).returncode != 0
+    assert validate("development", "vllm/vllm-openai:v0.27.1").returncode == 0
+
+
+def test_storage_permission_check_runs_as_configured_non_root_identity(tmp_path: Path) -> None:
+    checker = DEPLOY_ROOT / "scripts/check-storage-permissions.py"
+    children = (
+        "models",
+        "inbox",
+        "model-staging",
+        "datasets",
+        "evaluation-datasets",
+        "evaluation-output",
+        "checkpoints",
+        "training-configs",
+        "runtime",
+    )
+    uid, gid = os.getuid(), os.getgid()
+    if uid == 0:
+        uid = gid = 65534
+        os.chown(tmp_path, uid, gid)
+    for child in children:
+        target = tmp_path / child
+        target.mkdir(mode=0o700)
+        if os.getuid() == 0:
+            os.chown(target, uid, gid)
+
+    passed = subprocess.run(
+        ["python3", str(checker), str(tmp_path), str(uid), str(gid)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert passed.returncode == 0, passed.stderr
+
+    blocked = tmp_path / "checkpoints"
+    blocked.chmod(0o500)
+    failed = subprocess.run(
+        ["python3", str(checker), str(tmp_path), str(uid), str(gid)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode != 0
+    assert "不可读写进入" in failed.stderr

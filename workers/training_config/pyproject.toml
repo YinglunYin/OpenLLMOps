@@ -7,7 +7,7 @@ name = "openllmops-training-config"
 version = "0.1.0"
 description = "OpenLLMOps LLaMA-Factory 白名单训练配置生成器"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["pydantic>=2.10,<3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3,<10", "ruff>=0.9,<1"]

@@ -1,0 +1,13 @@
+**
+!deploy/
+!deploy/security/
+!deploy/security/harden_llamafactory.py
+!workers/
+!workers/training_config/
+!workers/training_config/pyproject.toml
+!workers/training_config/src/
+!workers/training_config/src/**
+!workers/training_runtime/
+!workers/training_runtime/pyproject.toml
+!workers/training_runtime/src/
+!workers/training_runtime/src/**

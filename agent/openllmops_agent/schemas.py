@@ -41,9 +41,12 @@ class TrainingLaunchRequest(StrictModel):
     gpu_ids: list[int] = Field(min_length=1, max_length=16)
     model_path: Path
     dataset_path: Path
-    dataset_dir: Path | None = None
+    dataset_dir: Path
     config_path: Path
     output_path: Path
+    stage: Literal["cpt", "sft"]
+    algorithm: Literal["freeze", "lora", "qlora"]
+    dataset_format: Literal["cpt_text", "alpaca", "messages"]
     environment: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("gpu_ids")

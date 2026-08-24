@@ -1,7 +1,8 @@
+import json
 from pathlib import Path
 from uuid import UUID, uuid4
 
-import yaml
+import pytest
 
 from openllmops_agent.agent_contract import (
     AgentAction,
@@ -12,7 +13,7 @@ from openllmops_agent.agent_contract import (
 )
 from openllmops_agent.command_service import CommandProcessor, CommandStateStore
 from openllmops_agent.config import Settings
-from openllmops_agent.docker_runner import WorkloadConflict, WorkloadNotFound
+from openllmops_agent.docker_runner import InvalidWorkload, WorkloadConflict, WorkloadNotFound
 from openllmops_agent.schemas import (
     EvaluationLaunchRequest,
     InferenceLaunchRequest,
@@ -28,6 +29,7 @@ class FakeRunner:
         self.training_requests: list[TrainingLaunchRequest] = []
         self.evaluation_requests: list[EvaluationLaunchRequest] = []
         self.stop_calls = 0
+        self.training_metadata_completed_calls: list[bool] = []
 
     def prepare_contract_start(
         self, owner_type: str, workload_id: UUID, generation: int
@@ -94,14 +96,20 @@ class FakeRunner:
         except KeyError as exc:
             raise WorkloadNotFound("absent") from exc
 
-    def stop_contract_workload(self, owner_type: str, workload_id: UUID, generation: int) -> None:
+    def stop_contract_workload(
+        self, owner_type: str, workload_id: UUID, generation: int
+    ) -> WorkloadInfo | None:
         info = self.get_contract_workload(owner_type, workload_id)
         if info.generation != generation:
             raise WorkloadConflict("generation mismatch")
         self.stop_calls += 1
+        if owner_type in {"training", "evaluation"} and info.status == "exited" and info.exit_code == 0:
+            return info
         del self.workloads[(owner_type, workload_id)]
+        return None
 
-    def training_metadata(self, workload_id: UUID) -> dict:
+    def training_metadata(self, workload_id: UUID, *, completed: bool = False) -> dict:
+        self.training_metadata_completed_calls.append(completed)
         return {"progress": 25.0, "current_step": 1, "total_steps": 4}
 
     def evaluation_metadata(self, workload_id: UUID) -> dict:
@@ -224,7 +232,7 @@ def test_start_binding_and_generation_watermark_persist_atomically(
     restarted.bind_start("deployment", owner_id, 7, "fingerprint")
 
 
-def test_training_execution_materializes_controlled_yaml_and_dataset_info(
+def test_training_execution_materializes_controlled_config_and_dataset_info(
     tmp_path: Path,
 ) -> None:
     settings = settings_for(tmp_path)
@@ -235,10 +243,10 @@ def test_training_execution_materializes_controlled_yaml_and_dataset_info(
         '{"instruction":"问候","input":"","output":"你好"}\n',
         encoding="utf-8",
     )
-    output_path = settings.checkpoint_root / "job"
+    job_id = uuid4()
+    output_path = settings.checkpoint_root / str(job_id)
     runner = FakeRunner()
     processor = CommandProcessor(settings, runner)  # type: ignore[arg-type]
-    job_id = uuid4()
     command = AgentCommand(
         action="start",
         owner=AgentOwner(type="training", id=job_id, name="sft", generation=3),
@@ -249,7 +257,7 @@ def test_training_execution_materializes_controlled_yaml_and_dataset_info(
             "dataset_path": str(dataset_path),
             "stage": "sft",
             "algorithm": "qlora",
-            "training_config": {"num_train_epochs": 1, "template": "qwen"},
+            "training_config": {"num_train_epochs": 1.0, "template": "qwen"},
             "output_dir": str(output_path),
         },
     )
@@ -258,14 +266,68 @@ def test_training_execution_materializes_controlled_yaml_and_dataset_info(
 
     assert result.response.accepted
     request = runner.training_requests[0]
-    config = yaml.safe_load(request.config_path.read_text(encoding="utf-8"))
-    dataset_info = yaml.safe_load((request.dataset_dir / "dataset_info.json").read_text(encoding="utf-8"))
+    config = json.loads(request.config_path.read_text(encoding="utf-8"))
+    dataset_info = json.loads((request.dataset_dir / "dataset_info.json").read_text(encoding="utf-8"))
     assert config["stage"] == "sft"
     assert config["finetuning_type"] == "lora"
     assert config["quantization_bit"] == 4
     assert config["trust_remote_code"] is False
-    assert dataset_info["openllmops_dataset"]["file_name"] == str(dataset_path)
+    assert dataset_info["openllmops_dataset"]["file_name"] == "/workspace/data/training.jsonl"
     assert dataset_info["openllmops_dataset"]["columns"]["query"] == "input"
+    assert request.stage == "sft"
+    assert request.algorithm == "qlora"
+    assert request.dataset_format == "alpaca"
+
+
+def test_training_execution_rejects_unknown_parameter_and_non_uuid_output(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    model_path = settings.model_root / "demo"
+    model_path.mkdir()
+    dataset_path = settings.dataset_root / "sft.jsonl"
+    dataset_path.write_text('{"instruction":"hi","output":"hello"}\n', encoding="utf-8")
+    runner = FakeRunner()
+    processor = CommandProcessor(settings, runner)  # type: ignore[arg-type]
+
+    def command(job_id: UUID, training_config: dict, output_dir: Path) -> AgentCommand:
+        return AgentCommand(
+            action="start",
+            owner=AgentOwner(type="training", id=job_id, name="sft", generation=1),
+            resources=AgentResourceRequest(gpu_ids=[0]),
+            execution={
+                "runner": "llamafactory",
+                "model_path": str(model_path),
+                "dataset_path": str(dataset_path),
+                "stage": "sft",
+                "algorithm": "lora",
+                "training_config": training_config,
+                "output_dir": str(output_dir),
+            },
+        )
+
+    unknown_job = uuid4()
+    unknown = processor.execute(
+        command(
+            unknown_job,
+            {"template": "qwen", "trust_remote_code": True},
+            settings.checkpoint_root / str(unknown_job),
+        )
+    )
+    assert unknown.status_code == 422
+    assert unknown.response.error_code == "invalid_execution"
+
+    wrong_output_job = uuid4()
+    wrong_output = processor.execute(
+        command(
+            wrong_output_job,
+            {"template": "qwen"},
+            settings.checkpoint_root / "operator-selected-name",
+        )
+    )
+    assert wrong_output.status_code == 422
+    assert wrong_output.response.error_code == "invalid_workload"
+    assert runner.training_requests == []
 
 
 def test_alpaca_dataset_without_input_does_not_declare_query(tmp_path: Path) -> None:
@@ -275,9 +337,87 @@ def test_alpaca_dataset_without_input_does_not_declare_query(tmp_path: Path) -> 
         encoding="utf-8",
     )
 
-    info = CommandProcessor._dataset_info(dataset_path, "sft")
+    info, dataset_format = CommandProcessor._dataset_info(dataset_path, "sft")
 
     assert info["columns"] == {"prompt": "instruction", "response": "output"}
+    assert dataset_format.value == "alpaca"
+
+
+def test_training_dataset_probe_rejects_duplicate_json_fields(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "sft.jsonl"
+    dataset_path.write_text(
+        '{"instruction":"hi","instruction":"changed","output":"hello"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InvalidWorkload, match="重复字段"):
+        CommandProcessor._dataset_info(dataset_path, "sft")
+
+
+def test_training_stop_preserves_naturally_succeeded_container_and_is_repeatable(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    runner = FakeRunner()
+    job_id = uuid4()
+    runner.workloads[("training", job_id)] = WorkloadInfo(
+        name=f"openllmops-training-{job_id}",
+        workload_id=job_id,
+        kind="training",
+        image="safe-training-image",
+        status="exited",
+        exit_code=0,
+        gpu_ids=[0],
+        generation=2,
+    )
+    processor = CommandProcessor(settings, runner)  # type: ignore[arg-type]
+
+    def stop_command() -> AgentCommand:
+        return AgentCommand(
+            action="stop",
+            owner=AgentOwner(type="training", id=job_id, name="sft", generation=2),
+            resources=AgentResourceRequest(gpu_ids=[0]),
+            execution={},
+        )
+
+    first = processor.execute(stop_command())
+    repeated = processor.execute(stop_command())
+
+    assert first.response.observed_state == AgentWorkloadState.SUCCEEDED
+    assert repeated.response.observed_state == AgentWorkloadState.SUCCEEDED
+    assert first.response.metadata["progress"] == 25.0
+    assert ("training", job_id) in runner.workloads
+    assert runner.stop_calls == 2
+    assert runner.training_metadata_completed_calls == [True, True]
+
+
+def test_training_stop_returns_absent_after_real_cancellation(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    runner = FakeRunner()
+    job_id = uuid4()
+    runner.workloads[("training", job_id)] = WorkloadInfo(
+        name=f"openllmops-training-{job_id}",
+        workload_id=job_id,
+        kind="training",
+        image="safe-training-image",
+        status="running",
+        gpu_ids=[0],
+        generation=1,
+    )
+    processor = CommandProcessor(settings, runner)  # type: ignore[arg-type]
+
+    result = processor.execute(
+        AgentCommand(
+            action="stop",
+            owner=AgentOwner(type="training", id=job_id, name="sft", generation=1),
+            resources=AgentResourceRequest(gpu_ids=[0]),
+            execution={},
+        )
+    )
+
+    assert result.response.observed_state == AgentWorkloadState.ABSENT
+    assert ("training", job_id) not in runner.workloads
+    assert runner.training_metadata_completed_calls == []
 
 
 def test_evaluation_start_status_and_stop_use_real_runner(tmp_path: Path) -> None:
@@ -346,5 +486,18 @@ def test_evaluation_start_status_and_stop_use_real_runner(tmp_path: Path) -> Non
             execution={},
         )
     )
-    assert stopped.response.observed_state == AgentWorkloadState.ABSENT
+    assert stopped.response.observed_state == AgentWorkloadState.SUCCEEDED
+    assert stopped.response.metadata["result_path"].endswith("pair-report.json")
     assert runner.stop_calls == 1
+
+    repeated = processor.execute(
+        AgentCommand(
+            action="stop",
+            owner=AgentOwner(type="evaluation", id=run_id, name="eval", generation=1),
+            resources=AgentResourceRequest(gpu_ids=[0]),
+            execution={},
+        )
+    )
+    assert repeated.response.observed_state == AgentWorkloadState.SUCCEEDED
+    assert repeated.response.metadata["result_path"].endswith("pair-report.json")
+    assert runner.stop_calls == 2

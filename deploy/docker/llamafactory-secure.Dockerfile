@@ -4,10 +4,18 @@ FROM hiyouga/llamafactory@sha256:b96fd8dde0a5b5f177cf6cff70e782ebe0fc240b17c3b85
 USER root
 ENV PYTHONDONTWRITEBYTECODE=1
 COPY deploy/security/harden_llamafactory.py /usr/local/lib/openllmops/harden_llamafactory.py
+COPY workers/training_config/pyproject.toml /usr/local/src/openllmops-training-config/pyproject.toml
+COPY workers/training_config/src /usr/local/src/openllmops-training-config/src
+COPY workers/training_runtime/pyproject.toml /usr/local/src/openllmops-training-runtime/pyproject.toml
+COPY workers/training_runtime/src /usr/local/src/openllmops-training-runtime/src
 
 # 哈希不匹配、补丁匹配数量变化或仍存在危险字面量时，镜像构建立即失败。
 RUN python /usr/local/lib/openllmops/harden_llamafactory.py apply --root /app \
     && python /usr/local/lib/openllmops/harden_llamafactory.py verify --root /app \
+    && pip install --no-cache-dir --no-deps \
+        /usr/local/src/openllmops-training-config \
+        /usr/local/src/openllmops-training-runtime \
+    && python -c "from openllmops_training_runtime import ProcessSupervisor, validate_full_model_directory" \
     && chmod 0444 /usr/local/share/openllmops/llamafactory-hardening.json
 
 LABEL org.opencontainers.image.title="OpenLLMOps hardened LLaMAFactory runtime" \
@@ -16,7 +24,10 @@ LABEL org.opencontainers.image.title="OpenLLMOps hardened LLaMAFactory runtime" 
       org.opencontainers.image.source="https://github.com/hiyouga/LLaMA-Factory" \
       org.opencontainers.image.base.digest="sha256:b96fd8dde0a5b5f177cf6cff70e782ebe0fc240b17c3b85e95c20b0b98fedc0a" \
       com.openllmops.security.ghsa-mwc7-mf87-v3mf="mitigated" \
-      com.openllmops.security.trust-remote-code="disabled"
+      com.openllmops.security.trust-remote-code="disabled" \
+      com.openllmops.runner="training-wrapper-v1" \
+      com.openllmops.artifacts="safetensors-validated-v1"
 
 # node-agent 还会显式传入同一非 root 身份；这里也提供安全的直接运行默认值。
 USER 1000:1000
+ENTRYPOINT ["openllmops-training-runtime"]

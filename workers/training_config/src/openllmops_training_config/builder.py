@@ -1,11 +1,12 @@
-"""把简化表单转换为不接受任意命令的 LLaMA-Factory 配置。"""
+"""把控制面表单转换为严格白名单的 LLaMA-Factory 配置。"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class TrainingConfigError(ValueError):
@@ -29,33 +30,44 @@ class DatasetFormat(StrEnum):
     MESSAGES = "messages"
 
 
-@dataclass(frozen=True, slots=True)
-class TrainingRequest:
+class TrainingHyperparameters(BaseModel):
+    """控制面可写的完整训练参数集合；任何额外键都必须在边界处失败。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+    template: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$",
+    )
+    num_train_epochs: float = Field(default=3.0, gt=0, le=100)
+    learning_rate: float = Field(default=2e-4, ge=1e-7, le=1)
+    cutoff_len: int = Field(default=2048, ge=128, le=65_536)
+    per_device_train_batch_size: int = Field(default=1, ge=1, le=128)
+    gradient_accumulation_steps: int = Field(default=8, ge=1, le=4096)
+    logging_steps: int = Field(default=10, ge=1, le=100_000)
+    save_steps: int = Field(default=100, ge=1, le=1_000_000)
+    warmup_ratio: float = Field(default=0.03, ge=0, le=1)
+    lora_rank: int = Field(default=16, ge=1, le=1024)
+    lora_alpha: int = Field(default=32, ge=1, le=4096)
+    lora_dropout: float = Field(default=0.05, ge=0, lt=1)
+    freeze_trainable_layers: int = Field(default=2, ge=1, le=256)
+    max_samples: int | None = Field(default=None, ge=1, le=10_000_000)
+    seed: int = Field(default=42, ge=0, le=2_147_483_647)
+
+
+class TrainingRequest(TrainingHyperparameters):
+    """已由节点补齐路径和训练模式的内部请求。"""
+
     stage: Stage
     algorithm: Algorithm
     model_path: Path
     dataset_dir: Path
     output_dir: Path
-    dataset_name: str = "openllmops_dataset"
+    dataset_name: str = Field(default="openllmops_dataset", pattern=r"^[A-Za-z0-9_]{1,64}$")
     dataset_format: DatasetFormat = DatasetFormat.ALPACA
-    template: str | None = None
-    epochs: float = 3.0
-    learning_rate: float = 2e-4
-    cutoff_len: int = 2048
-    per_device_batch_size: int = 1
-    gradient_accumulation_steps: int = 8
-    logging_steps: int = 10
-    save_steps: int = 100
-    warmup_ratio: float = 0.03
-    lora_rank: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    freeze_trainable_layers: int = 2
-    max_samples: int | None = None
-    seed: int = 42
 
 
-def _validate(request: TrainingRequest) -> None:
+def _validate_combination(request: TrainingRequest) -> None:
     if request.stage == Stage.CPT and request.algorithm != Algorithm.LORA:
         raise TrainingConfigError("继续预训练（CPT）仅支持 LoRA")
     if request.stage == Stage.CPT and request.dataset_format != DatasetFormat.CPT_TEXT:
@@ -64,32 +76,12 @@ def _validate(request: TrainingRequest) -> None:
         raise TrainingConfigError("SFT 不能使用 CPT 文本格式")
     if request.stage == Stage.SFT and not request.template:
         raise TrainingConfigError("SFT 必须显式选择与模型匹配的模板")
-    if not request.dataset_name.replace("_", "").isalnum():
-        raise TrainingConfigError("dataset_name 只能包含字母、数字和下划线")
-
-    ranges: tuple[tuple[bool, str], ...] = (
-        (0 < request.epochs <= 100, "epochs 必须位于 0..100"),
-        (1e-7 <= request.learning_rate <= 1.0, "learning_rate 超出安全范围"),
-        (128 <= request.cutoff_len <= 131072, "cutoff_len 超出安全范围"),
-        (1 <= request.per_device_batch_size <= 512, "单卡 batch size 超出安全范围"),
-        (1 <= request.gradient_accumulation_steps <= 4096, "梯度累积步数超出安全范围"),
-        (1 <= request.logging_steps <= 100000, "logging_steps 超出安全范围"),
-        (1 <= request.save_steps <= 1000000, "save_steps 超出安全范围"),
-        (0 <= request.warmup_ratio <= 1, "warmup_ratio 必须位于 0..1"),
-        (1 <= request.lora_rank <= 1024, "LoRA rank 超出安全范围"),
-        (1 <= request.lora_alpha <= 4096, "LoRA alpha 超出安全范围"),
-        (0 <= request.lora_dropout < 1, "LoRA dropout 必须位于 0..1"),
-        (0 <= request.freeze_trainable_layers <= 256, "Freeze 层数超出安全范围"),
-    )
-    for valid, message in ranges:
-        if not valid:
-            raise TrainingConfigError(message)
 
 
 def build_training_config(request: TrainingRequest) -> dict[str, Any]:
-    """返回可序列化配置；调用方可用 JSON 写入 `.yaml`（YAML 兼容 JSON）。"""
+    """返回节点生成的固定配置；调用方不能注入额外 YAML 字段。"""
 
-    _validate(request)
+    _validate_combination(request)
     config: dict[str, Any] = {
         "stage": "pt" if request.stage == Stage.CPT else "sft",
         "do_train": True,
@@ -100,15 +92,13 @@ def build_training_config(request: TrainingRequest) -> dict[str, Any]:
         "overwrite_cache": False,
         "overwrite_output_dir": False,
         "trust_remote_code": False,
-        "finetuning_type": (
-            "freeze" if request.algorithm == Algorithm.FREEZE else "lora"
-        ),
+        "finetuning_type": "freeze" if request.algorithm == Algorithm.FREEZE else "lora",
         "cutoff_len": request.cutoff_len,
         "preprocessing_num_workers": 8,
-        "per_device_train_batch_size": request.per_device_batch_size,
+        "per_device_train_batch_size": request.per_device_train_batch_size,
         "gradient_accumulation_steps": request.gradient_accumulation_steps,
         "learning_rate": request.learning_rate,
-        "num_train_epochs": request.epochs,
+        "num_train_epochs": request.num_train_epochs,
         "lr_scheduler_type": "cosine",
         "warmup_ratio": request.warmup_ratio,
         "bf16": True,
@@ -116,13 +106,14 @@ def build_training_config(request: TrainingRequest) -> dict[str, Any]:
         "logging_steps": request.logging_steps,
         "save_steps": request.save_steps,
         "save_total_limit": 5,
+        # 明确禁用 Transformers 的 pickle 权重回退；wrapper 仍会在成功后递归
+        # 清理优化器等 Trainer 状态，控制面只上报 Safetensors 产物。
+        "save_safetensors": True,
         "plot_loss": True,
         "report_to": "none",
         "seed": request.seed,
     }
     if request.max_samples is not None:
-        if not 1 <= request.max_samples <= 1_000_000_000:
-            raise TrainingConfigError("max_samples 超出安全范围")
         config["max_samples"] = request.max_samples
     if request.stage == Stage.SFT:
         config["template"] = request.template
@@ -153,7 +144,7 @@ def build_dataset_info(
     dataset_format: DatasetFormat,
     dataset_name: str = "openllmops_dataset",
 ) -> dict[str, Any]:
-    """生成每个不可变数据集目录内的 `dataset_info.json`。"""
+    """生成每个不可变数据集目录内的 ``dataset_info.json``。"""
 
     if Path(file_name).name != file_name or not file_name.endswith(".jsonl"):
         raise TrainingConfigError("数据文件名必须是当前目录中的 .jsonl 文件")

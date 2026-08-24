@@ -8,10 +8,14 @@ HARDENED_LLAMAFACTORY_IMAGE = "openllmops/llamafactory-secure:0.9.6.dev0-c4e09c7
 HARDENED_UPSTREAM_REVISION = "c4e09c7cbe18844816af9e18a97fe465515edbcd"
 GHSA_LABEL = "com.openllmops.security.ghsa-mwc7-mf87-v3mf"
 REMOTE_CODE_LABEL = "com.openllmops.security.trust-remote-code"
+TRAINING_RUNNER_LABEL = "com.openllmops.runner"
+TRAINING_ARTIFACT_LABEL = "com.openllmops.artifacts"
 EXPECTED_SECURITY_LABELS = {
     GHSA_LABEL: "mitigated",
     REMOTE_CODE_LABEL: "disabled",
     "org.opencontainers.image.revision": HARDENED_UPSTREAM_REVISION,
+    TRAINING_RUNNER_LABEL: "training-wrapper-v1",
+    TRAINING_ARTIFACT_LABEL: "safetensors-validated-v1",
 }
 
 _DIGEST_REFERENCE = re.compile(r"^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$")

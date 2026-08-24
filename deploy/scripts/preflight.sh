@@ -7,6 +7,9 @@ project_root=$(dirname -- "$deploy_dir")
 env_file=${1:-"$deploy_dir/.env"}
 compose_file="$deploy_dir/compose.yaml"
 
+# 与测试共用同一份 POSIX sh 镜像引用策略，防止静态断言和生产逻辑漂移。
+. "$script_dir/image-reference-policy.sh"
+
 if [ ! -f "$env_file" ]; then
     echo "环境文件不存在：$env_file" >&2
     exit 1
@@ -44,6 +47,9 @@ read_env_value() {
     key=$1
     sed -n "s/^${key}=//p" "$env_file" | tail -n 1
 }
+
+environment=$(read_env_value ENVIRONMENT)
+environment=${environment:-production}
 
 control_subnet=$(read_env_value CONTROL_SUBNET)
 control_subnet=${control_subnet:-172.30.10.0/24}
@@ -94,8 +100,12 @@ while [ -n "$remaining_images" ]; do
     advisory_label=$(docker image inspect --format '{{ index .Config.Labels "com.openllmops.security.ghsa-mwc7-mf87-v3mf" }}' "$training_image")
     remote_code_label=$(docker image inspect --format '{{ index .Config.Labels "com.openllmops.security.trust-remote-code" }}' "$training_image")
     revision_label=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$training_image")
+    runner_label=$(docker image inspect --format '{{ index .Config.Labels "com.openllmops.runner" }}' "$training_image")
+    artifact_label=$(docker image inspect --format '{{ index .Config.Labels "com.openllmops.artifacts" }}' "$training_image")
     if [ "$advisory_label" != "mitigated" ] || [ "$remote_code_label" != "disabled" ] || \
-        [ "$revision_label" != "c4e09c7cbe18844816af9e18a97fe465515edbcd" ]; then
+        [ "$revision_label" != "c4e09c7cbe18844816af9e18a97fe465515edbcd" ] || \
+        [ "$runner_label" != "training-wrapper-v1" ] || \
+        [ "$artifact_label" != "safetensors-validated-v1" ]; then
         echo "训练镜像缺少可信安全标签，拒绝启动：$training_image" >&2
         exit 1
     fi
@@ -122,6 +132,7 @@ while [ -n "$remaining_images" ]; do
         echo "请由管理员先按固定版本或 digest 拉取，任务不会隐式拉取镜像" >&2
         exit 1
     fi
+    require_production_digest "$environment" "VLLM_ALLOWED_IMAGES" "$vllm_image"
 done
 
 # 评测镜像除引用白名单外，还要核对构建标签，防止同名镜像替换执行器。
@@ -144,6 +155,7 @@ while [ -n "$remaining_images" ]; do
         echo "评测镜像尚未构建或拉取：$evaluation_image" >&2
         exit 1
     fi
+    require_production_digest "$environment" "EVALUATION_ALLOWED_IMAGES" "$evaluation_image"
     runner_label=$(docker image inspect --format '{{ index .Config.Labels "com.openllmops.runner" }}' "$evaluation_image")
     remote_code_label=$(docker image inspect --format '{{ index .Config.Labels "com.openllmops.security.trust-remote-code" }}' "$evaluation_image")
     base_label=$(docker image inspect --format '{{ index .Config.Labels "com.openllmops.base.vllm" }}' "$evaluation_image")
@@ -198,13 +210,7 @@ if [ "$app_uid:$app_gid" != "$workload_uid:$workload_gid" ]; then
     exit 1
 fi
 
-for child in models inbox model-staging datasets evaluation-datasets evaluation-output checkpoints training-configs runtime; do
-    target="$storage_root/$child"
-    if [ ! -d "$target" ] || [ ! -w "$target" ]; then
-        echo "受控目录不存在或当前用户不可写：$target" >&2
-        exit 1
-    fi
-done
+python3 "$script_dir/check-storage-permissions.py" "$storage_root" "$app_uid" "$app_gid"
 
 models_device=$(stat -c '%d' "$storage_root/models")
 staging_device=$(stat -c '%d' "$storage_root/model-staging")

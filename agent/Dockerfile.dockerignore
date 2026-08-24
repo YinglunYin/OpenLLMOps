@@ -1,0 +1,14 @@
+**
+!agent/
+!agent/pyproject.toml
+!agent/openllmops_agent/
+!agent/openllmops_agent/**
+!workers/
+!workers/training_config/
+!workers/training_config/pyproject.toml
+!workers/training_config/src/
+!workers/training_config/src/**
+!workers/training_runtime/
+!workers/training_runtime/pyproject.toml
+!workers/training_runtime/src/
+!workers/training_runtime/src/**

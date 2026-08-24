@@ -355,6 +355,8 @@ dependencies = [
     { name = "docker" },
     { name = "fastapi" },
     { name = "nvidia-ml-py" },
+    { name = "openllmops-training-config" },
+    { name = "openllmops-training-runtime" },
     { name = "prometheus-client" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
@@ -373,6 +375,8 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.28,<1" },
     { name = "nvidia-ml-py", specifier = ">=12,<14" },
+    { name = "openllmops-training-config", directory = "../workers/training_config" },
+    { name = "openllmops-training-runtime", directory = "../workers/training_runtime" },
     { name = "prometheus-client", specifier = ">=0.21,<1" },
     { name = "pydantic-settings", specifier = ">=2.7,<3" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.3,<9" },
@@ -380,6 +384,38 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
 ]
 provides-extras = ["test"]
+
+[[package]]
+name = "openllmops-training-config"
+version = "0.1.0"
+source = { directory = "../workers/training_config" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pydantic", specifier = ">=2.10,<3" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3,<10" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9,<1" },
+]
+provides-extras = ["dev"]
+
+[[package]]
+name = "openllmops-training-runtime"
+version = "0.1.0"
+source = { directory = "../workers/training_runtime" }
+dependencies = [
+    { name = "openllmops-training-config" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "openllmops-training-config", directory = "../workers/training_config" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3,<10" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9,<1" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "packaging"

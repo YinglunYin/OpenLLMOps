@@ -127,8 +127,8 @@ services:
 
   node-agent:
     build:
-      context: ../agent
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: agent/Dockerfile
     image: ${NODE_AGENT_IMAGE:-openllmops/node-agent:local}
     restart: unless-stopped
     user: "${APP_UID:-1000}:${APP_GID:-1000}"

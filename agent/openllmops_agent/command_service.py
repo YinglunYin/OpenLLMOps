@@ -4,14 +4,33 @@ import hashlib
 import json
 import os
 import threading
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-import yaml
+from openllmops_training_config import (
+    Algorithm as TrainingAlgorithm,
+)
+from openllmops_training_config import (
+    DatasetFormat,
+    TrainingConfigError,
+    TrainingHyperparameters,
+    build_training_config,
+)
+from openllmops_training_config import (
+    Stage as TrainingStage,
+)
+from openllmops_training_config import (
+    TrainingRequest as SafeTrainingRequest,
+)
+from openllmops_training_runtime import (
+    WORKSPACE_DATA_FILE,
+    WORKSPACE_DATASET,
+    WORKSPACE_MODEL,
+    WORKSPACE_OUTPUT,
+)
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .agent_contract import (
@@ -32,6 +51,7 @@ from .evaluation_runtime import (
     DatasetSource,
     EvaluationInputError,
     prepare_evaluation_workspace,
+    strict_existing_path,
 )
 from .schemas import (
     EvaluationLaunchRequest,
@@ -41,19 +61,8 @@ from .schemas import (
 )
 
 MAX_CACHED_REQUESTS = 2048
+MAX_TRAINING_JSONL_LINE_BYTES = 16 * 1024 * 1024
 STATE_VERSION = 1
-PROTECTED_TRAINING_KEYS = frozenset(
-    {
-        "dataset",
-        "dataset_dir",
-        "finetuning_type",
-        "model_name_or_path",
-        "output_dir",
-        "quantization_bit",
-        "stage",
-        "trust_remote_code",
-    }
-)
 
 
 class ExecutionModel(BaseModel):
@@ -77,7 +86,7 @@ class LLaMAFactoryExecution(ExecutionModel):
     dataset_path: Path
     stage: Literal["cpt", "sft"]
     algorithm: Literal["freeze", "lora", "qlora"]
-    training_config: dict[str, Any] = Field(default_factory=dict)
+    training_config: TrainingHyperparameters = Field(default_factory=TrainingHyperparameters)
     output_dir: Path
 
 
@@ -367,7 +376,7 @@ class CommandProcessor:
             )
         elif command.owner.type == "training":
             execution = LLaMAFactoryExecution.model_validate(command.execution)
-            config_path, dataset_dir = self._materialize_training_files(command, execution)
+            config_path, dataset_dir, dataset_format = self._materialize_training_files(command, execution)
             info = self.runner.launch_training(
                 TrainingLaunchRequest(
                     job_id=command.owner.id,
@@ -379,6 +388,9 @@ class CommandProcessor:
                     dataset_dir=dataset_dir,
                     config_path=config_path,
                     output_path=execution.output_dir,
+                    stage=execution.stage,
+                    algorithm=execution.algorithm,
+                    dataset_format=dataset_format.value,
                 )
             )
         else:
@@ -420,12 +432,16 @@ class CommandProcessor:
         return self._response_from_info(command, info, accepted=True)
 
     def _stop(self, command: AgentCommand) -> CommandResult:
-        with suppress(WorkloadNotFound):
-            self.runner.stop_contract_workload(
+        try:
+            info = self.runner.stop_contract_workload(
                 command.owner.type,
                 command.owner.id,
                 command.owner.generation,
             )
+        except WorkloadNotFound:
+            return self._accepted_absent(command.request_id)
+        if info is not None:
+            return self._response_from_info(command, info, accepted=True)
         return self._accepted_absent(command.request_id)
 
     def _observe(self, command: AgentCommand, *, accepted: bool) -> CommandResult:
@@ -450,7 +466,10 @@ class CommandProcessor:
             }
             metadata = {key: value for key, value in metadata.items() if value is not None}
         elif command.owner.type == "training":
-            metadata = self.runner.training_metadata(command.owner.id)
+            metadata = self.runner.training_metadata(
+                command.owner.id,
+                completed=state == AgentWorkloadState.SUCCEEDED,
+            )
         elif command.owner.type == "evaluation" and state == AgentWorkloadState.SUCCEEDED:
             metadata = self.runner.evaluation_metadata(command.owner.id)
         message = None
@@ -492,13 +511,21 @@ class CommandProcessor:
 
     def _materialize_training_files(
         self, command: AgentCommand, execution: LLaMAFactoryExecution
-    ) -> tuple[Path, Path]:
-        overlap = PROTECTED_TRAINING_KEYS & execution.training_config.keys()
-        if overlap:
-            raise InvalidWorkload(f"训练参数不能覆盖系统字段：{', '.join(sorted(overlap))}")
-        if len(execution.training_config) > 256:
-            raise InvalidWorkload("训练参数数量超过节点安全上限")
-        dataset_path = self._resolve_existing_file(execution.dataset_path, self.settings.dataset_root)
+    ) -> tuple[Path, Path, DatasetFormat]:
+        expected_output = self.settings.checkpoint_root.resolve(strict=True) / str(command.owner.id)
+        if (
+            not execution.output_dir.is_absolute()
+            or Path(os.path.abspath(execution.output_dir)) != expected_output
+        ):
+            raise InvalidWorkload(f"训练输出目录必须由系统派生为：{expected_output}")
+        try:
+            dataset_path, _ = strict_existing_path(
+                execution.dataset_path,
+                (self.settings.dataset_root,),
+                directory=False,
+            )
+        except EvaluationInputError as exc:
+            raise InvalidWorkload(str(exc).replace("评测", "训练")) from exc
         dataset_name = "openllmops_dataset"
         dataset_dir = (
             self.settings.runtime_root
@@ -509,43 +536,77 @@ class CommandProcessor:
             / "dataset"
         )
         dataset_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        dataset_info = self._dataset_info(dataset_path, execution.stage)
+        dataset_info, dataset_format = self._dataset_info(dataset_path, execution.stage)
         self._write_atomic_json(dataset_dir / "dataset_info.json", {dataset_name: dataset_info})
 
-        finetuning_type = "lora" if execution.algorithm == "qlora" else execution.algorithm
-        config: dict[str, Any] = {
-            **execution.training_config,
-            "model_name_or_path": str(execution.model_path),
-            "dataset": dataset_name,
-            "dataset_dir": str(dataset_dir),
-            "output_dir": str(execution.output_dir),
-            "stage": "pt" if execution.stage == "cpt" else "sft",
-            "finetuning_type": finetuning_type,
-            "trust_remote_code": False,
-        }
-        if execution.algorithm == "qlora":
-            config["quantization_bit"] = 4
+        try:
+            config = build_training_config(
+                SafeTrainingRequest(
+                    stage=TrainingStage(execution.stage),
+                    algorithm=TrainingAlgorithm(execution.algorithm),
+                    model_path=WORKSPACE_MODEL,
+                    dataset_dir=WORKSPACE_DATASET,
+                    output_dir=WORKSPACE_OUTPUT,
+                    dataset_name=dataset_name,
+                    dataset_format=dataset_format,
+                    **execution.training_config.model_dump(),
+                )
+            )
+        except (TrainingConfigError, ValueError) as exc:
+            raise InvalidWorkload(str(exc)) from exc
         config_dir = self.settings.training_config_root / str(command.owner.id)
         config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        config_path = config_dir / f"generation-{command.owner.generation}.yaml"
-        self._write_atomic_text(config_path, yaml.safe_dump(config, sort_keys=True))
-        return config_path, dataset_dir
+        config_path = config_dir / f"generation-{command.owner.generation}.json"
+        self._write_atomic_json(config_path, config)
+        return config_path, dataset_dir, dataset_format
 
     @staticmethod
-    def _dataset_info(dataset_path: Path, stage: str) -> dict[str, Any]:
+    def _dataset_info(dataset_path: Path, stage: str) -> tuple[dict[str, Any], DatasetFormat]:
+        def reject_constant(value: str) -> None:
+            raise ValueError(f"非有限数值：{value}")
+
+        def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"重复字段：{key}")
+                result[key] = value
+            return result
+
         try:
-            with dataset_path.open("r", encoding="utf-8") as source:
-                first_record = next((json.loads(line) for line in source if line.strip()), None)
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            with dataset_path.open("rb") as source:
+                first_line: bytes | None = None
+                while True:
+                    raw = source.readline(MAX_TRAINING_JSONL_LINE_BYTES + 1)
+                    if not raw:
+                        break
+                    if len(raw) > MAX_TRAINING_JSONL_LINE_BYTES:
+                        raise InvalidWorkload("训练数据集单行超过 16 MiB 安全上限")
+                    if raw.strip():
+                        first_line = raw
+                        break
+            first_record = (
+                json.loads(
+                    first_line.decode("utf-8"),
+                    parse_constant=reject_constant,
+                    object_pairs_hook=unique_object,
+                )
+                if first_line is not None
+                else None
+            )
+        except InvalidWorkload:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
             raise InvalidWorkload(f"无法解析训练数据集首条记录：{exc}") from exc
         if not isinstance(first_record, dict):
             raise InvalidWorkload("训练数据集没有可识别的 JSON 对象记录")
-        info: dict[str, Any] = {"file_name": str(dataset_path)}
+        info: dict[str, Any] = {"file_name": str(WORKSPACE_DATA_FILE)}
         if stage == "cpt":
             prompt = "text" if isinstance(first_record.get("text"), str) else "content"
             if not isinstance(first_record.get(prompt), str):
                 raise InvalidWorkload("CPT 数据集缺少 text/content 字段")
             info["columns"] = {"prompt": prompt}
+            dataset_format = DatasetFormat.CPT_TEXT
         elif isinstance(first_record.get("messages"), list):
             info.update(
                 {
@@ -560,6 +621,7 @@ class CommandProcessor:
                     },
                 }
             )
+            dataset_format = DatasetFormat.MESSAGES
         elif isinstance(first_record.get("conversations"), list):
             info.update(
                 {
@@ -567,6 +629,7 @@ class CommandProcessor:
                     "columns": {"messages": "conversations"},
                 }
             )
+            dataset_format = DatasetFormat.MESSAGES
         elif isinstance(first_record.get("instruction"), str) and isinstance(first_record.get("output"), str):
             columns = {
                 "prompt": "instruction",
@@ -577,21 +640,10 @@ class CommandProcessor:
             if isinstance(first_record.get("input"), str):
                 columns["query"] = "input"
             info["columns"] = columns
+            dataset_format = DatasetFormat.ALPACA
         else:
             raise InvalidWorkload("SFT 数据集字段无法映射到 LLaMAFactory")
-        return info
-
-    @staticmethod
-    def _resolve_existing_file(candidate: Path, root: Path) -> Path:
-        try:
-            root_real = root.resolve(strict=True)
-            candidate_real = candidate.resolve(strict=True)
-            candidate_real.relative_to(root_real)
-        except (FileNotFoundError, RuntimeError, ValueError) as exc:
-            raise InvalidWorkload(f"数据集路径不存在或越出受控目录：{candidate}") from exc
-        if not candidate_real.is_file():
-            raise InvalidWorkload("合同训练任务的数据集必须是 JSONL 文件")
-        return candidate_real
+        return info, dataset_format
 
     @staticmethod
     def _write_atomic_json(path: Path, value: dict[str, Any]) -> None:

@@ -1,8 +1,23 @@
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from openllmops_training_config import (
+    Algorithm,
+    DatasetFormat,
+    Stage,
+    TrainingRequest,
+    build_training_config,
+)
+from openllmops_training_runtime import (
+    WORKSPACE_CONFIG,
+    WORKSPACE_DATA_FILE,
+    WORKSPACE_DATASET,
+    WORKSPACE_MODEL,
+    WORKSPACE_OUTPUT,
+)
 
 from openllmops_agent.config import Settings
 from openllmops_agent.docker_runner import (
@@ -11,6 +26,7 @@ from openllmops_agent.docker_runner import (
     ID_LABEL,
     KIND_LABEL,
     MANAGED_LABEL,
+    TRAINING_ALGORITHM_LABEL,
     DockerRunner,
     InvalidWorkload,
 )
@@ -19,6 +35,7 @@ from openllmops_agent.image_policy import EXPECTED_SECURITY_LABELS
 from openllmops_agent.schemas import (
     EvaluationLaunchRequest,
     InferenceLaunchRequest,
+    TrainingLaunchRequest,
     WorkloadInfo,
 )
 
@@ -171,28 +188,81 @@ def test_vllm_resource_amplification_arguments_are_bounded(
         runner._vllm_command(request, [0])
 
 
-def test_cpt_rejects_freeze(runner: DockerRunner, tmp_path: Path) -> None:
+def test_training_uses_fixed_wrapper_paths_offline_network_and_world_size(
+    runner: DockerRunner,
+) -> None:
+    job_id = uuid4()
     model_path = runner.settings.model_root / "demo"
-    dataset_path = runner.settings.dataset_root / "cpt"
-    output_path = runner.settings.checkpoint_root / "job"
-    for path in (model_path, dataset_path, output_path):
-        path.mkdir(parents=True)
-    config_path = runner.settings.training_config_root / "job.yaml"
+    model_path.mkdir()
+    dataset_path = runner.settings.dataset_root / "sft.jsonl"
+    dataset_path.write_text('{"instruction":"hi","output":"hello"}\n', encoding="utf-8")
+    dataset_dir = runner.settings.runtime_root / "contract" / "training" / str(job_id) / "1"
+    dataset_dir.mkdir(parents=True)
+    (dataset_dir / "dataset_info.json").write_text("{}", encoding="utf-8")
+    output_path = runner.settings.checkpoint_root / str(job_id)
+    config_path = runner.settings.training_config_root / f"{job_id}.json"
     config_path.write_text(
-        "\n".join(
-            (
-                "stage: pt",
-                "finetuning_type: freeze",
-                f"model_name_or_path: {model_path}",
-                f"dataset_dir: {dataset_path}",
-                f"output_dir: {output_path}",
+        json.dumps(
+            build_training_config(
+                TrainingRequest(
+                    stage=Stage.SFT,
+                    algorithm=Algorithm.LORA,
+                    model_path=WORKSPACE_MODEL,
+                    dataset_dir=WORKSPACE_DATASET,
+                    output_dir=WORKSPACE_OUTPUT,
+                    dataset_format=DatasetFormat.ALPACA,
+                    template="qwen",
+                )
             )
         ),
         encoding="utf-8",
     )
+    image = MagicMock()
+    image.labels = EXPECTED_SECURITY_LABELS
+    image.id = "sha256:" + "c" * 64
+    runner.client.images.get.return_value = image
+    runner.client.containers.run.return_value = MagicMock()
+    expected = WorkloadInfo(
+        name=f"openllmops-training-{job_id}",
+        workload_id=job_id,
+        kind="training",
+        image=image.id,
+        status="running",
+        gpu_ids=[0, 1],
+    )
+    request = TrainingLaunchRequest(
+        job_id=job_id,
+        image=runner.settings.llamafactory_runtime_image,
+        gpu_ids=[0, 1],
+        model_path=model_path,
+        dataset_path=dataset_path,
+        dataset_dir=dataset_dir,
+        config_path=config_path,
+        output_path=output_path,
+        stage="sft",
+        algorithm="lora",
+        dataset_format="alpaca",
+    )
 
-    with pytest.raises(InvalidWorkload, match="继续预训练固定使用 LoRA"):
-        runner._validate_training_config(config_path, model_path, dataset_path, output_path)
+    with (
+        patch.object(runner, "_assert_name_available"),
+        patch.object(runner, "_assert_gpus_available"),
+        patch.object(runner, "_to_info", return_value=expected),
+    ):
+        assert runner.launch_training(request) == expected
+
+    arguments = runner.client.containers.run.call_args.kwargs
+    assert arguments["command"][0] == "run"
+    assert arguments["command"][arguments["command"].index("--config") + 1] == str(WORKSPACE_CONFIG)
+    assert arguments["volumes"][str(model_path)]["bind"] == str(WORKSPACE_MODEL)
+    assert arguments["volumes"][str(dataset_path)]["bind"] == str(WORKSPACE_DATA_FILE)
+    assert arguments["volumes"][str(dataset_dir)]["bind"] == str(WORKSPACE_DATASET)
+    assert arguments["volumes"][str(output_path)]["bind"] == str(WORKSPACE_OUTPUT)
+    assert arguments["environment"]["FORCE_TORCHRUN"] == "1"
+    assert arguments["environment"]["NPROC_PER_NODE"] == "2"
+    assert arguments["environment"]["NCCL_P2P_DISABLE"] == "1"
+    assert arguments["network_mode"] == "none"
+    assert arguments["labels"][TRAINING_ALGORITHM_LABEL] == "lora"
 
 
 def test_training_image_is_resolved_to_verified_immutable_id(
@@ -222,6 +292,121 @@ def test_training_image_rejects_forged_security_labels(runner: DockerRunner) -> 
 
     with pytest.raises(InvalidWorkload, match="安全构建标签"):
         runner._verified_training_image_id("registry/secure@sha256:" + "d" * 64)
+
+
+def _full_training_model(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "config.json").write_text('{"model_type":"qwen2"}', encoding="utf-8")
+    (root / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (root / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (root / "model.safetensors").write_bytes(b"safe")
+
+
+def _training_container(runner: DockerRunner, job_id, output: Path, algorithm: str) -> MagicMock:
+    container = MagicMock()
+    container.name = f"openllmops-training-{job_id}"
+    container.labels = {
+        MANAGED_LABEL: "true",
+        ID_LABEL: str(job_id),
+        KIND_LABEL: "training",
+        GPU_LABEL: "0",
+        GENERATION_LABEL: "1",
+        "com.openllmops.output-path": str(output),
+        TRAINING_ALGORITHM_LABEL: algorithm,
+    }
+    runner.client.containers.get.return_value = container
+    return container
+
+
+def test_completed_freeze_reports_validated_output_as_deployable_path(
+    runner: DockerRunner,
+) -> None:
+    job_id = uuid4()
+    output = runner.settings.checkpoint_root / str(job_id)
+    _full_training_model(output)
+    _training_container(runner, job_id, output, "freeze")
+
+    metadata = runner.training_metadata(job_id, completed=True)
+
+    assert metadata["merged_model_path"] == str(output.resolve())
+    assert "adapter_path" not in metadata
+
+
+def test_completed_lora_requires_adapter_and_merged_safetensors(
+    runner: DockerRunner,
+) -> None:
+    job_id = uuid4()
+    output = runner.settings.checkpoint_root / str(job_id)
+    output.mkdir()
+    (output / "adapter_config.json").write_text('{"peft_type":"LORA"}', encoding="utf-8")
+    (output / "adapter_model.safetensors").write_bytes(b"safe adapter")
+    _full_training_model(output / "merged")
+    _training_container(runner, job_id, output, "lora")
+
+    metadata = runner.training_metadata(job_id, completed=True)
+
+    assert metadata["adapter_path"] == str(output.resolve())
+    assert metadata["merged_model_path"] == str((output / "merged").resolve())
+
+    (output / "merged" / "model.safetensors").unlink()
+    with pytest.raises(InvalidWorkload, match="产物校验失败"):
+        runner.training_metadata(job_id, completed=True)
+
+
+def test_transient_trainer_state_is_ignored_while_running_but_strict_on_success(
+    runner: DockerRunner,
+) -> None:
+    job_id = uuid4()
+    output = runner.settings.checkpoint_root / str(job_id)
+    output.mkdir()
+    (output / "trainer_state.json").write_text('{"global_step":', encoding="utf-8")
+    _training_container(runner, job_id, output, "lora")
+
+    assert runner.training_metadata(job_id, completed=False) == {}
+    with pytest.raises(InvalidWorkload, match="训练状态"):
+        runner.training_metadata(job_id, completed=True)
+
+
+def test_running_progress_falls_back_to_latest_numeric_checkpoint(
+    runner: DockerRunner,
+) -> None:
+    job_id = uuid4()
+    output = runner.settings.checkpoint_root / str(job_id)
+    checkpoint = output / "checkpoint-20"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps(
+            {
+                "global_step": 20,
+                "max_steps": 40,
+                "log_history": [{"loss": 1.25, "step": 20}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _training_container(runner, job_id, output, "lora")
+
+    metadata = runner.training_metadata(job_id, completed=False)
+
+    assert metadata["current_step"] == 20
+    assert metadata["total_steps"] == 40
+    assert metadata["progress"] == 50.0
+    assert metadata["metrics"]["loss"] == 1.25
+    assert "checkpoint_path" not in metadata
+
+
+def test_failed_or_running_training_never_reports_partial_artifact_paths(
+    runner: DockerRunner,
+) -> None:
+    job_id = uuid4()
+    output = runner.settings.checkpoint_root / str(job_id)
+    output.mkdir()
+    (output / "adapter_config.json").write_text('{"peft_type":"LORA"}', encoding="utf-8")
+    (output / "adapter_model.safetensors").write_bytes(b"safe adapter")
+    _full_training_model(output / "merged")
+    _training_container(runner, job_id, output, "lora")
+
+    assert runner.training_metadata(job_id, completed=False) == {}
 
 
 def test_evaluation_launch_uses_verified_image_fixed_command_and_no_network(
@@ -318,3 +503,111 @@ def test_stop_reloads_once_before_and_once_after_transition(runner: DockerRunner
     assert info.status == "exited"
     assert container.reload.call_count == 2
     container.stop.assert_called_once_with(timeout=30)
+
+
+def _contract_terminal_container(
+    runner: DockerRunner,
+    workload_id,
+    *,
+    kind: str = "training",
+    status: str,
+    exit_code: int,
+) -> MagicMock:
+    container = MagicMock()
+    container.name = f"openllmops-{kind}-{workload_id}"
+    container.status = status
+    container.labels = {
+        MANAGED_LABEL: "true",
+        ID_LABEL: str(workload_id),
+        KIND_LABEL: kind,
+        GPU_LABEL: "0",
+        GENERATION_LABEL: "1",
+    }
+    container.attrs = {"State": {"ExitCode": exit_code}}
+    container.image.tags = [runner.settings.llamafactory_runtime_image]
+    runner.client.containers.get.return_value = container
+    return container
+
+
+def test_contract_stop_preserves_preexisting_success_and_repeated_stop(
+    runner: DockerRunner,
+) -> None:
+    workload_id = uuid4()
+    container = _contract_terminal_container(
+        runner,
+        workload_id,
+        status="exited",
+        exit_code=0,
+    )
+
+    first = runner.stop_contract_workload("training", workload_id, generation=1)
+    repeated = runner.stop_contract_workload("training", workload_id, generation=1)
+
+    assert first is not None and first.status == "exited" and first.exit_code == 0
+    assert repeated is not None and repeated.status == "exited" and repeated.exit_code == 0
+    container.stop.assert_not_called()
+    container.remove.assert_not_called()
+
+
+def test_contract_stop_removes_active_training_that_exits_nonzero(
+    runner: DockerRunner,
+) -> None:
+    workload_id = uuid4()
+    container = _contract_terminal_container(
+        runner,
+        workload_id,
+        status="running",
+        exit_code=0,
+    )
+
+    def cancelled(*, timeout: int) -> None:
+        assert timeout == 30
+        container.status = "exited"
+        container.attrs = {"State": {"ExitCode": 143}}
+
+    container.stop.side_effect = cancelled
+
+    assert runner.stop_contract_workload("training", workload_id, generation=1) is None
+    container.remove.assert_called_once_with(force=False, v=True)
+
+
+def test_contract_stop_window_preserves_training_that_naturally_exits_zero(
+    runner: DockerRunner,
+) -> None:
+    workload_id = uuid4()
+    container = _contract_terminal_container(
+        runner,
+        workload_id,
+        status="running",
+        exit_code=0,
+    )
+
+    def naturally_completed(*, timeout: int) -> None:
+        assert timeout == 30
+        container.status = "exited"
+        container.attrs = {"State": {"ExitCode": 0}}
+
+    container.stop.side_effect = naturally_completed
+
+    info = runner.stop_contract_workload("training", workload_id, generation=1)
+
+    assert info is not None and info.status == "exited" and info.exit_code == 0
+    container.remove.assert_not_called()
+
+
+def test_contract_stop_preserves_successful_evaluation_container(
+    runner: DockerRunner,
+) -> None:
+    workload_id = uuid4()
+    container = _contract_terminal_container(
+        runner,
+        workload_id,
+        kind="evaluation",
+        status="exited",
+        exit_code=0,
+    )
+
+    info = runner.stop_contract_workload("evaluation", workload_id, generation=1)
+
+    assert info is not None and info.status == "exited" and info.exit_code == 0
+    container.remove.assert_not_called()
