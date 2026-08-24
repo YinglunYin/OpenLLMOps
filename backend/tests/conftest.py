@@ -15,6 +15,7 @@ for directory in (
     TEST_ROOT / "datasets",
     TEST_ROOT / "evaluation-datasets",
     TEST_ROOT / "evaluation-output",
+    TEST_ROOT / "checkpoints",
     TEST_ROOT / "runtime",
 ):
     directory.mkdir(parents=True, exist_ok=True)

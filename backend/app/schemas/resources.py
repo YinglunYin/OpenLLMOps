@@ -27,6 +27,7 @@ from app.schemas.evaluation import (
     EvaluationMetrics,
     EvaluationWarning,
 )
+from app.schemas.training import TrainingParameters
 
 
 class ModelAssetCreate(BaseModel):
@@ -203,19 +204,22 @@ class DeploymentRead(TimestampedModel):
 
 
 class TrainingJobCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=128)
     model_asset_id: uuid.UUID
     dataset_id: uuid.UUID
     stage: TrainingStage
     algorithm: TrainingAlgorithm
-    gpu_ids: list[int] = Field(default_factory=lambda: [0], min_length=1)
-    training_config: dict[str, Any] = Field(default_factory=dict)
-    output_dir: str = Field(min_length=1, max_length=1024)
+    gpu_ids: list[int] = Field(default_factory=lambda: [0], min_length=1, max_length=16)
+    training_config: TrainingParameters = Field(default_factory=TrainingParameters)
 
     @model_validator(mode="after")
     def validate_training_mode(self) -> "TrainingJobCreate":
         if self.stage == TrainingStage.CPT and self.algorithm != TrainingAlgorithm.LORA:
             raise ValueError("继续预训练（CPT）首版仅支持 LoRA")
+        if self.stage == TrainingStage.SFT and self.training_config.template is None:
+            raise ValueError("SFT 训练必须指定受支持的 template")
         if len(self.gpu_ids) != len(set(self.gpu_ids)) or min(self.gpu_ids) < 0:
             raise ValueError("GPU 编号必须是互不重复的非负整数")
         return self
@@ -234,11 +238,12 @@ class TrainingJobRead(TimestampedModel):
     current_step: int | None
     total_steps: int | None
     metrics: dict[str, Any]
-    training_config: dict[str, Any]
+    training_config: TrainingParameters
     output_dir: str
     checkpoint_path: str | None
     adapter_path: str | None
     merged_model_path: str | None
+    published_model_asset_id: uuid.UUID | None
     error_message: str | None
     queued_at: datetime | None
     state_version: int

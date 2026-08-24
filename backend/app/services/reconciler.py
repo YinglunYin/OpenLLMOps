@@ -35,6 +35,12 @@ from app.services.evaluation_control import (
 )
 from app.services.gpu_scheduler import GPULeaseManager, LeaseOwner
 from app.services.node_agent import NodeAgentError
+from app.services.training_control import (
+    TrainingControlError,
+    build_training_execution,
+    validate_successful_training_artifacts,
+    validate_training_observation_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +124,14 @@ class StateReconciler:
         active = await self._load_active_workloads()
         for workload in active:
             report.inspected += 1
-            action = self._action_for_active(workload)
+            # 训练终止前先读取一次状态：既保存 Agent 已验证的最后 checkpoint，
+            # 也让恰好以 code 0 完成的任务以 SUCCEEDED 收口，而不是被 STOP 的
+            # ABSENT 响应错误降级为 CANCELED。
+            probe_before_stop = (
+                workload.owner.type == LeaseOwnerType.TRAINING
+                and workload.desired_state == DesiredJobState.TERMINATED
+            )
+            action = AgentAction.STATUS if probe_before_stop else self._action_for_active(workload)
             try:
                 response = await self._agent.execute(self._command(workload, action))
             except NodeAgentError as exc:
@@ -127,6 +140,25 @@ class StateReconciler:
                 await self._record_agent_error(workload, str(exc))
                 continue
             await self._apply_observation(workload, response)
+            if not (
+                probe_before_stop
+                and response.accepted
+                and response.observed_state
+                in {
+                    AgentWorkloadState.STARTING,
+                    AgentWorkloadState.RUNNING,
+                    AgentWorkloadState.STOPPING,
+                }
+            ):
+                continue
+            try:
+                stop_response = await self._agent.execute(self._command(workload, AgentAction.STOP))
+            except NodeAgentError as exc:
+                # STOP 结果不确定时同样保留 CANCELING 与租约，下轮继续探测。
+                report.agent_errors += 1
+                await self._record_agent_error(workload, str(exc))
+                continue
+            await self._apply_observation(workload, stop_response)
 
         report.terminal_leases_reaped = await self._reap_terminal_expired_leases()
         while True:
@@ -147,9 +179,18 @@ class StateReconciler:
                 response = await self._agent.execute(self._command(workload, AgentAction.START))
             except NodeAgentError as exc:
                 report.agent_errors += 1
-                await self._fail_start(workload, str(exc))
+                # START 可能已经在节点生效；保持 STARTING 与整卡租约，下一轮仅用
+                # 同 generation 的 STATUS 收敛，绝不重发 START 或调度第二个 owner。
+                await self._record_agent_error(workload, str(exc))
                 continue
-            await self._apply_observation(workload, response)
+            if not response.accepted:
+                # 经过验签和 schema 校验的明确拒绝才可证明启动没有发生。
+                await self._fail_start(
+                    workload,
+                    response.message or response.error_code or "node-agent 明确拒绝启动",
+                )
+            else:
+                await self._apply_observation(workload, response)
         return report
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
@@ -294,14 +335,15 @@ class StateReconciler:
             )
             try:
                 execution = await self._build_execution(session, owner_type, row)
-            except EvaluationControlError as exc:
+            except (EvaluationControlError, TrainingControlError) as exc:
                 # 配置或受控文件失效必须成为可见终态；否则严格 FIFO 会被坏队首永久堵塞。
-                assert isinstance(row, EvaluationRun)
+                assert isinstance(row, (TrainingJob, EvaluationRun))
                 row.actual_state = JobState.FAILED
                 row.queued_at = None
                 row.runtime_generation = 0
                 row.finished_at = self._clock()
-                row.error_message = f"评测启动前检查失败：{exc}"
+                task_label = "评测" if isinstance(row, EvaluationRun) else "训练"
+                row.error_message = f"{task_label}启动前检查失败：{exc}"
                 return ScheduleAttempt(ScheduleOutcome.PREFLIGHT_FAILED)
 
             # 新一轮实际运行沿用当前期望版本；后续 stop 只改变 state_version，
@@ -361,16 +403,14 @@ class StateReconciler:
             asset = await session.get(ModelAsset, row.model_asset_id)
             dataset = await session.get(Dataset, row.dataset_id)
             if asset is None or dataset is None:
-                raise RuntimeError("训练任务引用的模型资产或数据集不存在")
-            return {
-                "runner": "llamafactory",
-                "model_path": asset.local_path,
-                "dataset_path": dataset.local_path,
-                "stage": row.stage.value,
-                "algorithm": row.algorithm.value,
-                "training_config": row.training_config,
-                "output_dir": row.output_dir,
-            }
+                raise TrainingControlError("训练任务引用的模型资产或数据集不存在")
+            return await asyncio.to_thread(
+                build_training_execution,
+                row,
+                asset,
+                dataset,
+                self._settings,
+            )
         assert isinstance(row, EvaluationRun)
         base = await session.get(ModelAsset, row.base_model_asset_id)
         candidate = await session.get(ModelAsset, row.candidate_model_asset_id)
@@ -479,12 +519,41 @@ class StateReconciler:
             return
         if observed in {AgentWorkloadState.SUCCEEDED, AgentWorkloadState.FAILED}:
             if isinstance(row, TrainingJob):
-                row.actual_state = (
-                    JobState.SUCCEEDED if observed == AgentWorkloadState.SUCCEEDED else JobState.FAILED
-                )
-                row.error_message = None if observed == AgentWorkloadState.SUCCEEDED else response.message
+                try:
+                    metadata = validate_training_observation_metadata(
+                        row,
+                        response.metadata,
+                        self._settings,
+                        require_success_artifacts=observed == AgentWorkloadState.SUCCEEDED,
+                    )
+                except TrainingControlError as exc:
+                    row.actual_state = JobState.FAILED
+                    row.error_message = f"训练终态 metadata 校验失败：{exc}"
+                    row.checkpoint_path = None
+                    row.adapter_path = None
+                    row.merged_model_path = None
+                else:
+                    self._copy_training_metadata(row, metadata)
+                    row.actual_state = (
+                        JobState.SUCCEEDED if observed == AgentWorkloadState.SUCCEEDED else JobState.FAILED
+                    )
+                    row.error_message = (
+                        None
+                        if observed == AgentWorkloadState.SUCCEEDED
+                        else response.message or "训练运行失败"
+                    )
+                    if observed == AgentWorkloadState.SUCCEEDED:
+                        row.progress = 100.0
+                        try:
+                            await asyncio.to_thread(
+                                validate_successful_training_artifacts,
+                                row,
+                                self._settings,
+                            )
+                        except TrainingControlError as exc:
+                            row.actual_state = JobState.FAILED
+                            row.error_message = f"训练成功产物校验失败：{exc}"
                 row.finished_at = self._clock()
-                self._copy_training_outputs(row, response.metadata)
             elif observed == AgentWorkloadState.SUCCEEDED:
                 try:
                     metadata = validate_evaluation_success_metadata(
@@ -526,31 +595,36 @@ class StateReconciler:
         if isinstance(row, TrainingJob):
             if observed == AgentWorkloadState.RUNNING and row.started_at is None:
                 row.started_at = self._clock()
-            self._copy_training_progress(row, response.metadata)
+            try:
+                metadata = validate_training_observation_metadata(
+                    row,
+                    response.metadata,
+                    self._settings,
+                    require_success_artifacts=False,
+                )
+            except TrainingControlError as exc:
+                row.error_message = f"训练状态 metadata 校验失败：{exc}"
+            else:
+                self._copy_training_metadata(row, metadata)
+                row.error_message = None if response.accepted else response.message
         elif observed == AgentWorkloadState.RUNNING and row.started_at is None:
             row.started_at = self._clock()
-        row.error_message = None if response.accepted else response.message
+        if not isinstance(row, TrainingJob):
+            row.error_message = None if response.accepted else response.message
 
     @staticmethod
-    def _copy_training_progress(row: TrainingJob, metadata: dict[str, Any]) -> None:
-        progress = metadata.get("progress")
-        if isinstance(progress, int | float):
-            row.progress = min(100.0, max(0.0, float(progress)))
-        current_step = metadata.get("current_step")
-        total_steps = metadata.get("total_steps")
-        metrics = metadata.get("metrics")
-        if isinstance(current_step, int):
-            row.current_step = current_step
-        if isinstance(total_steps, int):
-            row.total_steps = total_steps
-        if isinstance(metrics, dict):
-            row.metrics = metrics
-
-    @staticmethod
-    def _copy_training_outputs(row: TrainingJob, metadata: dict[str, Any]) -> None:
+    def _copy_training_metadata(row: TrainingJob, metadata: Any) -> None:
+        if metadata.progress is not None:
+            row.progress = metadata.progress
+        if metadata.current_step is not None:
+            row.current_step = metadata.current_step
+        if metadata.total_steps is not None:
+            row.total_steps = metadata.total_steps
+        if metadata.metrics is not None:
+            row.metrics = metadata.metrics
         for key in ("checkpoint_path", "adapter_path", "merged_model_path"):
-            value = metadata.get(key)
-            if isinstance(value, str):
+            value = getattr(metadata, key)
+            if value is not None:
                 setattr(row, key, value)
 
     async def _record_agent_error(self, workload: WorkloadSnapshot, message: str) -> None:

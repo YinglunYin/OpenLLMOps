@@ -37,6 +37,8 @@ uv run pytest
 | `MODEL_IMPORT_CLAIM_TIMEOUT_SECONDS` | 导入 claim 心跳失效阈值，默认 120 秒；用于硬崩恢复 |
 | `HUGGINGFACE_TOKEN_FILE` / `MODELSCOPE_TOKEN_FILE` | 可选的仓库访问令牌只读 secret 文件路径，不接受令牌环境变量或 API 字段 |
 | `DATASET_ROOT` / `CHECKPOINT_ROOT` | 数据集和训练产物受控目录 |
+| `TRAINING_ARTIFACT_MAX_FILES` | 单个训练产物树允许的文件/目录节点上限，默认 `100000` |
+| `TRAINING_ARTIFACT_MAX_BYTES` | 单个训练产物树允许的原始字节上限，默认 `500 GiB` |
 | `EVALUATION_DATASET_ROOT` | 管理员预制 C-Eval/CMMLU 的受控根目录；固定子目录布局见下文 |
 | `EVALUATION_OUTPUT_ROOT` | 评测产物根目录；每个任务只能使用 `<root>/<run UUID>` |
 | `NODE_AGENT_RUNTIME_ROOT` | 与 node-agent 共享的运行目录，用于严格校验数据 manifest 路径 |
@@ -66,6 +68,40 @@ uv run pytest
 node-agent 合同为 `POST /v1/workloads/commands`。请求与响应都对规范化 JSON 原始字节执行
 HMAC-SHA256 签名，携带时间戳与一次性 nonce；动作由 `start`、`stop`、`status` 组成，
 `request_id` 和 `owner.generation` 提供重试幂等与迟到响应隔离。
+
+## 模型训练执行与产物合同
+
+`POST /api/v1/training-jobs` 只接受模型、数据集、阶段、算法、GPU 和有限训练参数。
+`output_dir` 固定由控制面派生为 `${CHECKPOINT_ROOT}/<job UUID>`，客户端传入该字段或未知
+训练参数均返回 422。CPT 仅支持 LoRA；SFT 支持 Freeze、LoRA、QLoRA 且必须显式选择
+template；Embedding 模型被拒绝。epoch、学习率、长度、batch、累积步数、LoRA/Freeze 参数、
+采样数和 seed 均有严格类型与范围，不能传入 shell、DeepSpeed 路径或 LLaMA-Factory 任意键。
+
+创建及获得 GPU 租约前都会复核模型的 Safetensors/config/tokenizer、训练集单一 JSONL 行
+格式以及上传时记录的 SHA-256、大小和记录数。排队期间被替换的模型或数据集会使任务以
+可读错误失败，不调用 Agent，也不会占用 GPU。训练和评测一样不支持 resume，也不会在
+实例消失后自动重跑。
+
+终态任务提供以下接口：
+
+- `GET /api/v1/training-jobs/{job_id}/artifacts`：列出经过安全筛选的已登记产物；
+- `GET /api/v1/training-jobs/{job_id}/artifacts/{kind}/download`：生成确定性 `tar.gz`；
+- `POST /api/v1/training-jobs/{job_id}/publish-model`：仅 succeeded 任务可幂等发布模型资产。
+
+归档按路径排序并清零时间、属主等不稳定 tar 元数据；adapter 归档不会混入 merged 或
+checkpoint。`full` 只对 succeeded 任务开放；canceled/failed 只能下载 Agent 最后登记的
+checkpoint/adapter/merged，其中 checkpoint 会递归剔除 optimizer、scheduler、rng 等
+`.pt/.pth/.bin/.pkl/.pickle/.joblib/.ckpt` 反序列化状态。扫描与打包拒绝软/硬链接、
+特殊文件、目录逃逸和超限产物，压缩临时文件位于
+`${CHECKPOINT_ROOT}/.download-cache` 并在响应结束后删除。下载大模型仍需要相应临时磁盘
+空间，应结合 2 TB 容量设置上限并监控余量。
+
+发布 LoRA/QLoRA 时优先使用 Agent 生成的 `merged`，Freeze 使用清理后的完整输出；控制面
+再次校验 model.safetensors（或严格分片索引）、config、tokenizer，并拒绝 pickle、远程
+custom code 和不安全文件。文件先复制到 `MODEL_ROOT` 内 staging，校验一致后在跨进程锁下
+无覆盖原子重命名，数据库保存 `published_model_asset_id`；最终 ModelAsset 永不直接引用
+`CHECKPOINT_ROOT`。删除训练任务当前只删除控制面记录并保留训练目录，清理属于显式运维
+动作；checkpoint 下载不承诺包含 optimizer 状态，也不代表支持断点续训。
 
 ## 模型评测执行合同
 

@@ -160,6 +160,9 @@ class TrainingJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     checkpoint_path: Mapped[str | None] = mapped_column(String(1024))
     adapter_path: Mapped[str | None] = mapped_column(String(1024))
     merged_model_path: Mapped[str | None] = mapped_column(String(1024))
+    published_model_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("model_assets.id", ondelete="SET NULL"), unique=True, index=True
+    )
     error_message: Mapped[str | None] = mapped_column(Text)
     queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     state_version: Mapped[int] = mapped_column(Integer, default=1)

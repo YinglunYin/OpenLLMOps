@@ -1,6 +1,6 @@
 import io
+import json
 import uuid
-from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -8,12 +8,22 @@ from app.core.config import get_settings
 
 
 def create_ready_model(client: TestClient, suffix: str = "base") -> dict:
+    model_path = get_settings().model_root / str(uuid.uuid4())
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text('{"model_type":"qwen2"}', encoding="utf-8")
+    (model_path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    header = json.dumps(
+        {"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}},
+        separators=(",", ":"),
+    ).encode()
+    (model_path / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + b"\0\0\0\0")
     response = client.post(
         "/api/v1/model-assets",
         json={
             "name": f"Qwen demo {suffix}",
             "source_type": "manual",
-            "local_path": f"/srv/openllmops/models/{uuid.uuid4()}",
+            "local_path": str(model_path),
             "model_kind": "instruct",
             "status": "ready",
         },
@@ -69,13 +79,8 @@ def test_model_asset_and_deployment_lifecycle(client: TestClient) -> None:
 
 def test_dataset_upload_preview_and_training_queue(
     client: TestClient,
-    test_root: Path,
 ) -> None:
-    payload = (
-        b'{"instruction":"say hello","output":"hello"}\n'
-        b'{"messages":[{"role":"user","content":"2+2"},'
-        b'{"role":"assistant","content":"4"}]}\n'
-    )
+    payload = b'{"instruction":"say hello","output":"hello"}\n{"instruction":"2+2","output":"4"}\n'
     response = client.post(
         "/api/v1/datasets/upload",
         data={"name": "demo-sft", "dataset_type": "sft"},
@@ -90,7 +95,6 @@ def test_dataset_upload_preview_and_training_queue(
     assert len(preview.json()) == 1
 
     model = create_ready_model(client, "training")
-    output_dir = test_root / "checkpoints" / str(uuid.uuid4())
     training = client.post(
         "/api/v1/training-jobs",
         json={
@@ -100,12 +104,12 @@ def test_dataset_upload_preview_and_training_queue(
             "stage": "sft",
             "algorithm": "qlora",
             "gpu_ids": [0],
-            "training_config": {"num_train_epochs": 1},
-            "output_dir": str(output_dir),
+            "training_config": {"num_train_epochs": 1, "template": "qwen"},
         },
     )
     assert training.status_code == 201, training.text
     assert training.json()["actual_state"] == "queued"
+    assert training.json()["output_dir"] == str(get_settings().checkpoint_root / training.json()["id"])
 
     terminated = client.post(f"/api/v1/training-jobs/{training.json()['id']}/terminate")
     assert terminated.status_code == 200
@@ -120,7 +124,6 @@ def test_dataset_upload_preview_and_training_queue(
             "stage": "cpt",
             "algorithm": "freeze",
             "gpu_ids": [0],
-            "output_dir": str(output_dir),
         },
     )
     assert invalid_cpt.status_code == 422

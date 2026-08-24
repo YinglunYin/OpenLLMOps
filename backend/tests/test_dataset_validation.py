@@ -166,3 +166,26 @@ def test_evaluation_rejects_ambiguous_or_reserved_json(
             tmp_path / "unsafe.jsonl",
             DatasetType.EVALUATION,
         )
+
+
+def test_training_dataset_requires_one_consistent_record_format(tmp_path: Path) -> None:
+    mixed_sft = (
+        b'{"instruction":"Q1","output":"A1"}\n'
+        b'{"messages":[{"role":"user","content":"Q2"},{"role":"assistant","content":"A2"}]}\n'
+    )
+    with pytest.raises(ValueError, match="全文件一致"):
+        validate_and_store_jsonl(
+            io.BytesIO(mixed_sft),
+            tmp_path / ".mixed.part",
+            tmp_path / "mixed.jsonl",
+            DatasetType.SFT,
+        )
+
+    mixed_cpt = b'{"text":"one"}\n{"content":"two"}\n'
+    with pytest.raises(ValueError, match="全文件一致"):
+        validate_and_store_jsonl(
+            io.BytesIO(mixed_cpt),
+            tmp_path / ".mixed-cpt.part",
+            tmp_path / "mixed-cpt.jsonl",
+            DatasetType.CPT,
+        )

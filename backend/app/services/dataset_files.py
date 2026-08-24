@@ -46,18 +46,58 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _validate_shape(item: Any, dataset_type: DatasetType) -> str | None:
+def validate_training_record(
+    item: Any,
+    dataset_type: DatasetType,
+) -> tuple[str | None, str | None]:
+    """验证单条训练数据并返回 Agent dataset_info 所需的唯一格式。"""
+
     if not isinstance(item, dict):
-        return "每行必须是 JSON 对象"
+        return "每行必须是 JSON 对象", None
     if dataset_type == DatasetType.CPT:
-        if not isinstance(item.get("text"), str) and not isinstance(item.get("content"), str):
-            return "CPT 数据至少需要字符串字段 text 或 content"
+        has_text = isinstance(item.get("text"), str) and bool(item["text"].strip())
+        has_content = isinstance(item.get("content"), str) and bool(item["content"].strip())
+        if has_text == has_content:
+            return "CPT 每行必须且只能使用非空 text 或 content 之一", None
+        return None, "cpt_text" if has_text else "cpt_content"
     elif dataset_type == DatasetType.SFT:
-        has_messages = isinstance(item.get("messages"), list) or isinstance(item.get("conversations"), list)
-        has_instruction = isinstance(item.get("instruction"), str) and isinstance(item.get("output"), str)
-        if not has_messages and not has_instruction:
-            return "SFT 数据需要 messages/conversations，或 instruction + output"
-    return None
+        formats = [
+            name
+            for name, present in (
+                ("sft_messages", isinstance(item.get("messages"), list)),
+                ("sft_conversations", isinstance(item.get("conversations"), list)),
+                (
+                    "sft_alpaca",
+                    isinstance(item.get("instruction"), str) and isinstance(item.get("output"), str),
+                ),
+            )
+            if present
+        ]
+        if len(formats) != 1:
+            return "SFT 每行必须且只能使用 messages、conversations 或 instruction+output 一种格式", None
+        record_format = formats[0]
+        if record_format == "sft_alpaca":
+            if not item["instruction"].strip() or not item["output"].strip():
+                return "Alpaca instruction/output 必须是非空字符串", None
+            if "input" in item and not isinstance(item["input"], str):
+                return "Alpaca input 如存在必须是字符串", None
+        else:
+            field = "messages" if record_format == "sft_messages" else "conversations"
+            role_key, content_key = ("role", "content") if field == "messages" else ("from", "value")
+            messages = item[field]
+            if not messages:
+                return f"SFT {field} 不能为空", None
+            for message in messages:
+                if (
+                    not isinstance(message, dict)
+                    or not isinstance(message.get(role_key), str)
+                    or not message[role_key].strip()
+                    or not isinstance(message.get(content_key), str)
+                    or not message[content_key].strip()
+                ):
+                    return f"SFT {field} 每项必须包含非空 {role_key}/{content_key}", None
+        return None, record_format
+    return None, None
 
 
 def validate_and_store_jsonl(
@@ -73,6 +113,7 @@ def validate_and_store_jsonl(
     errors: list[dict[str, Any]] = []
     field_names: set[str] = set()
     evaluation_sample_ids: set[str] = set()
+    training_record_format: str | None = None
     digest = hashlib.sha256()
 
     temporary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -141,9 +182,18 @@ def validate_and_store_jsonl(
                             _record_error(errors, line_number, f"样本 ID 重复: {sample.sample_id}")
                         evaluation_sample_ids.add(sample.sample_id)
                 else:
-                    shape_error = _validate_shape(item, dataset_type)
+                    shape_error, record_format = validate_training_record(item, dataset_type)
                     if shape_error:
                         _record_error(errors, line_number, shape_error)
+                    elif record_format is not None:
+                        if training_record_format is None:
+                            training_record_format = record_format
+                        elif training_record_format != record_format:
+                            _record_error(
+                                errors,
+                                line_number,
+                                f"训练数据格式必须全文件一致，首条为 {training_record_format}",
+                            )
 
         if record_count == 0:
             _record_error(errors, 0, "数据集没有有效记录")
@@ -159,7 +209,11 @@ def validate_and_store_jsonl(
         total_bytes,
         digest.hexdigest(),
         errors,
-        {"fields": sorted(field_names), "format": "jsonl"},
+        {
+            "fields": sorted(field_names),
+            "format": "jsonl",
+            **({"record_format": training_record_format} if training_record_format else {}),
+        },
     )
 
 

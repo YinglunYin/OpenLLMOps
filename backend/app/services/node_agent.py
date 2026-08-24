@@ -18,7 +18,11 @@ SIGNATURE_VERSION = "v1"
 
 
 class NodeAgentError(RuntimeError):
-    """node-agent 合同、鉴权或网络调用失败。"""
+    """node-agent 调用结果不确定，不能据此释放 GPU 租约。
+
+    超时、网络中断、5xx、坏签名和非法响应都可能发生在节点已经执行命令之后。
+    调用方必须通过后续 STATUS 收敛，不能把这些异常解释成“启动未发生”。
+    """
 
 
 class SignatureVerificationError(NodeAgentError):
@@ -147,7 +151,17 @@ class NodeAgentHTTPClient:
             # 先验签再解释 HTTP 状态，避免未签名的网关错误伪装成 agent 业务拒绝。
             self._signer.verify(response.content, response.headers)
             result = AgentCommandResponse.model_validate_json(response.content)
-            if not (response.is_success or response.status_code in {409, 422}):
+            if response.is_client_error:
+                # 只有经过响应验签、合同解析且明确 accepted=false 的 4xx 才是
+                # 可确定的业务拒绝；它会作为结构化响应交给 reconciler 收口。
+                if (
+                    result.accepted
+                    or result.observed_state.value not in {"absent", "failed"}
+                    or not result.error_code
+                ):
+                    raise ValueError("node-agent 4xx 响应不是明确、结构一致的业务拒绝")
+            elif not response.is_success:
+                # 5xx/重定向无法证明命令未执行，统一归入结果不确定。
                 response.raise_for_status()
         except (httpx.HTTPError, ValueError, SignatureVerificationError) as exc:
             raise NodeAgentError(f"node-agent 调用失败：{exc}") from exc

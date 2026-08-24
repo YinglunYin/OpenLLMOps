@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     modelscope_token_file: Path | None = None
     dataset_root: Path = Path("/srv/openllmops/datasets")
     checkpoint_root: Path = Path("/srv/openllmops/checkpoints")
+    training_artifact_max_files: int = Field(default=100_000, ge=1, le=1_000_000)
+    training_artifact_max_bytes: int = Field(
+        default=500 * 1024 * 1024 * 1024,
+        ge=1,
+        le=2 * 1024 * 1024 * 1024 * 1024,
+    )
     evaluation_dataset_root: Path = Path("/srv/openllmops/evaluation-datasets")
     evaluation_output_root: Path = Path("/srv/openllmops/evaluation-output")
     node_agent_runtime_root: Path = Path("/srv/openllmops/runtime")

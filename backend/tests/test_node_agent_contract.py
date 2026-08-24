@@ -15,6 +15,7 @@ from app.schemas.agent_contract import (
 )
 from app.services.node_agent import (
     HMACSigner,
+    NodeAgentError,
     NodeAgentHTTPClient,
     SignatureVerificationError,
     canonical_json,
@@ -91,3 +92,75 @@ async def test_http_client_and_fake_agent_use_signed_structured_contract() -> No
     assert result.accepted
     assert result.observed_state == AgentWorkloadState.RUNNING
     assert len(seen_nonces) == 1
+
+
+async def test_http_client_distinguishes_explicit_4xx_from_indeterminate_failures() -> None:
+    signer = HMACSigner(SECRET)
+    command = _command()
+
+    def signed_response(
+        request: httpx.Request,
+        *,
+        status_code: int,
+        accepted: bool,
+        request_id: uuid.UUID | None = None,
+    ) -> httpx.Response:
+        response = AgentCommandResponse(
+            request_id=request_id or command.request_id,
+            accepted=accepted,
+            observed_state=AgentWorkloadState.FAILED,
+            observed_at=datetime.now(UTC),
+            message="节点拒绝",
+            error_code="invalid_workload",
+        )
+        body = canonical_json(response)
+        return httpx.Response(status_code, content=body, headers=signer.sign(body), request=request)
+
+    async def explicit_rejection(request: httpx.Request) -> httpx.Response:
+        return signed_response(request, status_code=422, accepted=False)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(explicit_rejection),
+        base_url="http://agent",
+    ) as http_client:
+        client = NodeAgentHTTPClient("http://agent", SECRET, client=http_client)
+        rejection = await client.execute(command)
+    assert not rejection.accepted and rejection.error_code == "invalid_workload"
+
+    async def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("响应超时", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(timeout),
+        base_url="http://agent",
+    ) as http_client:
+        client = NodeAgentHTTPClient("http://agent", SECRET, client=http_client)
+        with pytest.raises(NodeAgentError, match="调用失败"):
+            await client.execute(command)
+
+    async def server_error(request: httpx.Request) -> httpx.Response:
+        return signed_response(request, status_code=503, accepted=False)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server_error),
+        base_url="http://agent",
+    ) as http_client:
+        client = NodeAgentHTTPClient("http://agent", SECRET, client=http_client)
+        with pytest.raises(NodeAgentError, match="503"):
+            await client.execute(command)
+
+    async def protocol_error(request: httpx.Request) -> httpx.Response:
+        return signed_response(
+            request,
+            status_code=200,
+            accepted=True,
+            request_id=uuid.uuid4(),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(protocol_error),
+        base_url="http://agent",
+    ) as http_client:
+        client = NodeAgentHTTPClient("http://agent", SECRET, client=http_client)
+        with pytest.raises(NodeAgentError, match="request_id"):
+            await client.execute(command)

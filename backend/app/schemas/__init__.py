@@ -38,5 +38,11 @@ from app.schemas.resources import (
     TrainingJobCreate,
     TrainingJobRead,
 )
+from app.schemas.training import (
+    TrainingArtifactKind,
+    TrainingArtifactManifestRead,
+    TrainingArtifactRead,
+    TrainingParameters,
+)
 
 __all__ = [name for name in globals() if not name.startswith("_")]
