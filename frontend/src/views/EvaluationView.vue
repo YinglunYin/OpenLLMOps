@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { DataAnalysis, Download, Plus } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 import BaseChart from '@/components/BaseChart.vue'
 import PageHeader from '@/components/PageHeader.vue'
@@ -39,6 +39,7 @@ const domainOption = { color: ['#12a865'], grid: { top: 12, left: 72, right: 36,
 
 async function createEvaluation() {
   if (!form.name || !form.baseModelAssetId || !form.candidateModelAssetId || !form.datasets.length) { ElMessage.warning('请填写任务名称并选择基线、候选模型和数据集'); return }
+  if (form.datasets.includes('custom') && !form.customDatasetId) { ElMessage.warning('请选择自定义领域评测集'); return }
   createBusy.value = true
   try {
     await api.evaluations.create({ ...form })
@@ -50,6 +51,45 @@ async function createEvaluation() {
   } finally {
     createBusy.value = false
   }
+}
+
+async function refreshEvaluations() {
+  ;[rows.value, taskRows.value] = await Promise.all([api.evaluations.comparison(), api.evaluations.list()])
+}
+
+async function cancelEvaluation(row: EvaluationRunSummary) {
+  try {
+    await ElMessageBox.confirm('取消会终止当前顺序评测并释放整卡，已生成的中间结果不计入最终对比。', `取消 ${row.name}`, { type: 'warning' })
+    await api.evaluations.cancel(row.id)
+    await refreshEvaluations()
+    ElMessage.success('取消指令已记录')
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    ElMessage.error(error instanceof Error ? error.message : '取消测评失败')
+  }
+}
+
+async function removeEvaluation(row: EvaluationRunSummary) {
+  try {
+    await ElMessageBox.confirm('该操作只删除已结束的任务记录。', `删除 ${row.name}`, { type: 'warning' })
+    await api.evaluations.remove(row.id)
+    await refreshEvaluations()
+    ElMessage.success('测评任务已删除')
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    ElMessage.error(error instanceof Error ? error.message : '删除测评任务失败')
+  }
+}
+
+function exportReport() {
+  if (!rows.value.length) return
+  const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), results: rows.value }, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `openllmops-evaluation-${new Date().toISOString().slice(0, 10)}.json`
+  link.click()
+  URL.revokeObjectURL(url)
 }
 
 onMounted(async () => {
@@ -64,13 +104,13 @@ onMounted(async () => {
 <template>
   <div>
     <PageHeader title="模型测评" subtitle="量化比较训练前后通用能力保持与目标领域提升">
-      <el-button :icon="Download">导出报告</el-button>
+      <el-button :icon="Download" :disabled="!rows.length" @click="exportReport">导出报告</el-button>
       <el-button type="primary" :icon="Plus" @click="createVisible=true">创建测评</el-button>
     </PageHeader>
 
     <el-tabs v-model="activeTab" class="evaluation-tabs">
       <el-tab-pane label="测评任务" name="tasks">
-        <PanelCard flush><el-table :data="taskRows" empty-text="暂无测评任务"><el-table-column prop="name" label="任务名称" min-width="180"/><el-table-column prop="model" label="候选模型" min-width="180"/><el-table-column prop="datasets" label="测评数据集" min-width="250"/><el-table-column label="进度" min-width="180"><template #default="{row}"><el-progress :percentage="row.progress" :stroke-width="6"/></template></el-table-column><el-table-column label="状态" width="110"><template #default="{row}"><StatusPill v-bind="taskStatusMeta(row.status)"/></template></el-table-column><el-table-column prop="updatedAt" label="更新时间" width="165"/><el-table-column label="操作" width="100"><template #default><span class="table-link">查看报告</span></template></el-table-column></el-table></PanelCard>
+        <PanelCard flush><el-table :data="taskRows" empty-text="暂无测评任务"><el-table-column prop="name" label="任务名称" min-width="180"/><el-table-column prop="model" label="候选模型" min-width="180"/><el-table-column prop="datasets" label="测评数据集" min-width="250"/><el-table-column label="进度" min-width="180"><template #default="{row}"><el-progress :percentage="row.progress" :stroke-width="6"/></template></el-table-column><el-table-column label="状态" width="110"><template #default="{row}"><StatusPill v-bind="taskStatusMeta(row.status)"/></template></el-table-column><el-table-column prop="updatedAt" label="更新时间" width="165"/><el-table-column label="操作" width="135"><template #default="{ row }"><div class="table-actions"><span v-if="['queued','running','stopping'].includes(row.status)" class="danger-link" @click="cancelEvaluation(row)">取消</span><span v-else class="danger-link" @click="removeEvaluation(row)">删除</span></div></template></el-table-column></el-table></PanelCard>
       </el-tab-pane>
       <el-tab-pane label="训练前后对比" name="comparison">
         <template v-if="rows.length">

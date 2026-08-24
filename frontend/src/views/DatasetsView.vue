@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, shallowRef } from 'vue'
-import { Box, DataAnalysis, Files, Plus, Refresh, Search, Upload, Warning } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { Box, DataAnalysis, Files, Refresh, Search, Upload, Warning } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 
 import BaseChart from '@/components/BaseChart.vue'
@@ -42,6 +42,11 @@ const histogramOption = {
 
 function reset() { Object.assign(filters, { keyword: '', purpose: '', status: '' }) }
 
+async function refreshRows() {
+  rows.value = await api.datasets.list()
+  selected.value = selected.value ? rows.value.find((row) => row.id === selected.value?.id) ?? rows.value[0] ?? null : rows.value[0] ?? null
+}
+
 function handleFileChange(file: UploadFile) {
   uploadFile.value = file.raw
 }
@@ -54,6 +59,24 @@ async function selectDataset(row: Dataset) {
   }
 }
 
+async function showPreview(row: Dataset) {
+  await selectDataset(row)
+  detailTab.value = 'preview'
+}
+
+async function removeDataset(row: Dataset) {
+  try {
+    await ElMessageBox.confirm('存在训练或测评任务引用时，控制面会拒绝删除。', `删除 ${row.name}`, { type: 'warning' })
+    await api.datasets.remove(row.id)
+    await refreshRows()
+    previewRows.value = []
+    ElMessage.success('数据集已删除')
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    ElMessage.error(error instanceof Error ? error.message : '删除数据集失败')
+  }
+}
+
 async function submitUpload() {
   if (!uploadForm.name || !uploadFile.value) { ElMessage.warning('请填写数据集名称并选择 JSONL 文件'); return }
   uploadBusy.value = true
@@ -61,8 +84,8 @@ async function submitUpload() {
     await api.datasets.upload({ name: uploadForm.name, purpose: uploadForm.purpose as Dataset['purpose'], description: `版本 ${uploadForm.version}；划分 ${uploadForm.split}` }, uploadFile.value)
     uploadVisible.value = false
     uploadFile.value = undefined
-    rows.value = await api.datasets.list()
-    selected.value = rows.value[0] ?? null
+    await refreshRows()
+    if (selected.value) await selectDataset(selected.value)
     ElMessage.success('上传与逐行校验已完成')
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '数据集上传失败')
@@ -85,7 +108,7 @@ onMounted(async () => {
   <div>
     <PageHeader title="训练数据集" subtitle="管理 CPT、SFT 与自定义测评 JSONL 数据及不可变版本">
       <el-button :icon="Upload" @click="uploadVisible = true">上传数据集</el-button>
-      <el-button type="primary" :icon="Plus">创建版本</el-button>
+      <el-button type="primary" :icon="Refresh" @click="refreshRows">刷新列表</el-button>
     </PageHeader>
 
     <div class="stats-grid">
@@ -112,7 +135,7 @@ onMounted(async () => {
         <el-table-column prop="tokens" label="Token 数" width="135"><template #default="{ row }">{{ row.tokens.toLocaleString() }}</template></el-table-column>
         <el-table-column label="状态" width="105"><template #default="{ row }"><StatusPill v-bind="statusMeta(row.status)" /></template></el-table-column>
         <el-table-column prop="updatedAt" label="更新时间" width="165" />
-        <el-table-column label="操作" width="160" fixed="right"><template #default><div class="table-actions"><span class="table-link">查看版本</span><span class="table-link">更多⌄</span></div></template></el-table-column>
+        <el-table-column label="操作" width="150" fixed="right"><template #default="{ row }"><div class="table-actions"><span class="table-link" @click.stop="showPreview(row)">预览</span><span class="danger-link" @click.stop="removeDataset(row)">删除</span></div></template></el-table-column>
       </el-table>
     </PanelCard>
 

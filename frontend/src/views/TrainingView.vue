@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { CircleCheck, CloseBold, Clock, Download, Plus, VideoPlay, Warning } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -20,6 +20,8 @@ const modelOptions = ref<ModelAsset[]>([])
 const datasetOptions = ref<Dataset[]>([])
 const createVisible = ref(false)
 const createBusy = ref(false)
+let refreshTimer: number | undefined
+let refreshRunning = false
 const form = reactive({ name: '', stage: 'SFT', algorithm: 'LoRA', modelAssetId: '', datasetId: '', gpuCount: 1, epochs: 3, learningRate: 0.0002, batchSize: 2, gradientAccumulation: 8, loraRank: 8, template: 'qwen' })
 
 watch(() => form.stage, (stage) => {
@@ -66,6 +68,30 @@ async function stopJob() {
   }
 }
 
+async function refreshJobs() {
+  if (refreshRunning) return
+  refreshRunning = true
+  try {
+    const selectedId = selected.value?.id
+    rows.value = await api.training.list()
+    selected.value = rows.value.find((item) => item.id === selectedId) ?? rows.value[0] ?? null
+  } finally {
+    refreshRunning = false
+  }
+}
+
+async function removeJob(row: TrainingJob) {
+  try {
+    await ElMessageBox.confirm('只能删除已完成、失败或已终止的训练任务记录，checkpoint 文件不会在此操作中被递归清理。', `删除 ${row.name}`, { type: 'warning' })
+    await api.training.remove(row.id)
+    await refreshJobs()
+    ElMessage.success('训练任务已删除')
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    ElMessage.error(error instanceof Error ? error.message : '删除训练任务失败')
+  }
+}
+
 async function createJob() {
   if (!form.name || !form.modelAssetId || !form.datasetId) { ElMessage.warning('请填写任务名称并选择模型、数据集'); return }
   createBusy.value = true
@@ -87,9 +113,14 @@ onMounted(async () => {
     if (import.meta.env.VITE_USE_MOCKS === 'true') mockGpus.value = (await import('@/mock/data')).gpuDevices
     ;[rows.value, modelOptions.value, datasetOptions.value] = await Promise.all([api.training.list(), api.models.list(), api.datasets.list()])
     selected.value = rows.value[0] ?? null
+    refreshTimer = window.setInterval(() => { void refreshJobs().catch(() => undefined) }, 3_000)
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '训练任务加载失败')
   }
+})
+
+onBeforeUnmount(() => {
+  if (refreshTimer !== undefined) window.clearInterval(refreshTimer)
 })
 </script>
 
@@ -115,13 +146,13 @@ onMounted(async () => {
         <el-table-column prop="gpuLabel" label="GPU 资源" width="125" />
         <el-table-column label="进度" min-width="210"><template #default="{row}"><div class="progress-cell"><span>{{ row.progress }}%</span><el-progress :percentage="row.progress" :show-text="false" :stroke-width="6" /></div></template></el-table-column>
         <el-table-column label="状态" width="110"><template #default="{row}"><StatusPill v-bind="statusMeta(row.status)" /></template></el-table-column>
-        <el-table-column label="操作" width="70" align="center"><template #default><el-dropdown><el-button link>•••</el-button><template #dropdown><el-dropdown-menu><el-dropdown-item>查看详情</el-dropdown-item><el-dropdown-item>查看日志</el-dropdown-item><el-dropdown-item>克隆任务</el-dropdown-item></el-dropdown-menu></template></el-dropdown></template></el-table-column>
+        <el-table-column label="操作" width="120" align="center"><template #default="{ row }"><div class="table-actions"><span class="table-link" @click="selected=row">详情</span><span v-if="['completed','failed','terminated'].includes(row.status)" class="danger-link" @click="removeJob(row)">删除</span></div></template></el-table-column>
       </el-table>
       <div v-if="rows.some((item) => item.status === 'queued')" class="resource-warning"><el-icon><Warning /></el-icon><span>GPU 不足，等待中的训练不会抢占推理服务；请手动停止占用中的推理部署。</span><el-button link type="primary">前往部署管理</el-button></div>
     </PanelCard>
 
     <PanelCard v-if="selected" class="section-gap training-detail" flush>
-      <div class="training-title"><strong>{{ selected.name }}</strong><div><el-button v-if="selected.status === 'running'" type="danger" plain @click="stopJob">终止任务</el-button><el-button>查看日志</el-button></div></div>
+      <div class="training-title"><strong>{{ selected.name }}</strong><div><el-button v-if="['running','queued'].includes(selected.status)" type="danger" plain @click="stopJob">终止任务</el-button></div></div>
       <div class="training-progress"><span>进度</span><el-progress :percentage="selected.progress" :stroke-width="7" /><span>{{ selected.progress }}%</span><span>步骤 <b>{{ selected.step.toLocaleString() }} / {{ selected.totalSteps.toLocaleString() }}</b></span><span>Epoch <b>{{ selected.epoch }}</b></span><span>预计剩余 <b>{{ selected.eta ?? '—' }}</b></span></div>
       <div v-if="useMocks" class="training-charts">
         <div class="chart-card"><h3>训练损失</h3><BaseChart :option="lossOption()" height="150px" /></div>

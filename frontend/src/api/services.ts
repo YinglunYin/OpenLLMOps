@@ -349,6 +349,7 @@ export const api = {
       ? mockMutation({ id: crypto.randomUUID() })
       : (await http.post<BackendTrainingJob>('/v1/training-jobs', normalizeTraining(payload))).data,
     stop: async (id: string) => useMocks ? mockMutation(true) : (await http.post(`/v1/training-jobs/${id}/terminate`), true),
+    remove: async (id: string) => useMocks ? mockMutation(true) : (await http.delete(`/v1/training-jobs/${id}`), true),
     async checkpoints(): Promise<CapabilityResult<Array<Record<string, unknown>>>> {
       return { supported: false, data: [], reason: '控制面尚未提供 checkpoint 列表与导出端点' }
     },
@@ -359,6 +360,8 @@ export const api = {
     create: async (payload: Record<string, unknown>) => useMocks
       ? mockMutation({ id: crypto.randomUUID() })
       : (await http.post<BackendEvaluationRun>('/v1/evaluation-runs', normalizeEvaluation(payload))).data,
+    cancel: async (id: string) => useMocks ? mockMutation(true) : (await http.post(`/v1/evaluation-runs/${id}/cancel`), true),
+    remove: async (id: string) => useMocks ? mockMutation(true) : (await http.delete(`/v1/evaluation-runs/${id}`), true),
   },
   apiKeys: {
     async list(): Promise<ApiKeySummary[]> {
