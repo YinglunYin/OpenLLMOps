@@ -3,6 +3,7 @@ from functools import lru_cache
 from ipaddress import ip_network
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from argon2 import extract_parameters
 from argon2.exceptions import InvalidHashError
@@ -55,12 +56,16 @@ class Settings(BaseSettings):
     node_agent_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     vllm_internal_api_key: str | None = None
 
+    prometheus_url: str | None = None
+    prometheus_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+
     model_root: Path = Path("/srv/openllmops/models")
     model_inbox_root: Path = Path("/srv/openllmops/inbox")
     model_staging_root: Path = Path("/srv/openllmops/model-staging")
     model_import_coordinator_enabled: bool = False
     model_import_poll_interval_seconds: float = Field(default=1.0, gt=0, le=60)
     model_import_concurrency: int = Field(default=1, ge=1, le=4)
+    model_import_claim_timeout_seconds: int = Field(default=120, ge=30, le=3600)
     huggingface_token_file: Path | None = None
     modelscope_token_file: Path | None = None
     dataset_root: Path = Path("/srv/openllmops/datasets")
@@ -106,6 +111,30 @@ class Settings(BaseSettings):
         if value is None or (isinstance(value, str) and not value.strip()):
             return None
         return value
+
+    @field_validator("prometheus_url", mode="before")
+    @classmethod
+    def normalize_prometheus_url(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        try:
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError("PROMETHEUS_URL 端口无效") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("PROMETHEUS_URL 必须是不含凭证、查询参数或片段的 HTTP(S) 地址")
+        return normalized
 
     @model_validator(mode="after")
     def validate_production_auth(self) -> "Settings":

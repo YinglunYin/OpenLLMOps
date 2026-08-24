@@ -34,6 +34,7 @@ uv run pytest
 | `MODEL_IMPORT_COORDINATOR_ENABLED` | 是否启动数据库轮询导入协调器；生产 API 实例应设为 `true` |
 | `MODEL_IMPORT_POLL_INTERVAL_SECONDS` | 导入任务轮询间隔，默认 1 秒 |
 | `MODEL_IMPORT_CONCURRENCY` | 单实例并发导入数，默认 1、最大 4 |
+| `MODEL_IMPORT_CLAIM_TIMEOUT_SECONDS` | 导入 claim 心跳失效阈值，默认 120 秒；用于硬崩恢复 |
 | `HUGGINGFACE_TOKEN_FILE` / `MODELSCOPE_TOKEN_FILE` | 可选的仓库访问令牌只读 secret 文件路径，不接受令牌环境变量或 API 字段 |
 | `DATASET_ROOT` / `CHECKPOINT_ROOT` | 数据集和训练产物受控目录 |
 | `GPU_COUNT` | 开发机通常为 2，目标生产机为 4 |
@@ -42,6 +43,7 @@ uv run pytest
 | `GPU_LEASE_TTL_SECONDS` | GPU 租约心跳失效时间；生产默认 30 秒 |
 | `NODE_AGENT_CLOCK_SKEW_SECONDS` | HMAC 请求/响应允许的最大时钟偏差 |
 | `VLLM_INTERNAL_API_KEY` | OpenAI 网关访问内部 vLLM 实例的密钥 |
+| `PROMETHEUS_URL` / `PROMETHEUS_TIMEOUT_SECONDS` | Prometheus HTTP API 地址与查询超时；未配置时 GPU API 明确返回 degraded |
 
 ## 状态与调度边界
 
@@ -91,3 +93,20 @@ Docker Compose `.env` 传递 Argon2 哈希，应使用单引号包裹，避免�
 使用单条条件更新。worker 完成 Safetensors 与配置校验并原子移入 `MODEL_ROOT` 后，控制面
 才在同一事务中创建 `ready` 模型资产；失败或取消任务不会产生可部署资产。在线访问令牌
 只从只读文件临时读入执行线程，既不写入导入任务/资产记录，也不接受请求体传入。
+
+协调器持续用 `claimed_at` 作为执行心跳。进程或主机硬崩后，超过
+`MODEL_IMPORT_CLAIM_TIMEOUT_SECONDS` 的 transferring/validating 任务会清理其固定 UUID
+暂存/未发布目录并重新排队，canceling 任务会收敛为 canceled。PostgreSQL advisory lock 与
+任务行锁防止多实例并发恢复；已有模型资产关联的路径永远不会被恢复清理。worker 已完成
+原子移动后以 ready 为发布提交点，最后检查点之后到达的取消不会制造无记录孤儿目录。
+
+## GPU 监控与仪表盘
+
+`GET /api/v1/system/gpus` 通过 Prometheus 查询 DCGM Exporter 的显存、利用率、温度和功耗，
+并按 GPU index 合并数据库整卡租约。缺失指标保持 `null` 并在 `degraded_reason` 说明原因，
+Prometheus 超时、不可用或响应非法时不会用 0 冒充真实遥测。
+
+`GET /api/v1/system/gpus/{gpu_index}/history` 仅接受固定指标枚举、最多 7 天跨度、5–3600 秒
+步长及最多 2000 点。PromQL 完全由服务端白名单构造，查询参数不能注入表达式。
+`GET /api/v1/dashboard/summary` 用三个数据库往返返回模型/部署/训练/评测计数、队列、GPU
+租约和最近活动，不依赖逐资源列表扫描。

@@ -4,6 +4,10 @@ import os
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from openllmops_eval.dataset import MAX_LINE_BYTES as MAX_EVALUATION_LINE_BYTES
+from openllmops_eval.dataset import DatasetValidationError
+from openllmops_eval.dataset import parse_row as parse_evaluation_row
+
 from app.models.enums import DatasetType
 
 MAX_DATASET_BYTES = 5 * 1024 * 1024 * 1024
@@ -27,11 +31,6 @@ def _validate_shape(item: Any, dataset_type: DatasetType) -> str | None:
         has_instruction = isinstance(item.get("instruction"), str) and isinstance(item.get("output"), str)
         if not has_messages and not has_instruction:
             return "SFT 数据需要 messages/conversations，或 instruction + output"
-    else:
-        has_qa = isinstance(item.get("question"), str) and "answer" in item
-        has_classification = "input" in item and "label" in item
-        if not has_qa and not has_classification:
-            return "评测数据需要 question + answer，或 input + label"
     return None
 
 
@@ -47,6 +46,7 @@ def validate_and_store_jsonl(
     record_count = 0
     errors: list[dict[str, Any]] = []
     field_names: set[str] = set()
+    evaluation_sample_ids: set[str] = set()
     digest = hashlib.sha256()
 
     temporary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,14 +56,19 @@ def validate_and_store_jsonl(
                 total_bytes += len(raw_line)
                 if total_bytes > MAX_DATASET_BYTES:
                     raise ValueError("数据集超过 5 GiB 限制")
-                if len(raw_line) > MAX_LINE_BYTES:
-                    _record_error(errors, line_number, "单行超过 16 MiB 限制")
+                line_limit = (
+                    MAX_EVALUATION_LINE_BYTES if dataset_type == DatasetType.EVALUATION else MAX_LINE_BYTES
+                )
+                if len(raw_line) > line_limit:
+                    _record_error(errors, line_number, f"单行超过 {line_limit} 字节限制")
                     continue
 
                 target.write(raw_line)
                 digest.update(raw_line)
                 if not raw_line.strip():
-                    _record_error(errors, line_number, "不允许空行")
+                    # 与评测执行器 load_jsonl 一致：评测集允许分隔空行，训练集仍拒绝。
+                    if dataset_type != DatasetType.EVALUATION:
+                        _record_error(errors, line_number, "不允许空行")
                     continue
                 try:
                     item = json.loads(raw_line)
@@ -74,9 +79,19 @@ def validate_and_store_jsonl(
                 record_count += 1
                 if isinstance(item, dict):
                     field_names.update(str(key) for key in item)
-                shape_error = _validate_shape(item, dataset_type)
-                if shape_error:
-                    _record_error(errors, line_number, shape_error)
+                if dataset_type == DatasetType.EVALUATION and isinstance(item, dict):
+                    try:
+                        sample = parse_evaluation_row(item, line_number)
+                    except DatasetValidationError as exc:
+                        _record_error(errors, line_number, str(exc))
+                    else:
+                        if sample.sample_id in evaluation_sample_ids:
+                            _record_error(errors, line_number, f"样本 ID 重复: {sample.sample_id}")
+                        evaluation_sample_ids.add(sample.sample_id)
+                else:
+                    shape_error = _validate_shape(item, dataset_type)
+                    if shape_error:
+                        _record_error(errors, line_number, shape_error)
 
         if record_count == 0:
             _record_error(errors, 0, "数据集没有有效记录")

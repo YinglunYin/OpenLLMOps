@@ -4,6 +4,7 @@ from app.api.routes import (
     api_keys,
     audit_logs,
     auth,
+    dashboard,
     datasets,
     deployments,
     evaluations,
@@ -31,6 +32,7 @@ protected_control.include_router(training_jobs.router)
 protected_control.include_router(evaluations.router)
 protected_control.include_router(api_keys.router)
 protected_control.include_router(audit_logs.router)
+protected_control.include_router(dashboard.router)
 protected_control.include_router(system.router)
 root_router.include_router(protected_control, prefix=get_settings().api_prefix)
 

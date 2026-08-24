@@ -8,7 +8,7 @@ from prometheus_client import make_asgi_app
 
 from app.api.router import root_router
 from app.core.config import get_settings
-from app.core.database import AsyncSessionFactory, create_all_tables, dispose_engine
+from app.core.database import AsyncSessionFactory, create_all_tables, dispose_engine, engine
 from app.core.metrics import metrics_middleware
 from app.core.request_context import request_context_and_audit_middleware
 from app.services.gpu_scheduler import GPULeaseManager
@@ -62,10 +62,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             importer,
             inbox_root=settings.model_inbox_root,
             staging_root=settings.model_staging_root,
+            store_root=settings.model_root,
             huggingface_token_file=settings.huggingface_token_file,
             modelscope_token_file=settings.modelscope_token_file,
             poll_interval_seconds=settings.model_import_poll_interval_seconds,
             concurrency=settings.model_import_concurrency,
+            claim_timeout_seconds=settings.model_import_claim_timeout_seconds,
+            lock_engine=engine,
         )
         import_stop_event = asyncio.Event()
         import_coordinator_task = asyncio.create_task(

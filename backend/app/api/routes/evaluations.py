@@ -8,7 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.models import Dataset, EvaluationRun, ModelAsset
-from app.models.enums import AssetStatus, DatasetStatus, DatasetType, DesiredJobState, JobState
+from app.models.enums import (
+    AssetStatus,
+    DatasetStatus,
+    DatasetType,
+    DesiredJobState,
+    JobState,
+    ModelKind,
+)
 from app.schemas import EvaluationRunCreate, EvaluationRunRead
 from app.services.crud import commit_or_conflict, get_or_404
 
@@ -28,6 +35,8 @@ async def create_evaluation_run(
     candidate = await get_or_404(session, ModelAsset, payload.candidate_model_asset_id, "候选模型")
     if base.status != AssetStatus.READY or candidate.status != AssetStatus.READY:
         raise HTTPException(status_code=422, detail="基线模型和候选模型必须处于 ready 状态")
+    if ModelKind.EMBEDDING in {base.model_kind, candidate.model_kind}:
+        raise HTTPException(status_code=422, detail="Embedding 模型不支持生成式评测")
     if payload.custom_dataset_id:
         dataset = await get_or_404(session, Dataset, payload.custom_dataset_id, "评测数据集")
         if dataset.dataset_type != DatasetType.EVALUATION or dataset.status != DatasetStatus.READY:

@@ -9,7 +9,9 @@ from app.schemas.agent_contract import (
 from app.schemas.audit import AuditLogRead
 from app.schemas.auth import AdminIdentityRead, LoginRequest
 from app.schemas.common import Message, StateActionResponse
+from app.schemas.dashboard import DashboardSummaryRead
 from app.schemas.model_imports import InboxCandidateRead, ModelImportCreate, ModelImportRead
+from app.schemas.monitoring import GPUHistoryMetric, GPUHistoryRead, GPUStatusRead
 from app.schemas.resources import (
     APIKeyCreate,
     APIKeyCreated,

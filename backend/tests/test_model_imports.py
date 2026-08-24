@@ -2,6 +2,7 @@ import asyncio
 import threading
 import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -17,11 +18,13 @@ from app.models.enums import (
     ModelImportSource,
     ModelImportStatus,
     ModelKind,
+    ModelSourceType,
 )
 from app.services.model_import_coordinator import (
     ModelImportCoordinator,
     claim_next_model_import,
     read_secret_file,
+    recover_stale_model_imports,
     request_model_import_cancel,
 )
 
@@ -99,6 +102,29 @@ class CancelableImporter:
         while not cancelled():
             time.sleep(0.001)
         raise ImportCancelledError("测试主动取消")
+
+
+class LateCompletingImporter:
+    """模拟 worker 已越过最后取消检查、即将完成原子移动的竞态。"""
+
+    def __init__(self, store_root: Path) -> None:
+        self.store_root = store_root
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def run(self, request: ImportRequest, *, progress=None, cancelled=None):  # type: ignore[no-untyped-def]
+        del progress, cancelled
+        self.started.set()
+        assert self.release.wait(2)
+        final_path = self.store_root / str(request.import_id)
+        final_path.mkdir(parents=True)
+        return final_path, ModelManifest(
+            model_type="qwen2",
+            architecture="Qwen2ForCausalLM",
+            total_size_bytes=10,
+            file_count=2,
+            files=(),
+        )
 
 
 async def test_sqlite_atomic_claim_does_not_double_claim(import_session_factory) -> None:
@@ -207,6 +233,138 @@ async def test_cancel_running_import_is_idempotent_and_creates_no_asset(
         second = await request_model_import_cancel(session, job_id)
         assert second is not None and second.status == ModelImportStatus.CANCELED
         assert await session.scalar(select(func.count()).select_from(ModelAsset)) == 0
+
+
+async def test_atomic_move_is_ready_commit_point_for_late_cancel(
+    import_session_factory,
+    tmp_path: Path,
+) -> None:
+    job_id = await _seed_import(import_session_factory)
+    store_root = tmp_path / "models"
+    importer = LateCompletingImporter(store_root)
+    coordinator = ModelImportCoordinator(
+        import_session_factory,
+        importer,
+        inbox_root=tmp_path / "inbox",
+        staging_root=tmp_path / "staging",
+        store_root=store_root,
+    )
+
+    await coordinator.run_once()
+    assert await asyncio.to_thread(importer.started.wait, 2)
+    async with import_session_factory() as session:
+        canceling = await request_model_import_cancel(session, job_id)
+        assert canceling is not None and canceling.status == ModelImportStatus.CANCELING
+    # 不再触发协调器取消轮询，模拟请求落在 worker 最后检查点之后。
+    importer.release.set()
+    await coordinator.wait_for_idle()
+
+    async with import_session_factory() as session:
+        job = await session.get(ModelImportJob, job_id)
+        asset = await session.get(ModelAsset, job.result_asset_id if job else None)
+        assert job is not None and job.status == ModelImportStatus.READY
+        assert asset is not None and asset.local_path == str(store_root / str(job_id))
+        assert Path(asset.local_path).is_dir()
+
+
+async def test_stale_claim_recovery_is_safe_and_does_not_delete_published_asset(
+    import_session_factory,
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    old = now - timedelta(minutes=10)
+    staging_root = tmp_path / "staging"
+    store_root = tmp_path / "models"
+    protected_id = uuid.uuid4()
+    async with import_session_factory() as session, session.begin():
+        stale = ModelImportJob(
+            name="stale-transfer",
+            source=ModelImportSource.CONTROLLED_DIRECTORY,
+            source_directory="candidate",
+            model_kind=ModelKind.BASE,
+            status=ModelImportStatus.TRANSFERRING,
+            progress_completed=50,
+            claimed_by="dead-worker",
+            claimed_at=old,
+            started_at=old,
+        )
+        canceling = ModelImportJob(
+            name="stale-cancel",
+            source=ModelImportSource.CONTROLLED_DIRECTORY,
+            source_directory="candidate",
+            model_kind=ModelKind.BASE,
+            status=ModelImportStatus.CANCELING,
+            progress_completed=50,
+            claimed_by="dead-worker",
+            claimed_at=old,
+            started_at=old,
+        )
+        fresh = ModelImportJob(
+            name="current-worker-transfer",
+            source=ModelImportSource.CONTROLLED_DIRECTORY,
+            source_directory="candidate",
+            model_kind=ModelKind.BASE,
+            status=ModelImportStatus.TRANSFERRING,
+            progress_completed=1,
+            # 即使时间异常偏旧，也不能恢复当前仍持有任务的协调器。
+            claimed_by="new-worker",
+            claimed_at=old,
+            started_at=old,
+        )
+        published_asset = ModelAsset(
+            name="published",
+            source_type=ModelSourceType.MANUAL,
+            local_path=str(store_root.resolve() / str(protected_id)),
+            model_kind=ModelKind.BASE,
+            status=AssetStatus.READY,
+        )
+        session.add_all([stale, canceling, fresh, published_asset])
+        await session.flush()
+        protected = ModelImportJob(
+            id=protected_id,
+            name="published-active-anomaly",
+            source=ModelImportSource.CONTROLLED_DIRECTORY,
+            source_directory="candidate",
+            model_kind=ModelKind.BASE,
+            status=ModelImportStatus.TRANSFERRING,
+            progress_completed=1,
+            claimed_by="dead-worker",
+            claimed_at=old,
+            started_at=old,
+            result_asset_id=published_asset.id,
+        )
+        session.add(protected)
+        await session.flush()
+        ids = stale.id, canceling.id, fresh.id, protected.id
+
+    for job_id in ids:
+        (staging_root / str(job_id)).mkdir(parents=True)
+        (staging_root / str(job_id) / "partial").write_text("partial", encoding="utf-8")
+        (store_root / str(job_id)).mkdir(parents=True)
+        (store_root / str(job_id) / "sentinel").write_text("keep?", encoding="utf-8")
+
+    recovered = await recover_stale_model_imports(
+        import_session_factory,
+        staging_root=staging_root,
+        store_root=store_root,
+        worker_id="new-worker",
+        claim_timeout_seconds=120,
+        now=now,
+    )
+    assert recovered == 3
+
+    async with import_session_factory() as session:
+        stale, canceling, fresh, protected = [await session.get(ModelImportJob, job_id) for job_id in ids]
+        assert stale is not None and stale.status == ModelImportStatus.PENDING
+        assert stale.claimed_by is None and stale.progress_completed == 0
+        assert canceling is not None and canceling.status == ModelImportStatus.CANCELED
+        assert fresh is not None and fresh.status == ModelImportStatus.TRANSFERRING
+        assert protected is not None and protected.status == ModelImportStatus.READY
+    assert not (staging_root / str(ids[0])).exists()
+    assert not (store_root / str(ids[0])).exists()
+    assert not (store_root / str(ids[1])).exists()
+    assert (store_root / str(ids[2]) / "sentinel").is_file()
+    assert (store_root / str(ids[3]) / "sentinel").is_file()
 
 
 def test_secret_file_must_be_regular_and_read_only(tmp_path: Path) -> None:

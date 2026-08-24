@@ -138,6 +138,34 @@ def test_api_key_plaintext_is_only_returned_once(client: TestClient) -> None:
     assert "key_hash" not in matching
 
 
+def test_evaluation_rejects_embedding_models(client: TestClient) -> None:
+    embedding = client.post(
+        "/api/v1/model-assets",
+        json={
+            "name": f"embedding-{uuid.uuid4()}",
+            "source_type": "manual",
+            "local_path": f"/srv/openllmops/models/{uuid.uuid4()}",
+            "model_kind": "embedding",
+            "status": "ready",
+        },
+    )
+    assert embedding.status_code == 201, embedding.text
+    candidate = create_ready_model(client, "evaluation-candidate")
+
+    response = client.post(
+        "/api/v1/evaluation-runs",
+        json={
+            "name": f"evaluation-{uuid.uuid4()}",
+            "base_model_asset_id": embedding.json()["id"],
+            "candidate_model_asset_id": candidate["id"],
+            "builtin_datasets": ["ceval"],
+            "gpu_ids": [0],
+        },
+    )
+    assert response.status_code == 422
+    assert "Embedding" in response.json()["detail"]
+
+
 def test_admin_and_issued_api_key_authentication(client: TestClient) -> None:
     settings = get_settings()
     previous_enabled = settings.auth_enabled

@@ -1,11 +1,12 @@
 import asyncio
 import os
+import shutil
 import stat
 import threading
 import uuid
-from collections.abc import Callable
-from contextlib import contextmanager, suppress
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, contextmanager, suppress
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -16,8 +17,8 @@ from openllmops_model_importer import (
     ModelSource,
 )
 from openllmops_model_importer.importer import ImportCancelledError
-from sqlalchemy import case, select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import case, func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.models import ModelAsset, ModelImportJob
 from app.models.enums import (
@@ -41,6 +42,9 @@ ACTIVE_IMPORT_STATUSES = {
     ModelImportStatus.VALIDATING,
     ModelImportStatus.CANCELING,
 }
+# 独立于 GPU scheduler 的锁命名空间（ASCII "MIMP"）。
+MODEL_IMPORT_RECOVERY_LOCK_ID = 0x4D494D50
+MODEL_IMPORT_INSTANCE_LOCK_ID = 0x4D494E53
 
 
 class ImporterProtocol(Protocol):
@@ -51,6 +55,27 @@ class ImporterProtocol(Protocol):
         progress: Callable[[str, int, int | None], None] | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> tuple[Path, ModelManifest]: ...
+
+
+@asynccontextmanager
+async def model_import_instance_lock(engine: AsyncEngine | None) -> AsyncIterator[None]:
+    """生产 PostgreSQL 用会话级 advisory lock 强制只有一个导入协调器实例。"""
+
+    if engine is None or engine.dialect.name != "postgresql":
+        yield
+        return
+    async with engine.connect() as connection:
+        acquired = await connection.scalar(select(func.pg_try_advisory_lock(MODEL_IMPORT_INSTANCE_LOCK_ID)))
+        # 结束只读事务但保持同一个物理连接；会话级锁继续持有到 finally/断连。
+        await connection.commit()
+        if not acquired:
+            raise RuntimeError("已有模型导入协调器实例持有 PostgreSQL 单例锁")
+        try:
+            yield
+        finally:
+            with suppress(Exception):
+                await connection.scalar(select(func.pg_advisory_unlock(MODEL_IMPORT_INSTANCE_LOCK_ID)))
+                await connection.commit()
 
 
 def read_secret_file(path: Path | None) -> str | None:
@@ -204,6 +229,118 @@ async def request_model_import_cancel(
     return await session.get(ModelImportJob, updated_id)
 
 
+def _job_directory(root: Path, job_id: uuid.UUID) -> Path:
+    """只构造固定 UUID 子目录，不接受任务或请求提供的路径片段。"""
+
+    resolved_root = root.resolve(strict=False)
+    candidate = resolved_root / str(job_id)
+    if candidate.parent != resolved_root:  # pragma: no cover - UUID 字符串不可能越界
+        raise ValueError("模型导入恢复目录越界")
+    return candidate
+
+
+def _remove_job_directory(root: Path, job_id: uuid.UUID) -> None:
+    candidate = _job_directory(root, job_id)
+    try:
+        file_stat = candidate.lstat()
+    except FileNotFoundError:
+        return
+    # 顶层软链接只删除链接自身，绝不跟随到受控目录之外。
+    if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISDIR(file_stat.st_mode):
+        candidate.unlink()
+        return
+    shutil.rmtree(candidate)
+
+
+async def recover_stale_model_imports(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    staging_root: Path,
+    store_root: Path,
+    worker_id: str,
+    claim_timeout_seconds: int,
+    now: datetime | None = None,
+) -> int:
+    """恢复失去心跳的任务，并清理仅属于该任务且尚未发布的目录。
+
+    PostgreSQL advisory transaction lock 让多个 API 实例不会同时做恢复；任务行锁同时
+    串行化管理员取消。仍存活协调器每轮刷新 claimed_at，因此只有超过租约时间且不属于
+    当前实例的任务会进入恢复路径。
+    """
+
+    recovered_at = now or datetime.now(UTC)
+    cutoff = recovered_at - timedelta(seconds=claim_timeout_seconds)
+    recovered = 0
+    async with session_factory() as session, session.begin():
+        dialect_name = session.bind.dialect.name if session.bind is not None else ""
+        if dialect_name == "postgresql":
+            locked = await session.scalar(
+                select(func.pg_try_advisory_xact_lock(MODEL_IMPORT_RECOVERY_LOCK_ID))
+            )
+            if not locked:
+                return 0
+        statement = (
+            select(ModelImportJob)
+            .where(
+                ModelImportJob.status.in_(ACTIVE_IMPORT_STATUSES),
+                or_(ModelImportJob.claimed_at.is_(None), ModelImportJob.claimed_at < cutoff),
+                or_(ModelImportJob.claimed_by.is_(None), ModelImportJob.claimed_by != worker_id),
+            )
+            .order_by(ModelImportJob.claimed_at, ModelImportJob.id)
+        )
+        if dialect_name == "postgresql":
+            statement = statement.with_for_update(skip_locked=True)
+        jobs = list(await session.scalars(statement))
+        for job in jobs:
+            if job.result_asset_id is not None:
+                # DB 事务一旦已关联资产，ready 是唯一安全终态，恢复绝不触碰资产目录。
+                asset = await session.get(ModelAsset, job.result_asset_id)
+                job.status = ModelImportStatus.READY
+                job.finished_at = recovered_at
+                job.error_message = None
+                if asset is not None and asset.size_bytes is not None:
+                    job.progress_completed = asset.size_bytes
+                    job.progress_total = asset.size_bytes
+                recovered += 1
+                continue
+            final_path = _job_directory(store_root, job.id)
+            existing_asset = await session.scalar(
+                select(ModelAsset.id).where(ModelAsset.local_path == str(final_path)).limit(1)
+            )
+            if existing_asset is not None:
+                # 绝不删除已有资产路径；异常状态交给管理员处理，避免重复发布同一路径。
+                job.status = ModelImportStatus.FAILED
+                job.finished_at = recovered_at
+                job.error_message = "恢复中发现最终目录已关联其他模型资产，请人工检查"
+                recovered += 1
+                continue
+            try:
+                await asyncio.to_thread(_remove_job_directory, staging_root, job.id)
+                await asyncio.to_thread(_remove_job_directory, staging_root / ".sdk-home", job.id)
+                await asyncio.to_thread(_remove_job_directory, store_root, job.id)
+            except OSError as exc:
+                job.status = ModelImportStatus.FAILED
+                job.finished_at = recovered_at
+                job.error_message = f"清理中断导入目录失败：{type(exc).__name__}"
+                recovered += 1
+                continue
+            if job.status == ModelImportStatus.CANCELING:
+                job.status = ModelImportStatus.CANCELED
+                job.finished_at = recovered_at
+            else:
+                job.status = ModelImportStatus.PENDING
+                job.started_at = None
+                job.finished_at = None
+                job.progress_completed = 0
+                job.progress_total = None
+                job.cancel_requested_at = None
+            job.claimed_by = None
+            job.claimed_at = None
+            job.error_message = None
+            recovered += 1
+    return recovered
+
+
 class ModelImportCoordinator:
     def __init__(
         self,
@@ -212,21 +349,27 @@ class ModelImportCoordinator:
         *,
         inbox_root: Path,
         staging_root: Path,
+        store_root: Path | None = None,
         huggingface_token_file: Path | None = None,
         modelscope_token_file: Path | None = None,
         poll_interval_seconds: float = 1.0,
         concurrency: int = 1,
+        claim_timeout_seconds: int = 120,
         worker_id: str | None = None,
+        lock_engine: AsyncEngine | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.importer = importer
         self.inbox_root = inbox_root
         self.staging_root = staging_root
+        self.store_root = store_root or staging_root.parent / "models"
         self.huggingface_token_file = huggingface_token_file
         self.modelscope_token_file = modelscope_token_file
         self.poll_interval_seconds = poll_interval_seconds
         self.concurrency = concurrency
+        self.claim_timeout_seconds = claim_timeout_seconds
         self.worker_id = worker_id or f"import-coordinator-{uuid.uuid4()}"
+        self.lock_engine = lock_engine
         self._tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
         self._cancel_events: dict[uuid.UUID, threading.Event] = {}
         self._shutting_down = False
@@ -253,6 +396,7 @@ class ModelImportCoordinator:
                     job.status = ModelImportStatus.TRANSFERRING
             job.progress_completed = max(0, completed)
             job.progress_total = max(0, total) if total is not None else None
+            job.claimed_at = datetime.now(UTC)
             await session.commit()
 
     def _token_file_for(self, source: ModelImportSource) -> Path | None:
@@ -298,16 +442,16 @@ class ModelImportCoordinator:
         final_path: Path,
         manifest: ModelManifest,
     ) -> None:
+        expected_path = _job_directory(self.store_root, job_id)
+        if final_path.resolve(strict=False) != expected_path:
+            raise RuntimeError("模型导入 worker 返回了受控仓库之外的最终路径")
         manifest_json = manifest.as_dict()
         async with self.session_factory() as session, session.begin():
             job = await session.get(ModelImportJob, job_id, with_for_update=True)
             if job is None:
                 raise RuntimeError("模型导入任务在完成前被删除")
-            # 取消和校验完成可能在最后一个轮询周期内竞争；取消一旦提交就不再发布资产。
-            if job.status == ModelImportStatus.CANCELING:
-                job.status = ModelImportStatus.CANCELED
-                job.finished_at = datetime.now(UTC)
-                return
+            # worker 的原子移动是发布提交点：到达这里的迟到取消不能覆盖 ready，否则会
+            # 留下没有资产记录的最终目录。更早的取消仍由 worker 的检查点收敛为 canceled。
             source_type = {
                 ModelImportSource.HUGGINGFACE: ModelSourceType.HUGGINGFACE,
                 ModelImportSource.MODELSCOPE: ModelSourceType.MODELSCOPE,
@@ -434,9 +578,35 @@ class ModelImportCoordinator:
             self._tasks.pop(job_id, None)
             self._cancel_events.pop(job_id, None)
 
+    async def _heartbeat_active_jobs(self) -> None:
+        if not self._tasks:
+            return
+        async with self.session_factory() as session:
+            await session.execute(
+                update(ModelImportJob)
+                .where(
+                    ModelImportJob.id.in_(self._tasks),
+                    ModelImportJob.claimed_by == self.worker_id,
+                    ModelImportJob.status.in_(ACTIVE_IMPORT_STATUSES),
+                )
+                .values(claimed_at=datetime.now(UTC))
+            )
+            await session.commit()
+
+    async def _recover_stale_jobs(self) -> int:
+        return await recover_stale_model_imports(
+            self.session_factory,
+            staging_root=self.staging_root,
+            store_root=self.store_root,
+            worker_id=self.worker_id,
+            claim_timeout_seconds=self.claim_timeout_seconds,
+        )
+
     async def run_once(self) -> None:
         await self._signal_canceling_jobs()
         await self._collect_finished()
+        await self._heartbeat_active_jobs()
+        await self._recover_stale_jobs()
         while len(self._tasks) < self.concurrency:
             job = await claim_next_model_import(self.session_factory, self.worker_id)
             if job is None:
@@ -454,16 +624,17 @@ class ModelImportCoordinator:
         await self._collect_finished()
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
-        try:
-            while not stop_event.is_set():
-                await self.run_once()
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(stop_event.wait(), timeout=self.poll_interval_seconds)
-        finally:
-            self._shutting_down = True
-            for cancel_event in self._cancel_events.values():
-                cancel_event.set()
-            await self.wait_for_idle()
+        async with model_import_instance_lock(self.lock_engine):
+            try:
+                while not stop_event.is_set():
+                    await self.run_once()
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(stop_event.wait(), timeout=self.poll_interval_seconds)
+            finally:
+                self._shutting_down = True
+                for cancel_event in self._cancel_events.values():
+                    cancel_event.set()
+                await self.wait_for_idle()
 
 
 def build_model_importer(inbox_root: Path, staging_root: Path, store_root: Path) -> ModelImporter:
