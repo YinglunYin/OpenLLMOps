@@ -11,27 +11,30 @@ import PanelCard from '@/components/PanelCard.vue'
 import StatCard from '@/components/StatCard.vue'
 import StatusPill from '@/components/StatusPill.vue'
 import { formatBytes } from '@/api/adapters'
-import { api } from '@/api/services'
+import { api, normalizeTraining } from '@/api/services'
 import { useMocks } from '@/api/client'
 import type { BackendTrainingArtifact } from '@/api/contracts'
 import type { Dataset, GpuDevice, ModelAsset, StatusTone, TrainingJob } from '@/types/domain'
 
+type TrainingArtifactRow = BackendTrainingArtifact & { jobId: string }
+
 const router = useRouter()
 const rows = ref<TrainingJob[]>([])
 const selected = ref<TrainingJob | null>(null)
-const artifactRows = ref<BackendTrainingArtifact[]>([])
+const artifactRows = ref<TrainingArtifactRow[]>([])
 const artifactError = ref('')
 const artifactsBusy = ref(false)
 const publishBusy = ref(false)
-const mockGpus = ref<GpuDevice[]>([])
+const gpuOptions = ref<GpuDevice[]>([])
 const modelOptions = ref<ModelAsset[]>([])
 const datasetOptions = ref<Dataset[]>([])
 const createVisible = ref(false)
 const createBusy = ref(false)
 let refreshTimer: number | undefined
 let refreshRunning = false
+let artifactRequestVersion = 0
 const form = reactive({
-  name: '', stage: 'SFT', algorithm: 'LoRA', modelAssetId: '', datasetId: '', gpuCount: 1,
+  name: '', stage: 'SFT', algorithm: 'LoRA', modelAssetId: '', datasetId: '', gpuIds: [0] as number[],
   epochs: 3, learningRate: 0.0002, cutoffLen: 2048, batchSize: 2, gradientAccumulation: 8,
   loggingSteps: 10, saveSteps: 100, warmupRatio: 0.03, loraRank: 8, loraAlpha: 16,
   loraDropout: 0.05, freezeTrainableLayers: 2, maxSamples: null as number | null, seed: 42,
@@ -60,6 +63,23 @@ const artifactLabels: Record<BackendTrainingArtifact['kind'], string> = {
   checkpoint: 'Checkpoint', adapter: 'Adapter', merged: '合并模型', full: '完整输出',
 }
 const artifactLabel = (kind: BackendTrainingArtifact['kind']) => artifactLabels[kind]
+const gpuStateText = (gpu: GpuDevice) => ({ idle: '空闲', inference: '推理占用', training: '训练占用', reserved: '已预留', unmanaged: '未纳管占用', unknown: '状态未知' })[gpu.state]
+const selectedGpus = computed(() => selected.value
+  ? gpuOptions.value.filter((gpu) => selected.value?.gpuIds.includes(gpu.index))
+  : [])
+const trainingConfigPreview = computed(() => normalizeTraining({ ...form }).training_config)
+const reportedMetricEntries = computed(() => {
+  const metrics = selected.value?.metrics ?? {}
+  const labels: Record<string, string> = {
+    loss: 'Train Loss', eval_loss: 'Eval Loss', learning_rate: 'Learning Rate',
+    epoch: 'Epoch', grad_norm: 'Grad Norm', tokens_per_second: 'Tokens/s',
+    train_samples_per_second: 'Samples/s', eta: 'ETA',
+  }
+  return Object.entries(metrics)
+    .filter(([, value]) => ['string', 'number', 'boolean'].includes(typeof value))
+    .slice(0, 12)
+    .map(([key, value]) => ({ key, label: labels[key] ?? key, value: String(value) }))
+})
 
 const statusMap: Record<TrainingJob['status'], { text: string; tone: StatusTone }> = {
   running: { text: '训练中', tone: 'success' }, queued: { text: '等待 GPU', tone: 'warning' }, completed: { text: '已完成', tone: 'primary' }, failed: { text: '失败', tone: 'danger' }, stopping: { text: '终止中', tone: 'info' }, terminated: { text: '已终止', tone: 'info' },
@@ -73,7 +93,7 @@ const learningRateOption = { grid: { top: 12, left: 44, right: 8, bottom: 22 }, 
 
 async function stopJob() {
   if (!selected.value) return
-  await ElMessageBox.confirm('终止后将保存最近一个完整 checkpoint 并释放 GPU，当前 step 不可恢复。', `终止 ${selected.value.name}`, { type: 'warning' })
+  await ElMessageBox.confirm('终止会中断当前训练并释放 GPU；首版不支持从 checkpoint 恢复，未完成任务的原始状态文件不会开放下载。', `终止 ${selected.value.name}`, { type: 'warning' })
   try {
     if (useMocks) selected.value.status = 'stopping'
     await api.training.stop(selected.value.id)
@@ -92,7 +112,7 @@ async function refreshJobs() {
   refreshRunning = true
   try {
     const selectedId = selected.value?.id
-    rows.value = await api.training.list()
+    ;[rows.value, gpuOptions.value] = await Promise.all([api.training.list(), api.resources.gpus()])
     selected.value = rows.value.find((item) => item.id === selectedId) ?? rows.value[0] ?? null
   } finally {
     refreshRunning = false
@@ -100,28 +120,31 @@ async function refreshJobs() {
 }
 
 async function loadArtifacts(job: TrainingJob | null) {
+  const requestVersion = ++artifactRequestVersion
   artifactRows.value = []
   artifactError.value = ''
   if (!job || !terminalStatuses.includes(job.status)) return
   artifactsBusy.value = true
   try {
-    artifactRows.value = await api.training.artifacts(job.id)
+    const artifacts = await api.training.artifacts(job.id)
+    if (requestVersion !== artifactRequestVersion || selected.value?.id !== job.id) return
+    artifactRows.value = artifacts.map((artifact) => ({ ...artifact, jobId: job.id }))
   } catch (error) {
+    if (requestVersion !== artifactRequestVersion || selected.value?.id !== job.id) return
     artifactError.value = error instanceof Error ? error.message : '训练产物清单加载失败'
   } finally {
-    artifactsBusy.value = false
+    if (requestVersion === artifactRequestVersion) artifactsBusy.value = false
   }
 }
 
-function downloadArtifact(artifact: BackendTrainingArtifact) {
-  if (!selected.value) return
+function downloadArtifact(artifact: TrainingArtifactRow) {
   if (useMocks) {
     ElMessage.success(`演示下载：${artifact.archive_filename}`)
     return
   }
   // 让浏览器直接流式保存后端 FileResponse，避免把数 GB 模型压缩包读入页面内存。
   const link = document.createElement('a')
-  link.href = api.training.artifactDownloadUrl(selected.value.id, artifact.kind)
+  link.href = api.training.artifactDownloadUrl(artifact.jobId, artifact.kind)
   link.download = artifact.archive_filename
   link.rel = 'noopener'
   document.body.append(link)
@@ -163,7 +186,7 @@ async function removeJob(row: TrainingJob) {
 }
 
 async function createJob() {
-  if (!form.name || !form.modelAssetId || !form.datasetId) { ElMessage.warning('请填写任务名称并选择模型、数据集'); return }
+  if (!form.name || !form.modelAssetId || !form.datasetId || !form.gpuIds.length) { ElMessage.warning('请填写任务名称并选择模型、数据集及至少一张 GPU'); return }
   createBusy.value = true
   try {
     await api.training.create({ ...form })
@@ -180,8 +203,7 @@ async function createJob() {
 
 onMounted(async () => {
   try {
-    if (import.meta.env.VITE_USE_MOCKS === 'true') mockGpus.value = (await import('@/mock/data')).gpuDevices
-    ;[rows.value, modelOptions.value, datasetOptions.value] = await Promise.all([api.training.list(), api.models.list(), api.datasets.list()])
+    ;[rows.value, modelOptions.value, datasetOptions.value, gpuOptions.value] = await Promise.all([api.training.list(), api.models.list(), api.datasets.list(), api.resources.gpus()])
     selected.value = rows.value[0] ?? null
     refreshTimer = window.setInterval(() => { void refreshJobs().catch(() => undefined) }, 3_000)
   } catch (error) {
@@ -237,11 +259,12 @@ watch(
       </div>
       <div v-else class="reported-metrics">
         <h3>任务上报指标</h3>
+        <div v-if="reportedMetricEntries.length" class="reported-metric-grid"><span v-for="metric in reportedMetricEntries" :key="metric.key"><small>{{ metric.label }}</small><b>{{ metric.value }}</b></span></div>
         <pre v-if="selected.metrics && Object.keys(selected.metrics).length">{{ JSON.stringify(selected.metrics, null, 2) }}</pre>
         <el-empty v-else description="训练容器尚未上报指标" :image-size="54" />
       </div>
-      <div v-if="useMocks" class="training-bottom">
-        <div class="training-gpus"><GpuCard v-for="gpu in mockGpus" :key="gpu.index" :gpu="{...gpu,state:'training'}" compact /></div>
+      <div v-if="selectedGpus.length" class="training-bottom">
+        <div class="training-gpus"><GpuCard v-for="gpu in selectedGpus" :key="gpu.index" :gpu="gpu" compact /></div>
       </div>
       <div class="checkpoint-empty">
         <div class="artifact-heading"><h3>任务产物</h3><el-button v-if="selected.status === 'completed'" type="primary" size="small" :loading="publishBusy" @click="publishModel">{{ selected.publishedModelAssetId ? '部署已发布模型' : '发布并部署模型' }}</el-button></div>
@@ -253,7 +276,7 @@ watch(
           <el-table-column label="操作" width="95"><template #default="{row}"><el-button link type="primary" :icon="Download" @click="downloadArtifact(row)">导出</el-button></template></el-table-column>
         </el-table>
         <el-alert v-else-if="artifactError" :title="artifactError" type="warning" :closable="false" show-icon />
-        <template v-else-if="reportedPaths.length"><div v-for="artifact in reportedPaths" :key="artifact.label" class="artifact-row"><span>{{ artifact.label }}</span><code>{{ artifact.path }}</code></div><p class="artifact-hint">任务进入终态后，控制面将独立复核并开放压缩导出。</p></template>
+        <template v-else-if="!terminalStatuses.includes(selected.status) && reportedPaths.length"><div v-for="artifact in reportedPaths" :key="artifact.label" class="artifact-row"><span>{{ artifact.label }}</span><code>{{ artifact.path }}</code></div><p class="artifact-hint">只有成功结束并通过独立安全复核的产物才会开放压缩导出。</p></template>
         <el-empty v-else :description="terminalStatuses.includes(selected.status) ? '任务没有通过安全校验的可导出产物' : '任务尚未产生 checkpoint 或模型产物'" :image-size="54" />
       </div>
     </PanelCard>
@@ -264,11 +287,12 @@ watch(
         <div class="two-column-form"><el-form-item label="任务名称" required><el-input v-model="form.name" placeholder="例如 sft-qlora-finance" /></el-form-item><el-form-item label="训练阶段"><el-radio-group v-model="form.stage"><el-radio-button value="CPT">继续预训练 CPT</el-radio-button><el-radio-button value="SFT">指令微调 SFT</el-radio-button></el-radio-group></el-form-item></div>
         <div class="two-column-form"><el-form-item label="基础模型" required><el-select v-model="form.modelAssetId" style="width:100%" placeholder="选择已校验模型"><el-option v-for="model in modelOptions.filter((item) => item.status === 'available' && item.type === 'generation')" :key="model.id" :label="model.name" :value="model.id"/></el-select></el-form-item><el-form-item label="数据集版本" required><el-select v-model="form.datasetId" style="width:100%" placeholder="选择匹配用途的数据集"><el-option v-for="dataset in datasetOptions.filter((item) => item.status === 'available' && item.purpose === form.stage)" :key="dataset.id" :label="`${dataset.name} ${dataset.version}`" :value="dataset.id"/></el-select></el-form-item></div>
         <el-form-item label="训练算法"><el-radio-group v-model="form.algorithm"><el-radio-button value="LoRA">LoRA</el-radio-button><el-radio-button v-if="form.stage==='SFT'" value="QLoRA">QLoRA</el-radio-button><el-radio-button v-if="form.stage==='SFT'" value="Freeze">Freeze</el-radio-button></el-radio-group><p v-if="form.stage==='CPT'" class="form-help">继续预训练在本版本固定使用 LoRA。</p></el-form-item>
-        <div class="four-column-form"><el-form-item label="整卡数量"><el-input-number v-model="form.gpuCount" :min="1" :max="4"/></el-form-item><el-form-item label="Epoch"><el-input-number v-model="form.epochs" :min="0.1" :max="100" :step="0.5"/></el-form-item><el-form-item label="学习率"><el-input-number v-model="form.learningRate" :min="0.0000001" :max="1" :step="0.0001" :precision="7"/></el-form-item><el-form-item label="单卡批大小"><el-input-number v-model="form.batchSize" :min="1" :max="128"/></el-form-item></div>
+        <div class="four-column-form"><el-form-item label="整卡选择" required><el-select v-model="form.gpuIds" multiple collapse-tags :max-collapse-tags="2" style="width:100%"><el-option v-for="gpu in gpuOptions" :key="gpu.index" :label="`GPU ${gpu.index} · ${gpuStateText(gpu)}`" :value="gpu.index" /></el-select></el-form-item><el-form-item label="Epoch"><el-input-number v-model="form.epochs" :min="0.1" :max="100" :step="0.5"/></el-form-item><el-form-item label="学习率"><el-input-number v-model="form.learningRate" :min="0.0000001" :max="1" :step="0.0001" :precision="7"/></el-form-item><el-form-item label="单卡批大小"><el-input-number v-model="form.batchSize" :min="1" :max="128"/></el-form-item></div>
         <div class="four-column-form"><el-form-item label="截断长度"><el-input-number v-model="form.cutoffLen" :min="128" :max="65536" :step="128"/></el-form-item><el-form-item label="梯度累积"><el-input-number v-model="form.gradientAccumulation" :min="1" :max="4096"/></el-form-item><el-form-item label="日志间隔"><el-input-number v-model="form.loggingSteps" :min="1" :max="100000"/></el-form-item><el-form-item label="保存间隔"><el-input-number v-model="form.saveSteps" :min="1" :max="1000000"/></el-form-item></div>
         <div class="four-column-form"><el-form-item label="Warmup 比例"><el-input-number v-model="form.warmupRatio" :min="0" :max="1" :step="0.01"/></el-form-item><el-form-item label="随机种子"><el-input-number v-model="form.seed" :min="0" :max="2147483647"/></el-form-item><el-form-item label="最大样本数"><el-input-number v-model="form.maxSamples" :min="1" :max="10000000" placeholder="全部"/></el-form-item><el-form-item v-if="form.algorithm==='Freeze'" label="可训练层数"><el-input-number v-model="form.freezeTrainableLayers" :min="1" :max="256"/></el-form-item></div>
         <div v-if="form.algorithm!=='Freeze'" class="three-column-form"><el-form-item label="LoRA Rank"><el-input-number v-model="form.loraRank" :min="1" :max="1024"/></el-form-item><el-form-item label="LoRA Alpha"><el-input-number v-model="form.loraAlpha" :min="1" :max="4096"/></el-form-item><el-form-item label="LoRA Dropout"><el-input-number v-model="form.loraDropout" :min="0" :max="0.99" :step="0.01"/></el-form-item></div>
         <el-form-item v-if="form.stage === 'SFT'" label="LLaMA-Factory 模板"><el-select v-model="form.template" style="width:100%"><el-option label="Qwen / Qwen2" value="qwen"/><el-option label="Llama 3" value="llama3"/><el-option label="ChatML" value="chatml"/><el-option label="Gemma" value="gemma"/></el-select><p class="form-help">模板必须与基础模型的对话格式一致，否则训练样本会被错误编码。</p></el-form-item>
+        <el-collapse><el-collapse-item title="查看节点最终白名单参数" name="config"><pre class="config-preview">{{ JSON.stringify(trainingConfigPreview, null, 2) }}</pre></el-collapse-item></el-collapse>
         <el-alert title="训练产物" description="系统保存原始 checkpoint，并在 LoRA/QLoRA 任务完成后提供 Adapter；合并模型由受控产物流程生成后才能部署。" type="info" :closable="false" show-icon />
         <el-alert title="GPU 调度提示" description="训练任务非抢占式排队。GPU 不足时，需要管理员手动停止推理服务后才会自动启动。" type="warning" :closable="false" show-icon />
       </el-form>
@@ -278,7 +302,7 @@ watch(
 </template>
 
 <style scoped lang="scss">
-.progress-cell{display:grid;grid-template-columns:36px 1fr;align-items:center;gap:8px}.resource-warning{display:flex;align-items:center;gap:8px;padding:9px 18px;color:#d66e08;background:#fff8ed;font-size:12px}.resource-warning .el-button{margin-left:auto}.training-title{display:flex;align-items:center;justify-content:space-between;padding:13px 18px;border-bottom:1px solid #e2e8ef}.training-progress{display:grid;grid-template-columns:auto minmax(120px,260px) auto repeat(3,auto);align-items:center;gap:13px;padding:12px 18px;font-size:12px}.training-progress b{margin-left:5px;font-weight:550}.training-charts{display:grid;grid-template-columns:repeat(3,1fr) 1.3fr;gap:10px;padding:0 18px 12px}.chart-card,.metric-blocks,.checkpoint-card{border:1px solid #e1e7ef;border-radius:8px}.chart-card{padding:12px}.chart-card h3,.checkpoint-card h3{margin:0;font-size:12px}.metric-blocks{display:grid;grid-template-columns:1fr 1fr;gap:1px;overflow:hidden;background:#e1e7ef}.metric-blocks span{display:flex;justify-content:center;flex-direction:column;padding:12px;background:#fff}.metric-blocks small{color:#6f7b8e}.metric-blocks b{margin-top:6px;font-size:19px}.training-bottom{display:grid;grid-template-columns:1.5fr 1fr;gap:10px;padding:0 18px 16px}.training-gpus{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.checkpoint-card{padding:12px}.two-column-form{display:grid;grid-template-columns:1fr 1fr;gap:14px}.four-column-form{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.form-help{margin:7px 0 0 12px;color:#798598;font-size:12px}
-.reported-metrics,.checkpoint-empty{margin:0 18px 14px;padding:14px;border:1px solid #e1e7ef;border-radius:8px}.reported-metrics h3,.checkpoint-empty h3{margin:0;font-size:13px}.reported-metrics pre{margin:10px 0 0;padding:12px;border-radius:6px;color:#d9e7fb;background:#071b32;font-size:11px;overflow:auto}.artifact-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}.artifact-row{display:grid;grid-template-columns:120px minmax(0,1fr);gap:10px;padding:9px 0;border-bottom:1px solid #edf1f5;font-size:12px}.artifact-row code,.checkpoint-empty :deep(.el-table code){overflow:hidden;color:#536176;text-overflow:ellipsis;white-space:nowrap}.artifact-hint{margin:10px 0 0;color:#798598;font-size:12px}.checkpoint-empty .el-alert{margin-top:12px}.three-column-form{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.progress-cell{display:grid;grid-template-columns:36px 1fr;align-items:center;gap:8px}.resource-warning{display:flex;align-items:center;gap:8px;padding:9px 18px;color:#d66e08;background:#fff8ed;font-size:12px}.resource-warning .el-button{margin-left:auto}.training-title{display:flex;align-items:center;justify-content:space-between;padding:13px 18px;border-bottom:1px solid #e2e8ef}.training-progress{display:grid;grid-template-columns:auto minmax(120px,260px) auto repeat(3,auto);align-items:center;gap:13px;padding:12px 18px;font-size:12px}.training-progress b{margin-left:5px;font-weight:550}.training-charts{display:grid;grid-template-columns:repeat(3,1fr) 1.3fr;gap:10px;padding:0 18px 12px}.chart-card,.metric-blocks,.checkpoint-card{border:1px solid #e1e7ef;border-radius:8px}.chart-card{padding:12px}.chart-card h3,.checkpoint-card h3{margin:0;font-size:12px}.metric-blocks{display:grid;grid-template-columns:1fr 1fr;gap:1px;overflow:hidden;background:#e1e7ef}.metric-blocks span{display:flex;justify-content:center;flex-direction:column;padding:12px;background:#fff}.metric-blocks small{color:#6f7b8e}.metric-blocks b{margin-top:6px;font-size:19px}.training-bottom{padding:0 18px 16px}.training-gpus{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.checkpoint-card{padding:12px}.two-column-form{display:grid;grid-template-columns:1fr 1fr;gap:14px}.four-column-form{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.form-help{margin:7px 0 0 12px;color:#798598;font-size:12px}
+.reported-metrics,.checkpoint-empty{margin:0 18px 14px;padding:14px;border:1px solid #e1e7ef;border-radius:8px}.reported-metrics h3,.checkpoint-empty h3{margin:0;font-size:13px}.reported-metrics pre,.config-preview{margin:10px 0 0;padding:12px;border-radius:6px;color:#d9e7fb;background:#071b32;font-size:11px;overflow:auto}.reported-metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}.reported-metric-grid span{display:flex;min-width:0;flex-direction:column;padding:9px;border-radius:6px;background:#f5f7fa}.reported-metric-grid small{overflow:hidden;color:#718095;text-overflow:ellipsis;white-space:nowrap}.reported-metric-grid b{margin-top:4px;overflow:hidden;text-overflow:ellipsis}.artifact-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}.artifact-row{display:grid;grid-template-columns:120px minmax(0,1fr);gap:10px;padding:9px 0;border-bottom:1px solid #edf1f5;font-size:12px}.artifact-row code,.checkpoint-empty :deep(.el-table code){overflow:hidden;color:#536176;text-overflow:ellipsis;white-space:nowrap}.artifact-hint{margin:10px 0 0;color:#798598;font-size:12px}.checkpoint-empty .el-alert{margin-top:12px}.three-column-form{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.config-preview{max-height:230px;margin:0}.el-collapse{margin-bottom:14px}
 @media(max-width:1250px){.training-charts{grid-template-columns:repeat(2,1fr)}.training-bottom{grid-template-columns:1fr}.four-column-form{grid-template-columns:repeat(2,1fr)}}@media(max-width:760px){.training-progress{grid-template-columns:auto 1fr auto}.training-progress>span:nth-last-child(-n+3){display:none}.training-charts,.two-column-form,.three-column-form,.four-column-form{grid-template-columns:1fr}.training-gpus{grid-template-columns:repeat(2,1fr)}}
 </style>

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, shallowRef } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
 import { Box, DataAnalysis, Files, Refresh, Search, Upload, Warning } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
@@ -20,10 +20,15 @@ const previewRows = ref<Array<Record<string, unknown>>>(useMocks ? [{ instructio
 const detailTab = ref('overview')
 const uploadVisible = ref(false)
 const uploadBusy = ref(false)
+const uploadProgress = ref(0)
+let uploadController: AbortController | undefined
 const filters = reactive({ keyword: '', purpose: '', status: '' })
-const uploadForm = reactive({ name: '', purpose: 'SFT', version: 'v1.0.0', split: 'train 90% / valid 5% / test 5%' })
+const uploadForm = reactive({ name: '', purpose: 'SFT', version: 'v1.0.0' })
 
 const filtered = computed(() => rows.value.filter((item) => (!filters.keyword || item.name.includes(filters.keyword)) && (!filters.purpose || item.purpose === filters.purpose) && (!filters.status || item.status === filters.status)))
+const versionRows = computed(() => selected.value
+  ? rows.value.filter((item) => item.name === selected.value?.name).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+  : [])
 const counts = computed(() => ({
   cpt: rows.value.filter((item) => item.purpose === 'CPT').length,
   sft: rows.value.filter((item) => item.purpose === 'SFT').length,
@@ -80,19 +85,39 @@ async function removeDataset(row: Dataset) {
 async function submitUpload() {
   if (!uploadForm.name || !uploadFile.value) { ElMessage.warning('请填写数据集名称并选择 JSONL 文件'); return }
   uploadBusy.value = true
+  uploadProgress.value = 0
+  uploadController = new AbortController()
   try {
-    await api.datasets.upload({ name: uploadForm.name, purpose: uploadForm.purpose as Dataset['purpose'], description: `版本 ${uploadForm.version}；划分 ${uploadForm.split}` }, uploadFile.value)
+    await api.datasets.upload(
+      { name: uploadForm.name, purpose: uploadForm.purpose as Dataset['purpose'], version: uploadForm.version },
+      uploadFile.value,
+      { signal: uploadController.signal, onProgress: (percent) => { uploadProgress.value = percent } },
+    )
     uploadVisible.value = false
     uploadFile.value = undefined
     await refreshRows()
     if (selected.value) await selectDataset(selected.value)
     ElMessage.success('上传与逐行校验已完成')
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '数据集上传失败')
+    if (uploadController.signal.aborted) ElMessage.info('已中断浏览器传输或等待；若服务端已开始校验，结果仍可能稍后出现在列表中')
+    else ElMessage.error(error instanceof Error ? error.message : '数据集上传失败')
   } finally {
     uploadBusy.value = false
+    uploadController = undefined
   }
 }
+
+function cancelUpload() {
+  if (uploadBusy.value) uploadController?.abort()
+  uploadVisible.value = false
+}
+
+function beforeCloseUpload(done: () => void) {
+  uploadController?.abort()
+  done()
+}
+
+onBeforeUnmount(() => uploadController?.abort())
 
 onMounted(async () => {
   try {
@@ -151,23 +176,24 @@ onMounted(async () => {
         </el-tab-pane>
         <el-tab-pane label="数据预览" name="preview"><pre v-if="previewRows.length" class="json-preview">{{ previewRows.map((row) => JSON.stringify(row)).join('\n') }}</pre><el-empty v-else description="暂无可预览记录" /></el-tab-pane>
         <el-tab-pane label="校验报告" name="report"><el-result :icon="selected.status === 'failed' ? 'error' : 'success'" :title="statusMeta(selected.status).text" :sub-title="`${selected.samples.toLocaleString()} 条记录，${selected.validationErrors?.length ?? 0} 条校验错误`" /></el-tab-pane>
-        <el-tab-pane label="版本记录" name="versions"><el-timeline v-if="useMocks"><el-timeline-item timestamp="2024-05-20 09:58">v2.1.0 上传并通过校验</el-timeline-item><el-timeline-item timestamp="2024-05-17 16:20">v2.0.0 创建</el-timeline-item></el-timeline><el-empty v-else description="控制面尚未提供版本历史端点" /></el-tab-pane>
+        <el-tab-pane label="版本记录" name="versions"><el-timeline v-if="versionRows.length"><el-timeline-item v-for="version in versionRows" :key="version.id" :timestamp="version.updatedAt">{{ version.version }} · {{ version.samples.toLocaleString() }} 条 · {{ statusMeta(version.status).text }}</el-timeline-item></el-timeline><el-empty v-else description="暂无版本记录" /><p class="version-hint">数据集内容不可原地覆盖；上传同名的新记录即可形成新版本。</p></el-tab-pane>
       </el-tabs>
     </PanelCard>
     <PanelCard v-else class="section-gap"><el-empty description="暂无数据集，请上传 JSONL 文件" /></PanelCard>
 
-    <el-dialog v-model="uploadVisible" title="上传 JSONL 数据集" width="min(620px, 94vw)">
+    <el-dialog v-model="uploadVisible" title="上传 JSONL 数据集" width="min(620px, 94vw)" :before-close="beforeCloseUpload" :close-on-click-modal="!uploadBusy" :close-on-press-escape="!uploadBusy" :show-close="!uploadBusy">
       <el-form label-position="top">
         <div class="two-column-form"><el-form-item label="数据集名称" required><el-input v-model="uploadForm.name" placeholder="请输入业务含义明确的名称" /></el-form-item><el-form-item label="用途"><el-select v-model="uploadForm.purpose" style="width:100%"><el-option label="继续预训练（CPT）" value="CPT"/><el-option label="指令微调（SFT）" value="SFT"/><el-option label="模型测评" value="Evaluation"/></el-select></el-form-item></div>
-        <div class="two-column-form"><el-form-item label="版本号"><el-input v-model="uploadForm.version" /></el-form-item><el-form-item label="数据划分"><el-input v-model="uploadForm.split" /></el-form-item></div>
+        <el-form-item label="版本号"><el-input v-model="uploadForm.version" placeholder="例如 v1.0.0" /></el-form-item>
         <el-form-item label="JSONL 文件" required><el-upload drag action="#" :auto-upload="false" accept=".jsonl" :limit="1" :on-change="handleFileChange"><el-icon class="el-icon--upload"><Upload /></el-icon><div class="el-upload__text">将文件拖到此处，或<em>点击选择</em></div><template #tip><div class="el-upload__tip">每行必须是独立 JSON 对象；上传后自动校验字段、长度与重复样本。</div></template></el-upload></el-form-item>
+        <el-progress v-if="uploadBusy" :percentage="uploadProgress" :indeterminate="uploadProgress === 0" :duration="2" />
       </el-form>
-      <template #footer><el-button @click="uploadVisible=false">取消</el-button><el-button type="primary" :loading="uploadBusy" @click="submitUpload">上传并校验</el-button></template>
+      <template #footer><el-button @click="cancelUpload">{{ uploadBusy ? '终止上传' : '取消' }}</el-button><el-button type="primary" :loading="uploadBusy" :disabled="uploadBusy" @click="submitUpload">上传并校验</el-button></template>
     </el-dialog>
   </div>
 </template>
 
 <style scoped lang="scss">
-.dataset-title { display:flex; align-items:center; justify-content:space-between; padding:15px 18px 0; }.dataset-title>div{display:flex;align-items:center;gap:10px}.dataset-title>span,.dataset-title>div>span{color:#748094;font-size:12px}.dataset-tabs{padding:0 18px 16px}.dataset-overview{display:grid;grid-template-columns:.8fr 1.2fr 1.1fr;gap:12px}.overview-card{min-width:0;padding:14px;border:1px solid #e1e7ef;border-radius:8px}.overview-card h3{margin:0 0 12px;font-size:13px}.overview-card dl{margin:0}.overview-card dt{margin-top:10px;color:#667388;font-size:11px}.overview-card dd{overflow:hidden;margin:3px 0 0;font-size:12px;text-overflow:ellipsis}.validation-metrics{display:grid;grid-template-columns:repeat(4,1fr);margin-bottom:14px}.validation-metrics span{display:flex;align-items:center;flex-direction:column;border-right:1px solid #e5eaf0}.validation-metrics span:last-child{border:0}.validation-metrics b{font-size:18px}.validation-metrics small{order:-1;color:#6d798d;font-size:10px}.warning-number{color:#ed8a16}.json-preview{margin:0;padding:16px;border-radius:7px;color:#d9e7fb;background:#071b32;line-height:1.8}.two-column-form{display:grid;grid-template-columns:1fr 1fr;gap:14px}.el-upload{width:100%}:deep(.el-upload-dragger){width:100%}
+.dataset-title { display:flex; align-items:center; justify-content:space-between; padding:15px 18px 0; }.dataset-title>div{display:flex;align-items:center;gap:10px}.dataset-title>span,.dataset-title>div>span{color:#748094;font-size:12px}.dataset-tabs{padding:0 18px 16px}.dataset-overview{display:grid;grid-template-columns:.8fr 1.2fr 1.1fr;gap:12px}.overview-card{min-width:0;padding:14px;border:1px solid #e1e7ef;border-radius:8px}.overview-card h3{margin:0 0 12px;font-size:13px}.overview-card dl{margin:0}.overview-card dt{margin-top:10px;color:#667388;font-size:11px}.overview-card dd{overflow:hidden;margin:3px 0 0;font-size:12px;text-overflow:ellipsis}.validation-metrics{display:grid;grid-template-columns:repeat(4,1fr);margin-bottom:14px}.validation-metrics span{display:flex;align-items:center;flex-direction:column;border-right:1px solid #e5eaf0}.validation-metrics span:last-child{border:0}.validation-metrics b{font-size:18px}.validation-metrics small{order:-1;color:#6d798d;font-size:10px}.warning-number{color:#ed8a16}.json-preview{margin:0;padding:16px;border-radius:7px;color:#d9e7fb;background:#071b32;line-height:1.8}.version-hint{margin:8px 0;color:#748094;font-size:12px}.two-column-form{display:grid;grid-template-columns:1fr 1fr;gap:14px}.el-upload{width:100%}:deep(.el-upload-dragger){width:100%}
 @media(max-width:1200px){.dataset-overview{grid-template-columns:1fr 1fr}.dataset-overview>div:last-child{grid-column:1/-1}}@media(max-width:700px){.dataset-overview,.two-column-form{grid-template-columns:1fr}.dataset-overview>div:last-child{grid-column:auto}.dataset-title>span{display:none}}
 </style>

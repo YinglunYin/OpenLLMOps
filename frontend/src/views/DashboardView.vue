@@ -56,6 +56,7 @@ onMounted(async () => {
     if (summaryResult.status === 'fulfilled') summary.value = summaryResult.value
     if (gpuResult.status === 'fulfilled') {
       gpus.value = gpuResult.value
+      summary.value = { ...summary.value, availableGpus: gpus.value.filter((gpu) => gpu.state === 'idle').length }
       if (!useMocks) {
         const histories = await api.resources.history('utilization', '1h', gpus.value.map((gpu) => gpu.index))
         utilizationSeries.value = histories.map((history) => history.points.map((point) => point.value))
@@ -96,7 +97,7 @@ onMounted(async () => {
       <StatCard label="模型资产" :value="summary.modelCount" :icon="Box" tone="blue" hint="已纳管 Safetensors 模型" />
       <StatCard label="运行服务" :value="summary.runningDeployments" :icon="Promotion" tone="green" hint="OpenAI Compatible 接口" />
       <StatCard label="训练任务" :value="summary.runningTrainingJobs" :icon="DataLine" tone="orange" hint="非抢占式整卡调度" />
-      <StatCard label="可用 GPU" :value="`${summary.availableGpus} / ${summary.totalGpus}`" :icon="Cpu" tone="purple" hint="整卡独占调度" />
+      <StatCard label="可用 GPU" :value="`${summary.availableGpus} / ${summary.totalGpus}`" :icon="Cpu" tone="purple" hint="租约与遥测均确认空闲" />
     </div>
 
     <PanelCard title="GPU 资源" class="section-gap">

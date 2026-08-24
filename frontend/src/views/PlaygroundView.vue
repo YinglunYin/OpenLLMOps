@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { ChatDotRound, Delete, Operation, Plus, Promotion, Setting, User } from '@element-plus/icons-vue'
+import { ChatDotRound, CopyDocument, Delete, Operation, Plus, Promotion, Setting, User } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 
 import PageHeader from '@/components/PageHeader.vue'
 import StatusPill from '@/components/StatusPill.vue'
 import { api, streamChat } from '@/api/services'
 import { useMocks } from '@/api/client'
-import type { ChatMessage, PlaygroundParams } from '@/types/domain'
+import type { ChatMessage, PlaygroundMetrics, PlaygroundParams } from '@/types/domain'
 
 const conversations = useMocks ? [
   { title: '如何优化大模型推理性能？', time: '刚刚' }, { title: '介绍一下向量数据库', time: '昨天 15:42' }, { title: '推荐一些机器学习书籍', time: '昨天 10:18' }, { title: '解释什么是注意力机制', time: '05-18 21:33' }, { title: 'Python 中的装饰器是什么', time: '05-18 16:07' },
@@ -23,6 +23,9 @@ const modelOptions = ref<string[]>(useMocks ? ['ChineseLM-8B-Instruct', 'Qwen2-7
 const params = reactive<PlaygroundParams>({ model: useMocks ? 'ChineseLM-8B-Instruct' : '', temperature: .7, topP: .9, maxTokens: 2048, repetitionPenalty: 1, stream: true })
 const input = ref('')
 const generating = ref(false)
+const metrics = ref<PlaygroundMetrics | null>(useMocks ? {
+  totalDurationMs: 1640, ttftMs: 186, inputTokens: 128, outputTokens: 356, outputTokensPerSecond: 42.8,
+} : null)
 const chatScroll = ref<HTMLElement>()
 let controller: AbortController | undefined
 
@@ -40,10 +43,12 @@ async function sendMessage() {
   const assistant: ChatMessage = { id: crypto.randomUUID(), role: 'assistant', content: '', createdAt: '' }
   messages.value.push(assistant)
   generating.value = true
-  controller = new AbortController()
+  metrics.value = null
+  const requestController = new AbortController()
+  controller = requestController
   await scrollToBottom()
   try {
-    await streamChat({ messages: messages.value.slice(0, -1), params, signal: controller.signal, onToken: (token) => { assistant.content += token; void scrollToBottom() } })
+    metrics.value = await streamChat({ messages: messages.value.slice(0, -1), params, signal: requestController.signal, onToken: (token) => { assistant.content += token; void scrollToBottom() } })
     assistant.createdAt = new Date().toLocaleTimeString('zh-CN', { hour12: false })
   } catch (error) {
     if (!(error instanceof DOMException && error.name === 'AbortError')) {
@@ -51,14 +56,30 @@ async function sendMessage() {
       ElMessage.error(error instanceof Error ? error.message : '生成请求失败')
     }
   } finally {
-    generating.value = false
-    controller = undefined
+    if (assistant.content && !assistant.createdAt) assistant.createdAt = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+    if (controller === requestController) {
+      generating.value = false
+      controller = undefined
+    }
   }
 }
 
-function stopGeneration() { controller?.abort(); generating.value = false }
-function clearChat() { stopGeneration(); messages.value = messages.value.filter((item) => item.role === 'system') }
+function stopGeneration() { controller?.abort() }
+function clearChat() { stopGeneration(); messages.value = messages.value.filter((item) => item.role === 'system'); metrics.value = null }
 function newChat() { clearChat(); input.value = '' }
+
+async function copyMessage(content: string) {
+  try {
+    await navigator.clipboard.writeText(content)
+    ElMessage.success('助手回复已复制')
+  } catch {
+    ElMessage.error('复制失败，请检查浏览器剪贴板权限')
+  }
+}
+
+function formatMetric(value: number | null | undefined, fractionDigits = 0): string {
+  return value === null || value === undefined ? '—' : value.toFixed(fractionDigits)
+}
 
 onBeforeUnmount(stopGeneration)
 onMounted(async () => {
@@ -75,7 +96,7 @@ onMounted(async () => {
 
 <template>
   <div class="playground-page">
-    <PageHeader title="Playground" subtitle="直接验证已部署生成模型的 OpenAI Compatible 流式能力" />
+    <PageHeader title="Playground" subtitle="直接验证已部署生成模型的 OpenAI Compatible 流式与非流式能力" />
 
     <section class="playground-shell">
       <div class="playground-toolbar">
@@ -100,7 +121,7 @@ onMounted(async () => {
           <div ref="chatScroll" class="message-list">
             <article v-for="message in messages" :key="message.id" :class="['message',`message-${message.role}`]">
               <div class="message-icon"><el-icon><Setting v-if="message.role==='system'"/><User v-else-if="message.role==='user'"/><Operation v-else/></el-icon></div>
-              <div class="message-content"><header><strong>{{ message.role==='system'?'系统提示':message.role==='user'?'用户':'助手' }}</strong><time>{{ message.createdAt }}</time></header><div>{{ message.content }}<i v-if="generating && message === messages.at(-1)" class="typing-caret" /></div></div>
+              <div class="message-content"><header><strong>{{ message.role==='system'?'系统提示':message.role==='user'?'用户':'助手' }}</strong><span class="message-actions"><time>{{ message.createdAt }}</time><el-button v-if="message.role==='assistant' && message.content" text circle size="small" :icon="CopyDocument" aria-label="复制助手回复" @click="copyMessage(message.content)" /></span></header><div>{{ message.content }}<i v-if="generating && message === messages.at(-1)" class="typing-caret" /></div></div>
             </article>
           </div>
           <div class="composer">
@@ -125,13 +146,14 @@ onMounted(async () => {
     </section>
 
     <div class="playground-metrics">
-      <div><span>TTFT</span><strong class="number-positive">{{ useMocks ? '186' : '—' }} <small v-if="useMocks">ms</small></strong></div><div><span>生成速度</span><strong class="number-primary">{{ useMocks ? '42.8' : '—' }} <small v-if="useMocks">tok/s</small></strong></div><div><span>输入</span><strong class="purple-number">{{ useMocks ? '128' : '—' }} <small v-if="useMocks">tokens</small></strong></div><div><span>输出</span><strong class="orange-number">{{ useMocks ? '356' : '—' }} <small v-if="useMocks">tokens</small></strong></div>
+      <div><span>总耗时</span><strong>{{ formatMetric(metrics?.totalDurationMs) }} <small v-if="metrics">ms</small></strong></div><div><span>TTFT</span><strong class="number-positive">{{ formatMetric(metrics?.ttftMs) }} <small v-if="metrics?.ttftMs != null">ms</small></strong></div><div><span>生成速度</span><strong class="number-primary">{{ formatMetric(metrics?.outputTokensPerSecond, 1) }} <small v-if="metrics?.outputTokensPerSecond != null">tok/s</small></strong></div><div><span>输入</span><strong class="purple-number">{{ formatMetric(metrics?.inputTokens) }} <small v-if="metrics?.inputTokens != null">tokens</small></strong></div><div><span>输出</span><strong class="orange-number">{{ formatMetric(metrics?.outputTokens) }} <small v-if="metrics?.outputTokens != null">tokens</small></strong></div>
     </div>
   </div>
 </template>
 
 <style scoped lang="scss">
-.playground-page{height:calc(100vh - 96px);min-height:720px;display:flex;flex-direction:column}.playground-page .page-header{flex:0 0 auto}.playground-shell{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;border:1px solid #dfe6ef;border-radius:9px;background:#fff}.playground-toolbar{height:61px;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid #e0e6ee}.model-select{width:290px}.playground-toolbar code{padding:7px 10px;border:1px solid #e0e6ee;border-radius:5px;color:#46546b;background:#fafbfd;font-size:12px}.clear-button{margin-left:auto}.playground-body{flex:1;min-height:0;display:grid;grid-template-columns:255px minmax(350px,1fr) 265px}.conversation-list{display:flex;flex-direction:column;gap:4px;padding:15px 10px;border-right:1px solid #e0e6ee}.conversation-list>.el-button{margin-bottom:7px}.conversation-item{display:flex;align-items:flex-start;gap:9px;padding:10px;border:0;border-radius:6px;text-align:left;background:transparent;cursor:pointer}.conversation-item:hover,.conversation-item.active{color:#1769f5;background:#edf5ff}.conversation-item>span{min-width:0;display:flex;flex-direction:column;gap:5px}.conversation-item strong{overflow:hidden;font-size:12px;white-space:nowrap;text-overflow:ellipsis}.conversation-item small{color:#8792a3;font-size:10px}.chat-area{min-width:0;display:flex;flex-direction:column;background:#f8fafc}.message-list{flex:1;min-height:0;overflow-y:auto;padding:16px}.message{display:grid;grid-template-columns:30px 1fr;gap:10px;margin-bottom:12px;padding:14px;border:1px solid #e0e6ee;border-radius:8px;background:#fff}.message-system{background:#f6f8fb}.message-icon{width:28px;height:28px;display:grid;place-items:center;border-radius:6px;color:#1769f5;background:#eaf2ff}.message-assistant .message-icon{color:#0da261;background:#e8f8ef}.message-content header{display:flex;justify-content:space-between;margin-bottom:7px}.message-content header strong{font-size:13px}.message-assistant header strong{color:#0b9e5f}.message-content time{color:#8792a3;font-size:10px}.message-content>div{color:#344055;font-size:13px;line-height:1.75;white-space:pre-wrap}.typing-caret{display:inline-block;width:2px;height:15px;margin-left:2px;vertical-align:middle;background:#1769f5;animation:blink .8s infinite}.composer{display:flex;align-items:flex-end;gap:8px;margin:0 16px 15px;padding:8px;border:1px solid #dce3ec;border-radius:8px;background:#fff}.composer:focus-within{border-color:#8ab8ff;box-shadow:0 0 0 2px #1769f512}.composer :deep(.el-textarea__inner){box-shadow:none!important}.parameter-panel{overflow-y:auto;padding:17px 16px;border-left:1px solid #e0e6ee}.parameter-panel h2{margin:0 0 20px;font-size:17px}.parameter-panel label{display:flex;flex-direction:column;gap:8px;margin-bottom:17px;color:#3f4b5e;font-size:12px}.parameter-panel label>span{display:flex;justify-content:space-between}.slider-row{display:grid;grid-template-columns:1fr 64px;align-items:center;gap:10px}.slider-row .el-input-number{width:64px}.parameter-panel label>.el-input-number{width:100%}.switch-row{display:flex;justify-content:space-between;margin:14px 0;font-size:12px}.playground-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:12px}.playground-metrics>div{display:flex;flex-direction:column;gap:8px;padding:13px 16px;border:1px solid #dfe6ef;border-radius:8px;background:#fff}.playground-metrics span{font-size:11px}.playground-metrics strong{font-size:20px}.playground-metrics small{font-size:10px;font-weight:500}.purple-number{color:#7c3aed}.orange-number{color:#ed8a16}@keyframes blink{50%{opacity:0}}
+.playground-page{height:calc(100vh - 96px);min-height:720px;display:flex;flex-direction:column}.playground-page .page-header{flex:0 0 auto}.playground-shell{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;border:1px solid #dfe6ef;border-radius:9px;background:#fff}.playground-toolbar{height:61px;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid #e0e6ee}.model-select{width:290px}.playground-toolbar code{padding:7px 10px;border:1px solid #e0e6ee;border-radius:5px;color:#46546b;background:#fafbfd;font-size:12px}.clear-button{margin-left:auto}.playground-body{flex:1;min-height:0;display:grid;grid-template-columns:255px minmax(350px,1fr) 265px}.conversation-list{display:flex;flex-direction:column;gap:4px;padding:15px 10px;border-right:1px solid #e0e6ee}.conversation-list>.el-button{margin-bottom:7px}.conversation-item{display:flex;align-items:flex-start;gap:9px;padding:10px;border:0;border-radius:6px;text-align:left;background:transparent;cursor:pointer}.conversation-item:hover,.conversation-item.active{color:#1769f5;background:#edf5ff}.conversation-item>span{min-width:0;display:flex;flex-direction:column;gap:5px}.conversation-item strong{overflow:hidden;font-size:12px;white-space:nowrap;text-overflow:ellipsis}.conversation-item small{color:#8792a3;font-size:10px}.chat-area{min-width:0;display:flex;flex-direction:column;background:#f8fafc}.message-list{flex:1;min-height:0;overflow-y:auto;padding:16px}.message{display:grid;grid-template-columns:30px 1fr;gap:10px;margin-bottom:12px;padding:14px;border:1px solid #e0e6ee;border-radius:8px;background:#fff}.message-system{background:#f6f8fb}.message-icon{width:28px;height:28px;display:grid;place-items:center;border-radius:6px;color:#1769f5;background:#eaf2ff}.message-assistant .message-icon{color:#0da261;background:#e8f8ef}.message-content header{display:flex;justify-content:space-between;margin-bottom:7px}.message-content header strong{font-size:13px}.message-assistant header strong{color:#0b9e5f}.message-content time{color:#8792a3;font-size:10px}.message-content>div{color:#344055;font-size:13px;line-height:1.75;white-space:pre-wrap}.typing-caret{display:inline-block;width:2px;height:15px;margin-left:2px;vertical-align:middle;background:#1769f5;animation:blink .8s infinite}.composer{display:flex;align-items:flex-end;gap:8px;margin:0 16px 15px;padding:8px;border:1px solid #dce3ec;border-radius:8px;background:#fff}.composer:focus-within{border-color:#8ab8ff;box-shadow:0 0 0 2px #1769f512}.composer :deep(.el-textarea__inner){box-shadow:none!important}.parameter-panel{overflow-y:auto;padding:17px 16px;border-left:1px solid #e0e6ee}.parameter-panel h2{margin:0 0 20px;font-size:17px}.parameter-panel label{display:flex;flex-direction:column;gap:8px;margin-bottom:17px;color:#3f4b5e;font-size:12px}.parameter-panel label>span{display:flex;justify-content:space-between}.slider-row{display:grid;grid-template-columns:1fr 64px;align-items:center;gap:10px}.slider-row .el-input-number{width:64px}.parameter-panel label>.el-input-number{width:100%}.switch-row{display:flex;justify-content:space-between;margin:14px 0;font-size:12px}.playground-metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-top:12px}.playground-metrics>div{display:flex;flex-direction:column;gap:8px;padding:13px 16px;border:1px solid #dfe6ef;border-radius:8px;background:#fff}.playground-metrics span{font-size:11px}.playground-metrics strong{font-size:20px}.playground-metrics small{font-size:10px;font-weight:500}.purple-number{color:#7c3aed}.orange-number{color:#ed8a16}@keyframes blink{50%{opacity:0}}
 .conversation-empty{padding:14px 8px;color:#8792a3;font-size:11px;line-height:1.6;text-align:center}
+.message-actions{display:flex;align-items:center;gap:4px}
 @media(max-width:1100px){.playground-body{grid-template-columns:200px 1fr}.parameter-panel{display:none}}@media(max-width:720px){.playground-page{height:auto;min-height:0}.playground-shell{height:calc(100vh - 200px);min-height:560px}.playground-body{grid-template-columns:1fr}.conversation-list{display:none}.playground-toolbar code,.playground-toolbar .el-divider,.playground-toolbar>.status-pill{display:none}.model-select{width:min(260px,65vw)}.playground-metrics{grid-template-columns:repeat(2,1fr)}}
 </style>

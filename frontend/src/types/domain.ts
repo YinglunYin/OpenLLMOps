@@ -9,7 +9,7 @@ export interface GpuDevice {
   temperature: number
   power: number
   powerLimit: number
-  state: 'idle' | 'inference' | 'training' | 'reserved'
+  state: 'idle' | 'inference' | 'training' | 'reserved' | 'unmanaged' | 'unknown'
   task?: string
   telemetryAvailable?: boolean
   telemetryReason?: string
@@ -27,6 +27,65 @@ export interface ModelAsset {
   updatedAt: string
   contextLength?: number
   path?: string
+  sourceUri?: string
+  revision?: string
+  requestedRevision?: string
+  resolvedRevision?: string
+  family?: string
+  architecture?: string
+  parameterCount?: number
+  weightDtypes?: string[]
+  checksum?: string
+  errorMessage?: string
+  manifest?: ModelManifestSummary
+}
+
+/**
+ * 模型导入器生成的不可变校验清单。字段保持可选，因为训练产物与旧资产可能没有
+ * 导入清单；页面必须明确显示“未提供”，不能从文件大小猜测模型参数量。
+ */
+export interface ModelManifestFile {
+  path: string
+  sizeBytes: number
+  sha256: string
+}
+
+export interface ModelManifestSummary {
+  modelType?: string
+  architecture?: string
+  totalSizeBytes?: number
+  fileCount?: number
+  parameterCount?: number
+  weightDtypes?: string[]
+  checksum?: string
+  requestedRevision?: string
+  resolvedRevision?: string
+  files: ModelManifestFile[]
+}
+
+export type ModelImportStatus = 'pending' | 'transferring' | 'validating' | 'ready' | 'failed' | 'canceling' | 'canceled'
+
+export interface ModelImportTask {
+  id: string
+  name: string
+  source: 'Hugging Face' | 'ModelScope' | '受控目录'
+  sourceKey: 'huggingface' | 'modelscope' | 'controlled_directory'
+  repository?: string
+  sourceDirectory?: string
+  modelKind: 'base' | 'instruct' | 'embedding'
+  status: ModelImportStatus
+  progressCompleted: number
+  progressTotal?: number
+  progressPercent?: number
+  createdAt: string
+  updatedAt: string
+  startedAt?: string
+  finishedAt?: string
+  requestedRevision?: string
+  resolvedRevision?: string
+  resultAssetId?: string
+  manifest?: ModelManifestSummary
+  errorMessage?: string
 }
 
 export interface Deployment {
@@ -39,12 +98,16 @@ export interface Deployment {
   gpuLabel: string
   parallelism: string
   status: 'running' | 'stopped' | 'queued' | 'error' | 'starting' | 'stopping'
-  endpoint?: string
+  desiredState: 'running' | 'stopped'
+  healthStatus: 'starting' | 'healthy' | 'unhealthy' | null
+  startedAt?: string
+  errorMessage?: string | null
   qps?: number
   ttft?: number
   kvHitRate?: number
   simplifiedConfig?: Record<string, unknown>
   vllmArgs?: Record<string, unknown>
+  createdAt?: string
   updatedAt?: string
 }
 
@@ -54,6 +117,7 @@ export interface TrainingJob {
   stage: 'CPT' | 'SFT'
   algorithm: 'LoRA' | 'QLoRA' | 'Freeze'
   baseModel: string
+  gpuIds: number[]
   gpuLabel: string
   progress: number
   status: 'running' | 'queued' | 'completed' | 'failed' | 'stopping' | 'terminated'
@@ -90,20 +154,71 @@ export interface Dataset {
 export interface EvaluationSummary {
   dataset: string
   samples: number
+  beforeCorrect: number | null
+  beforeTotal: number | null
+  beforeInvalid: number | null
+  afterCorrect: number | null
+  afterTotal: number | null
+  afterInvalid: number | null
   before: number
   after: number
   pointChange: number
-  relativeChange: number
+  // 基线为 0 时相对变化没有数学定义，不能伪装成 0%。
+  relativeChange: number | null
+}
+
+export interface EvaluationCategorySummary extends EvaluationSummary {
+  category: string
+}
+
+export interface EvaluationModelMetric {
+  template: 'base' | 'instruct'
+  score: number
+  total: number
+  correct: number
+  invalid: number
+  averageLatencyMs: number
+}
+
+export interface EvaluationComparisonScore {
+  before: number
+  after: number
+  pointChange: number
+  relativeChange: number | null
 }
 
 export interface EvaluationRunSummary {
   id: string
   name: string
+  baseModel: string
+  candidateModel: string
+  // 保留 Dashboard 现有消费者使用的候选模型别名。
   model: string
+  datasetNames: string[]
   datasets: string
   progress: number
   status: 'queued' | 'running' | 'completed' | 'failed' | 'stopping' | 'terminated'
+  hasResult: boolean
+  gpuIds: number[]
+  warnings: string[]
+  errorMessage?: string
+  startedAt?: string
+  finishedAt?: string
   updatedAt: string
+}
+
+export interface EvaluationRunDetail extends EvaluationRunSummary {
+  baseTemplate: 'base' | 'instruct'
+  candidateTemplate: 'base' | 'instruct'
+  baselineMetric?: EvaluationModelMetric
+  candidateMetric?: EvaluationModelMetric
+  overall?: EvaluationComparisonScore
+  results: EvaluationSummary[]
+  categories: EvaluationCategorySummary[]
+  tensorParallelSize: number
+  concurrency: number
+  maxTokens: number
+  gpuMemoryUtilization: number
 }
 
 export interface DashboardSummary {
@@ -156,4 +271,16 @@ export interface PlaygroundParams {
   repetitionPenalty: number
   seed?: number
   stream: boolean
+}
+
+/**
+ * Playground 只展示客户端能够可靠观测到的指标。兼容服务没有返回 usage 时，
+ * Token 数和依赖 Token 数计算的速度保持 null，避免用字符数冒充 Token 数。
+ */
+export interface PlaygroundMetrics {
+  totalDurationMs: number
+  ttftMs: number | null
+  inputTokens: number | null
+  outputTokens: number | null
+  outputTokensPerSecond: number | null
 }

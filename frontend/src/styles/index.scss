@@ -213,6 +213,8 @@ a { color: inherit; text-decoration: none; }
 .gpu-state.state-inference { color: var(--primary) !important; }
 .gpu-state.state-training { color: var(--success) !important; }
 .gpu-state.state-reserved { color: var(--warning) !important; }
+.gpu-state.state-unmanaged { color: var(--danger) !important; }
+.gpu-state.state-unknown { color: var(--muted) !important; }
 .metric-row { display: flex; justify-content: space-between; align-items: center; margin: 9px 0 5px; color: #566275; font-size: 12px; }
 .metric-row b { color: #273348; font-weight: 550; }
 .gpu-card.compact { padding: 12px 13px; }

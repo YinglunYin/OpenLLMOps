@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { createOpenAIStreamParser } from './sse'
 
@@ -21,5 +21,18 @@ describe('OpenAI SSE 增量解析器', () => {
     parser.push(': keep-alive\n\ndata:\n\ndata: {"choices":[{"text":"A"}]}\r\n')
     parser.finish()
     expect(tokens).toEqual(['A'])
+  })
+
+  it('读取标准 stream usage，且不要求 usage 事件包含 choices', () => {
+    const usage = vi.fn()
+    const parser = createOpenAIStreamParser(() => undefined, usage)
+    parser.push('data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":7}}\n\n')
+    parser.finish()
+    expect(usage).toHaveBeenCalledWith({ promptTokens: 12, completionTokens: 7 })
+  })
+
+  it('透传 SSE 根 error.message', () => {
+    const parser = createOpenAIStreamParser(() => undefined)
+    expect(() => parser.push('data: {"error":{"message":"模型正在重启"}}\n\n')).toThrow('模型正在重启')
   })
 })

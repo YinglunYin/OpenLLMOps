@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { CircleCheck, Clock, CloseBold, CopyDocument, Plus, Promotion, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRoute } from 'vue-router'
@@ -11,19 +11,24 @@ import StatCard from '@/components/StatCard.vue'
 import StatusPill from '@/components/StatusPill.vue'
 import { api } from '@/api/services'
 import { useMocks } from '@/api/client'
-import type { Deployment, ModelAsset, StatusTone } from '@/types/domain'
+import type { Deployment, GpuDevice, ModelAsset, StatusTone } from '@/types/domain'
 
 const rows = ref<Deployment[]>([])
 const route = useRoute()
 const selected = ref<Deployment | null>(null)
 const trendTimes = ref<string[]>([])
 const modelOptions = ref<ModelAsset[]>([])
+const gpuOptions = ref<GpuDevice[]>([])
 const activeTab = ref('overview')
 const createVisible = ref(false)
 const configMode = ref<'simple' | 'advanced'>('simple')
 const createBusy = ref(false)
 const editingId = ref<string | null>(null)
-const form = reactive({ name: '', servedModelName: '', modelAssetId: '', serviceType: 'generation', gpuCount: 1, maxModelLen: 32768, gpuMemoryUtilization: .9, dtype: 'auto', advancedArgs: '--enable-prefix-caching\n--max-num-seqs 64' })
+let refreshTimer: number | undefined
+let refreshRunning = false
+const openaiBaseUrl = (import.meta.env.VITE_OPENAI_BASE_URL || window.location.origin).replace(/\/$/, '')
+const publicGatewayUrl = `${openaiBaseUrl}/v1`
+const form = reactive({ name: '', servedModelName: '', modelAssetId: '', serviceType: 'generation', gpuIds: [0] as number[], maxModelLen: 32768, gpuMemoryUtilization: .9, dtype: 'auto', advancedArgs: '--enable-prefix-caching\n--max-num-seqs 64' })
 
 watch(() => form.serviceType, (serviceType) => {
   const selectedModel = modelOptions.value.find((model) => model.id === form.modelAssetId)
@@ -31,9 +36,10 @@ watch(() => form.serviceType, (serviceType) => {
 })
 
 function resetForm(model?: ModelAsset) {
+  const defaultGpu = gpuOptions.value.find((gpu) => gpu.state === 'idle') ?? gpuOptions.value[0]
   Object.assign(form, {
     name: '', servedModelName: '', modelAssetId: model?.id ?? '',
-    serviceType: model?.type ?? 'generation', gpuCount: 1, maxModelLen: 32768,
+    serviceType: model?.type ?? 'generation', gpuIds: defaultGpu ? [defaultGpu.index] : [], maxModelLen: 32768,
     gpuMemoryUtilization: .9, dtype: 'auto', advancedArgs: '--enable-prefix-caching\n--max-num-seqs 64',
   })
 }
@@ -64,7 +70,7 @@ function openEdit(row: Deployment) {
     servedModelName: row.model,
     modelAssetId: row.modelAssetId,
     serviceType: row.serviceType,
-    gpuCount: row.gpuIds.length || 1,
+    gpuIds: [...row.gpuIds],
     maxModelLen: Number(row.simplifiedConfig?.max_model_len ?? 32768),
     gpuMemoryUtilization: Number(row.simplifiedConfig?.gpu_memory_utilization ?? .9),
     dtype: String(row.simplifiedConfig?.dtype ?? 'auto'),
@@ -84,6 +90,24 @@ const statusMap: Record<Deployment['status'], { text: string; tone: StatusTone }
   running: { text: '运行中', tone: 'success' }, stopped: { text: '已停止', tone: 'info' }, queued: { text: '等待 GPU', tone: 'warning' }, error: { text: '异常', tone: 'danger' }, starting: { text: '启动中', tone: 'primary' }, stopping: { text: '停止中', tone: 'info' },
 }
 const statusMeta = (status: Deployment['status']) => statusMap[status]
+const desiredStateMap: Record<Deployment['desiredState'], { text: string; tone: StatusTone }> = {
+  running: { text: '应运行', tone: 'primary' },
+  stopped: { text: '应停止', tone: 'info' },
+}
+const desiredStateMeta = (state: Deployment['desiredState']) => desiredStateMap[state]
+const healthStatusMap: Record<NonNullable<Deployment['healthStatus']>, { text: string; color: string; description: string }> = {
+  healthy: { text: '健康', color: '#12a865', description: 'node-agent readiness 检查通过' },
+  starting: { text: '检查中', color: '#1769f5', description: '模型仍在加载或等待 readiness' },
+  unhealthy: { text: '不健康', color: '#dc2626', description: 'node-agent 健康检查未通过' },
+}
+const healthMeta = (row: Deployment) => row.healthStatus
+  ? healthStatusMap[row.healthStatus]
+  : {
+      text: row.status === 'stopped' ? '未运行' : '未报告',
+      color: '#7b8798',
+      description: row.status === 'stopped' ? '当前没有运行中的服务实例' : '尚未收到可信健康状态',
+    }
+const gpuStateText = (gpu: GpuDevice) => ({ idle: '空闲', inference: '推理占用', training: '训练占用', reserved: '已预留', unmanaged: '未纳管占用', unknown: '状态未知' })[gpu.state]
 
 const lineOption = (values: number[], color = '#1769f5') => ({
   tooltip: { trigger: 'axis' }, grid: { top: 18, left: 34, right: 10, bottom: 24 },
@@ -95,8 +119,19 @@ const lineOption = (values: number[], color = '#1769f5') => ({
 function selectRow(row: Deployment) { selected.value = row }
 
 async function refreshRows(preferredId?: string) {
-  rows.value = await api.deployments.list()
-  selected.value = rows.value.find((item) => item.id === preferredId) ?? rows.value[0] ?? null
+  if (refreshRunning) return
+  refreshRunning = true
+  try {
+    const selectedId = preferredId ?? selected.value?.id
+    // GPU 遥测可以独立退化；它不可阻断部署状态刷新和启停等控制面操作。
+    const [deploymentsResult, gpusResult] = await Promise.allSettled([api.deployments.list(), api.resources.gpus()])
+    if (gpusResult.status === 'fulfilled') gpuOptions.value = gpusResult.value
+    if (deploymentsResult.status === 'rejected') throw deploymentsResult.reason
+    rows.value = deploymentsResult.value
+    selected.value = rows.value.find((item) => item.id === selectedId) ?? rows.value[0] ?? null
+  } finally {
+    refreshRunning = false
+  }
 }
 
 async function toggleDeployment(row: Deployment) {
@@ -116,7 +151,9 @@ async function toggleDeployment(row: Deployment) {
 }
 
 async function submitDeployment() {
-  if (!form.name || !form.modelAssetId) { ElMessage.warning('请填写部署名称并选择模型'); return }
+  if (!form.name || !form.modelAssetId || !form.gpuIds.length) { ElMessage.warning('请填写部署名称并选择模型及至少一张 GPU'); return }
+  const servedModelName = form.servedModelName || form.name
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(servedModelName)) { ElMessage.warning('对外模型名仅允许英文字母、数字及 . _ : / -，中文部署名需单独填写对外模型名'); return }
   createBusy.value = true
   try {
     if (editingId.value) await api.deployments.update(editingId.value, { ...form, configMode: configMode.value })
@@ -143,17 +180,39 @@ async function removeDeployment(row: Deployment) {
   }
 }
 
+async function copyGatewayAddress() {
+  try {
+    await navigator.clipboard.writeText(publicGatewayUrl)
+    ElMessage.success('OpenAI Base URL 已复制')
+  } catch {
+    ElMessage.warning('浏览器未允许剪贴板访问，请手动复制')
+  }
+}
+
 onMounted(async () => {
   try {
     if (import.meta.env.VITE_USE_MOCKS === 'true') trendTimes.value = (await import('@/mock/data')).trendTimes
-    ;[rows.value, modelOptions.value] = await Promise.all([api.deployments.list(), api.models.list()])
+    const [deploymentsResult, modelsResult, gpusResult] = await Promise.allSettled([
+      api.deployments.list(), api.models.list(), api.resources.gpus(),
+    ])
+    if (deploymentsResult.status === 'rejected') throw deploymentsResult.reason
+    rows.value = deploymentsResult.value
+    if (modelsResult.status === 'fulfilled') modelOptions.value = modelsResult.value
+    else ElMessage.warning('模型资产暂时不可用，现有部署仍可管理')
+    if (gpusResult.status === 'fulfilled') gpuOptions.value = gpusResult.value
+    else ElMessage.warning('GPU 遥测暂时不可用，部署状态仍会继续刷新')
     selected.value = rows.value[0] ?? null
     const requestedModelId = typeof route.query.model === 'string' ? route.query.model : null
     const requestedModel = modelOptions.value.find((model) => model.id === requestedModelId && model.status === 'available')
     if (requestedModel) openCreate(requestedModel)
+    if (!useMocks) refreshTimer = window.setInterval(() => { void refreshRows().catch(() => undefined) }, 3_000)
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '部署数据加载失败')
   }
+})
+
+onBeforeUnmount(() => {
+  if (refreshTimer !== undefined) window.clearInterval(refreshTimer)
 })
 </script>
 
@@ -179,7 +238,8 @@ onMounted(async () => {
         <el-table-column prop="gpuLabel" label="GPU" width="105" />
         <el-table-column prop="parallelism" label="并行策略" width="110" />
         <el-table-column label="状态" width="110"><template #default="{ row }"><StatusPill v-bind="statusMeta(row.status)" dot /></template></el-table-column>
-        <el-table-column label="访问地址" min-width="210"><template #default="{ row }"><a v-if="row.endpoint" class="table-link">{{ row.endpoint }}</a><span v-else class="empty-dash">—</span></template></el-table-column>
+        <el-table-column label="期望" width="92"><template #default="{ row }"><StatusPill v-bind="desiredStateMeta(row.desiredState)" /></template></el-table-column>
+        <el-table-column label="OpenAI Base URL" min-width="210"><template #default="{ row }"><code v-if="row.status === 'running'">{{ publicGatewayUrl }}</code><span v-else class="empty-dash">—</span></template></el-table-column>
         <el-table-column label="操作" width="220" fixed="right">
           <template #default="{ row }"><div class="table-actions"><span class="table-link" @click="selected = row">详情</span><span class="table-link" @click="toggleDeployment(row)">{{ ['running','starting','queued'].includes(row.status) ? '停止' : row.status === 'stopping' ? '停止中' : '启动' }}</span><span class="table-link" @click="openEdit(row)">编辑</span><span class="danger-link" @click="removeDeployment(row)">删除</span></div></template>
         </el-table-column>
@@ -189,12 +249,13 @@ onMounted(async () => {
     <PanelCard v-if="selected" class="section-gap deployment-detail" flush>
       <div class="detail-title">
         <div><strong>部署详情：{{ selected.name }}</strong><StatusPill v-bind="statusMeta(selected.status)" /></div>
-        <div v-if="useMocks"><span>创建时间：2024-05-20 10:35:21</span><el-divider direction="vertical" /><span>运行时长：2 天 3 小时 18 分钟</span></div>
+        <div><span>创建时间：{{ selected.createdAt ?? '—' }}</span><el-divider direction="vertical" /><span>启动时间：{{ selected.startedAt ?? '尚未启动' }}</span><el-divider direction="vertical" /><StatusPill v-bind="desiredStateMeta(selected.desiredState)" /></div>
       </div>
       <el-tabs v-model="activeTab" class="detail-tabs">
         <el-tab-pane label="概览" name="overview">
+          <el-alert v-if="selected.errorMessage" class="runtime-error" :title="selected.errorMessage" type="error" :closable="false" show-icon />
           <div class="deployment-metrics">
-            <div class="health-card"><span>服务状态</span><div><el-icon color="#12a865" :size="29"><CircleCheck /></el-icon><strong>{{ statusMeta(selected.status).text }}</strong></div><small>{{ selected.status === 'running' ? '服务实例正在运行' : '以控制面实际状态为准' }}</small></div>
+            <div class="health-card"><span>健康状态</span><div :style="{ color: healthMeta(selected).color }"><el-icon :color="healthMeta(selected).color" :size="29"><CircleCheck v-if="selected.healthStatus === 'healthy'" /><CloseBold v-else-if="selected.healthStatus === 'unhealthy'" /><Clock v-else /></el-icon><strong>{{ healthMeta(selected).text }}</strong></div><small>{{ healthMeta(selected).description }}</small></div>
             <template v-if="useMocks">
               <div class="metric-chart"><span>请求速率（QPS）</span><strong>{{ selected.qps ?? 0 }}</strong><BaseChart :option="lineOption([18, 14, 20, 16, 19, 17, 21])" height="108px" /></div>
               <div class="metric-chart"><span>TTFT（p50）</span><strong>{{ selected.ttft ?? 0 }} <small>ms</small></strong><BaseChart :option="lineOption([202, 184, 196, 158, 175, 186, 181], '#7c3aed')" height="108px" /></div>
@@ -203,9 +264,9 @@ onMounted(async () => {
             <el-empty v-else class="metrics-empty" description="时序指标端点尚未接入" :image-size="52" />
           </div>
           <div class="deployment-info-grid">
-            <div class="info-card"><h3>服务端点</h3><p>/v1/chat/completions <el-tag size="small">POST</el-tag></p><p>/v1/completions <el-tag size="small">POST</el-tag></p><p v-if="selected.serviceType === 'embedding'">/v1/embeddings <el-tag size="small">POST</el-tag></p></div>
+            <div class="info-card"><h3>服务端点</h3><template v-if="selected.serviceType === 'generation'"><p>/v1/chat/completions <el-tag size="small">POST</el-tag></p><p>/v1/completions <el-tag size="small">POST</el-tag></p></template><p v-else>/v1/embeddings <el-tag size="small">POST</el-tag></p></div>
             <div class="info-card"><h3>GPU 资源分配（整卡）</h3><strong>{{ selected.gpuLabel }}</strong><p>{{ selected.parallelism }}</p></div>
-            <div class="info-card"><h3>访问地址</h3><strong>{{ selected.endpoint ?? '等待调度' }}</strong><el-button v-if="selected.endpoint" size="small" :icon="CopyDocument">复制地址</el-button><p>内网 OpenAI Compatible 网关</p></div>
+            <div class="info-card"><h3>OpenAI Base URL</h3><strong>{{ selected.status === 'running' ? publicGatewayUrl : '等待服务就绪' }}</strong><el-button v-if="selected.status === 'running'" size="small" :icon="CopyDocument" @click="copyGatewayAddress">复制 Base URL</el-button><p>请求体 model：{{ selected.model }}</p></div>
             <div class="info-card"><h3>API Key</h3><template v-if="useMocks"><el-input model-value="sk-••••••••••••••••••••" readonly show-password /><el-button type="primary" size="small" :icon="CopyDocument">复制</el-button></template><p v-else>使用系统设置中配置的 X-API-Key</p></div>
           </div>
         </el-tab-pane>
@@ -227,12 +288,14 @@ onMounted(async () => {
           <el-form-item label="模型资产" required><el-select v-model="form.modelAssetId" :disabled="Boolean(editingId)" filterable placeholder="选择已校验且类型匹配的模型" style="width:100%"><el-option v-for="model in modelOptions.filter((item) => item.status === 'available' && (form.serviceType === 'embedding' ? item.type === 'embedding' : item.type === 'generation'))" :key="model.id" :label="model.name" :value="model.id" /></el-select></el-form-item>
           <el-form-item label="对外模型名"><el-input v-model="form.servedModelName" :disabled="Boolean(editingId)" placeholder="留空则使用部署名称" /></el-form-item>
         </div>
+        <div :class="{ 'three-column-form': configMode === 'simple' }">
+          <el-form-item label="整卡选择" required><el-select v-model="form.gpuIds" multiple collapse-tags :max-collapse-tags="2" style="width:100%"><el-option v-for="gpu in gpuOptions" :key="gpu.index" :label="`GPU ${gpu.index} · ${gpuStateText(gpu)}`" :value="gpu.index" /></el-select></el-form-item>
+          <template v-if="configMode === 'simple'">
+            <el-form-item label="最大上下文"><el-input-number v-model="form.maxModelLen" :min="1024" :max="131072" :step="1024" /></el-form-item>
+            <el-form-item label="显存利用率"><el-input-number v-model="form.gpuMemoryUtilization" :min="0.1" :max="0.98" :step="0.05" /></el-form-item>
+          </template>
+        </div>
         <template v-if="configMode === 'simple'">
-          <div class="three-column-form">
-            <el-form-item label="整卡数量"><el-input-number v-model="form.gpuCount" :min="1" :max="4" /></el-form-item>
-            <el-form-item label="最大上下文"><el-input-number v-model="form.maxModelLen" :min="1024" :step="1024" /></el-form-item>
-            <el-form-item label="显存利用率"><el-input-number v-model="form.gpuMemoryUtilization" :min="0.1" :max="0.99" :step="0.05" /></el-form-item>
-          </div>
           <el-form-item label="数据类型"><el-radio-group v-model="form.dtype"><el-radio-button value="auto">Auto</el-radio-button><el-radio-button value="float16">FP16</el-radio-button><el-radio-button value="bfloat16">BF16</el-radio-button></el-radio-group></el-form-item>
         </template>
         <el-form-item v-else label="vLLM 额外参数"><el-input v-model="form.advancedArgs" type="textarea" :rows="8" spellcheck="false" /><p class="form-help">每行一个参数。模型路径、服务端口与 GPU 可见性由系统托管，不能覆盖。</p></el-form-item>
@@ -247,6 +310,7 @@ onMounted(async () => {
 .row-radio { display: block; width: 17px; height: 17px; border: 1.5px solid #c8d2df; border-radius: 50%; }.row-radio.active { border: 5px solid #1769f5; }
 .detail-title { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 13px 18px 0; }.detail-title > div { display: flex; align-items: center; gap: 12px; }.detail-title > div:last-child { color: #69768a; font-size: 12px; }
 .detail-tabs { padding: 0 18px 16px; }.deployment-metrics { display: grid; grid-template-columns: .85fr repeat(3, 1fr); gap: 12px; }
+.runtime-error { margin-bottom: 12px; }
 .metrics-empty { grid-column: span 3; border: 1px dashed #dfe6ef; border-radius: 8px; }
 .health-card, .metric-chart, .info-card { min-width: 0; padding: 14px; border: 1px solid #e1e7ef; border-radius: 8px; }.health-card > span, .metric-chart > span { display: block; margin-bottom: 8px; font-size: 13px; font-weight: 600; }.health-card > div { display: flex; align-items: center; gap: 8px; margin: 19px 0 7px; color: #12a865; }.health-card small { color: #728095; }.metric-chart > strong { font-size: 22px; }.metric-chart > strong small { font-size: 11px; font-weight: 500; }
 .deployment-info-grid { display: grid; grid-template-columns: .8fr 1.25fr .95fr 1fr; gap: 12px; margin-top: 12px; }.info-card h3 { margin: 0 0 13px; font-size: 13px; }.info-card p { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 9px 0; color: #5f6c80; font-size: 12px; }.info-card > strong { display: block; overflow: hidden; margin-bottom: 11px; font-size: 13px; text-overflow: ellipsis; }.info-card .el-button { margin-top: 10px; }

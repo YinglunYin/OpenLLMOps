@@ -4,7 +4,7 @@ import type { GpuDevice } from '@/types/domain'
 
 const props = withDefaults(defineProps<{ gpu: GpuDevice; compact?: boolean }>(), { compact: false })
 
-const stateText = computed(() => ({ idle: '空闲', inference: '推理', training: '训练', reserved: '预留' })[props.gpu.state])
+const stateText = computed(() => ({ idle: '空闲', inference: '推理', training: '训练', reserved: '预留', unmanaged: '未纳管占用', unknown: '状态未知' })[props.gpu.state])
 const stateClass = computed(() => `state-${props.gpu.state}`)
 const memoryPercent = computed(() => props.gpu.memoryTotal > 0 ? Math.round((props.gpu.memoryUsed / props.gpu.memoryTotal) * 100) : 0)
 </script>

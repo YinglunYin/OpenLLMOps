@@ -12,7 +12,7 @@ import StatusPill from '@/components/StatusPill.vue'
 import { api, type GpuHistoryRange } from '@/api/services'
 import { useMocks } from '@/api/client'
 import type { BackendGpuHistory } from '@/api/contracts'
-import type { GpuDevice } from '@/types/domain'
+import type { GpuDevice, StatusTone } from '@/types/domain'
 
 const gpus = ref<GpuDevice[]>([])
 const trendTimes = ref<string[]>([])
@@ -21,6 +21,8 @@ const memorySeries = ref<number[][]>([])
 const thermalSeries = ref<number[][]>([])
 const range = ref<GpuHistoryRange>('1h')
 const refreshedAt = ref(new Date())
+const gpuTypeText = (state: GpuDevice['state']) => ({ idle: '空闲', inference: '推理', training: '训练', reserved: '预留', unmanaged: '未纳管', unknown: '未知' })[state]
+const gpuTypeTone = (state: GpuDevice['state']): StatusTone => ({ idle: 'success', inference: 'primary', training: 'warning', reserved: 'info', unmanaged: 'danger', unknown: 'info' })[state] as StatusTone
 const refreshBusy = ref(false)
 
 const utilizationOption = computed(() => makeLineOption(utilizationSeries.value, '%'))
@@ -99,7 +101,7 @@ onMounted(refresh)
 
     <div class="monitor-bottom section-gap">
       <PanelCard title="GPU 资源租约" flush>
-        <el-table :data="gpus" size="small"><el-table-column label="GPU" width="70"><template #default="{row}">GPU {{ row.index }}</template></el-table-column><el-table-column prop="task" label="占用任务" min-width="180"><template #default="{row}">{{ row.task ?? '—' }}</template></el-table-column><el-table-column label="任务类型" width="95"><template #default="{row}"><StatusPill :text="row.state==='training'?'训练':row.state==='inference'?'推理':row.state==='reserved'?'预留':'空闲'" :tone="row.state==='training'?'warning':row.state==='inference'?'primary':row.state==='reserved'?'info':'success'"/></template></el-table-column><el-table-column label="显存" width="125"><template #default="{row}">{{ row.telemetryAvailable === false ? '遥测不可用' : `${row.memoryUsed} / ${row.memoryTotal} GB` }}</template></el-table-column><el-table-column label="状态" width="90"><template #default="{row}"><StatusPill :text="row.state==='idle'?'空闲':'运行中'" :tone="row.state==='idle'?'info':'success'"/></template></el-table-column></el-table>
+        <el-table :data="gpus" size="small"><el-table-column label="GPU" width="70"><template #default="{row}">GPU {{ row.index }}</template></el-table-column><el-table-column prop="task" label="占用任务" min-width="180"><template #default="{row}">{{ row.task ?? '—' }}</template></el-table-column><el-table-column label="资源判定" width="105"><template #default="{row}"><StatusPill :text="gpuTypeText(row.state)" :tone="gpuTypeTone(row.state)"/></template></el-table-column><el-table-column label="显存" width="125"><template #default="{row}">{{ row.telemetryAvailable === false ? '遥测不可用' : `${row.memoryUsed} / ${row.memoryTotal} GB` }}</template></el-table-column><el-table-column label="状态" width="100"><template #default="{row}"><StatusPill :text="row.state==='idle'?'可确认空闲':row.state==='unknown'?'无法确认':'存在占用'" :tone="row.state==='idle'?'success':row.state==='unknown'?'info':'warning'"/></template></el-table-column></el-table>
       </PanelCard>
       <PanelCard title="系统资源">
         <div v-if="useMocks" class="host-metrics"><div><span><el-icon><Cpu/></el-icon>CPU 利用率<b>28%</b></span><el-progress :percentage="28" :show-text="false" :stroke-width="7"/></div><div><span><el-icon><Monitor/></el-icon>系统内存<b>71.7 / 128 GB</b></span><el-progress :percentage="56" :show-text="false" :stroke-width="7"/></div><div><span><el-icon><Files/></el-icon>磁盘（/）<b>842 / 2000 GB</b></span><el-progress :percentage="42" :show-text="false" :stroke-width="7"/></div><div><span><el-icon><Connection/></el-icon>网络（eno1）<b>↑ 1.2 ↓ 1.5 Gbps</b></span><el-progress :percentage="52" :show-text="false" :stroke-width="7"/></div></div><el-empty v-else description="主机资源端点尚未接入" :image-size="54"/>

@@ -1,4 +1,4 @@
-import { formatDateTime, toApiKey, toDataset, toDeployment, toEvaluationRunSummary, toEvaluationSummaries, toGpuDevice, toModelAsset, toTrainingJob } from './adapters'
+import { formatDateTime, toApiKey, toDataset, toDeployment, toEvaluationRunDetail, toEvaluationRunSummary, toEvaluationSummaries, toGpuDevice, toModelAsset, toModelImportTask, toTrainingJob } from './adapters'
 import { http, setCsrfToken, useMocks } from './client'
 import type {
   BackendAdminIdentity,
@@ -29,10 +29,13 @@ import type {
   DashboardSummary,
   Dataset,
   Deployment,
+  EvaluationRunDetail,
   EvaluationRunSummary,
   EvaluationSummary,
   GpuDevice,
   ModelAsset,
+  ModelImportTask,
+  PlaygroundMetrics,
   PlaygroundParams,
   TrainingJob,
 } from '@/types/domain'
@@ -51,7 +54,13 @@ function loadMockData(): Promise<MockData> {
 export interface DatasetUploadInput {
   name: string
   purpose: Dataset['purpose']
+  version: string
   description?: string
+}
+
+export interface DatasetUploadOptions {
+  signal?: AbortSignal
+  onProgress?: (percent: number) => void
 }
 
 const clone = <T>(value: T): T => structuredClone(value)
@@ -118,18 +127,19 @@ function loadDashboardSummary(): Promise<BackendDashboardSummary> {
   return dashboardRequest
 }
 
-async function evaluationComparison(): Promise<EvaluationSummary[]> {
-  if (useMocks) return clone((await loadMockData()).evaluationSummary)
+async function evaluationComparison(runId?: string): Promise<EvaluationSummary[]> {
+  if (useMocks) {
+    const fixtures = (await loadMockData()).evaluationRunDetails
+    return clone((runId ? fixtures.find((item) => item.id === runId) : fixtures.find((item) => item.hasResult))?.results ?? [])
+  }
+  if (runId) return (await getEvaluationRun(runId)).results
   const { data } = await http.get<BackendEvaluationRun[]>('/v1/evaluation-runs')
   const finished = data.find((run) => Object.keys(run.comparison).length > 0)
   return finished ? toEvaluationSummaries(finished) : []
 }
 
 async function listEvaluationRuns(): Promise<EvaluationRunSummary[]> {
-  if (useMocks) return clone([
-    { id: 'eval-domain', name: 'domain-compare-0520', model: 'ChineseLM-8B-Domain', datasets: 'C-Eval / CMMLU / 领域测试集', progress: 100, status: 'completed', updatedAt: '2024-05-20 11:00:00' },
-    { id: 'eval-base', name: 'base-regression-0521', model: 'ChineseLM-8B-Base', datasets: 'C-Eval / CMMLU', progress: 36, status: 'running', updatedAt: '2024-05-20 10:52:00' },
-  ] satisfies EvaluationRunSummary[])
+  if (useMocks) return clone((await loadMockData()).evaluationRunSummaries)
   const [{ data: runs }, models, datasets] = await Promise.all([
     http.get<BackendEvaluationRun[]>('/v1/evaluation-runs'),
     listModels(),
@@ -137,7 +147,31 @@ async function listEvaluationRuns(): Promise<EvaluationRunSummary[]> {
   ])
   const modelNames = new Map(models.map((item) => [item.id, item.name]))
   const datasetNames = new Map(datasets.map((item) => [item.id, item.name]))
-  return runs.map((run) => toEvaluationRunSummary(run, modelNames.get(run.candidate_model_asset_id), run.custom_dataset_id ? datasetNames.get(run.custom_dataset_id) : undefined))
+  return runs.map((run) => toEvaluationRunSummary(run, {
+    baseModelName: modelNames.get(run.base_model_asset_id),
+    candidateModelName: modelNames.get(run.candidate_model_asset_id),
+    customDatasetName: run.custom_dataset_id ? datasetNames.get(run.custom_dataset_id) : undefined,
+  }))
+}
+
+async function getEvaluationRun(id: string): Promise<EvaluationRunDetail> {
+  if (useMocks) {
+    const fixture = (await loadMockData()).evaluationRunDetails.find((item) => item.id === id)
+    if (!fixture) throw new Error('测评任务不存在')
+    return clone(fixture)
+  }
+  const [{ data: run }, models, datasets] = await Promise.all([
+    http.get<BackendEvaluationRun>(`/v1/evaluation-runs/${encodeURIComponent(id)}`),
+    listModels(),
+    listDatasets(),
+  ])
+  const modelNames = new Map(models.map((item) => [item.id, item.name]))
+  const datasetNames = new Map(datasets.map((item) => [item.id, item.name]))
+  return toEvaluationRunDetail(run, {
+    baseModelName: modelNames.get(run.base_model_asset_id),
+    candidateModelName: modelNames.get(run.candidate_model_asset_id),
+    customDatasetName: run.custom_dataset_id ? datasetNames.get(run.custom_dataset_id) : undefined,
+  })
 }
 
 function normalizeModelImport(payload: Record<string, unknown>) {
@@ -155,15 +189,15 @@ function normalizeModelImport(payload: Record<string, unknown>) {
   }
 }
 
-function normalizeDeployment(payload: Record<string, unknown>) {
-  const gpuCount = Number(payload.gpuCount ?? 1)
+export function normalizeDeployment(payload: Record<string, unknown>) {
+  const gpuIds = normalizeGpuIds(payload)
   return {
     name: payload.name,
     served_model_name: payload.servedModelName || payload.name,
     model_asset_id: payload.modelAssetId,
     task_type: payload.serviceType === 'embedding' ? 'embedding' : 'generate',
-    gpu_ids: Array.from({ length: gpuCount }, (_, index) => index),
-    tensor_parallel_size: gpuCount,
+    gpu_ids: gpuIds,
+    tensor_parallel_size: gpuIds.length,
     simplified_config: {
       max_model_len: payload.maxModelLen,
       gpu_memory_utilization: payload.gpuMemoryUtilization,
@@ -174,11 +208,11 @@ function normalizeDeployment(payload: Record<string, unknown>) {
 }
 
 function normalizeDeploymentUpdate(payload: Record<string, unknown>) {
-  const gpuCount = Number(payload.gpuCount ?? 1)
+  const gpuIds = normalizeGpuIds(payload)
   return {
     name: payload.name,
-    gpu_ids: Array.from({ length: gpuCount }, (_, index) => index),
-    tensor_parallel_size: gpuCount,
+    gpu_ids: gpuIds,
+    tensor_parallel_size: gpuIds.length,
     simplified_config: {
       max_model_len: payload.maxModelLen,
       gpu_memory_utilization: payload.gpuMemoryUtilization,
@@ -188,15 +222,15 @@ function normalizeDeploymentUpdate(payload: Record<string, unknown>) {
   }
 }
 
-function normalizeTraining(payload: Record<string, unknown>) {
-  const gpuCount = Number(payload.gpuCount ?? 1)
+export function normalizeTraining(payload: Record<string, unknown>) {
+  const gpuIds = normalizeGpuIds(payload)
   return {
     name: String(payload.name),
     model_asset_id: payload.modelAssetId,
     dataset_id: payload.datasetId,
     stage: String(payload.stage).toLowerCase(),
     algorithm: String(payload.algorithm).toLowerCase(),
-    gpu_ids: Array.from({ length: gpuCount }, (_, index) => index),
+    gpu_ids: gpuIds,
     training_config: {
       num_train_epochs: payload.epochs,
       learning_rate: payload.learningRate,
@@ -225,8 +259,14 @@ function normalizeEvaluation(payload: Record<string, unknown>) {
     candidate_model_asset_id: payload.candidateModelAssetId,
     custom_dataset_id: payload.customDatasetId || null,
     builtin_datasets: selected.filter((item) => item === 'ceval' || item === 'cmmlu'),
-    gpu_ids: [0],
+    gpu_ids: normalizeGpuIds(payload),
   }
+}
+
+export function normalizeGpuIds(payload: Record<string, unknown>): number[] {
+  if (Array.isArray(payload.gpuIds)) return payload.gpuIds.map(Number)
+  const gpuCount = Number(payload.gpuCount ?? 1)
+  return Array.from({ length: gpuCount }, (_, index) => index)
 }
 
 export function parseAdvancedArgs(value: string): Record<string, string | number | boolean | null> {
@@ -303,14 +343,17 @@ export const api = {
     list: listModels,
     import: async (payload: Record<string, unknown>) => useMocks
       ? mockMutation({ id: crypto.randomUUID() })
-      : (await http.post<BackendModelImport>('/v1/model-imports', normalizeModelImport(payload))).data,
-    async imports(): Promise<BackendModelImport[]> {
+      : toModelImportTask((await http.post<BackendModelImport>('/v1/model-imports', normalizeModelImport(payload))).data),
+    async imports(): Promise<ModelImportTask[]> {
       if (useMocks) return []
-      return (await http.get<BackendModelImport[]>('/v1/model-imports')).data
+      return (await http.get<BackendModelImport[]>('/v1/model-imports')).data.map(toModelImportTask)
     },
-    async cancelImport(id: string): Promise<BackendModelImport> {
-      if (useMocks) return mockMutation({ id, status: 'canceled' } as BackendModelImport)
-      return (await http.post<BackendModelImport>(`/v1/model-imports/${id}/cancel`)).data
+    async cancelImport(id: string): Promise<ModelImportTask> {
+      if (useMocks) return mockMutation({
+        id, name: '演示导入任务', source: '受控目录', sourceKey: 'controlled_directory', modelKind: 'instruct',
+        status: 'canceled', progressCompleted: 0, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      } satisfies ModelImportTask)
+      return toModelImportTask((await http.post<BackendModelImport>(`/v1/model-imports/${id}/cancel`)).data)
     },
     async scanInbox(): Promise<BackendInboxCandidate[]> {
       if (useMocks) return [
@@ -333,16 +376,26 @@ export const api = {
   },
   datasets: {
     list: listDatasets,
-    upload: async (payload: DatasetUploadInput, file?: File) => {
+    upload: async (payload: DatasetUploadInput, file?: File, options: DatasetUploadOptions = {}) => {
       if (useMocks) return mockMutation({ id: crypto.randomUUID() })
       if (!file) throw new Error('请选择 JSONL 文件')
       const body = new FormData()
       body.append('name', payload.name)
       body.append('dataset_type', payload.purpose.toLowerCase())
+      body.append('version', payload.version)
       body.append('description', payload.description ?? '')
       body.append('file', file)
       // 不手写 Content-Type，让浏览器为 FormData 自动生成带 boundary 的 multipart 请求头。
-      return (await http.post<BackendDataset>('/v1/datasets/upload', body)).data
+      return (await http.post<BackendDataset>('/v1/datasets/upload', body, {
+        // 训练集允许达到 5 GiB，不能继承普通 JSON 请求的 30 秒超时。
+        timeout: 0,
+        signal: options.signal,
+        onUploadProgress: ({ loaded, total }) => {
+          if (total && total > 0) {
+            options.onProgress?.(Math.min(100, Math.round((loaded / total) * 100)))
+          }
+        },
+      })).data
     },
     preview: async (id: string) => useMocks ? [] : (await http.get<Array<Record<string, unknown>>>(`/v1/datasets/${id}/preview`)).data,
     remove: async (id: string) => useMocks ? mockMutation(true) : (await http.delete(`/v1/datasets/${id}`), true),
@@ -376,6 +429,7 @@ export const api = {
   },
   evaluations: {
     list: listEvaluationRuns,
+    get: getEvaluationRun,
     comparison: evaluationComparison,
     create: async (payload: Record<string, unknown>) => useMocks
       ? mockMutation({ id: crypto.randomUUID() })
@@ -412,20 +466,42 @@ interface StreamChatOptions {
   onToken: (token: string) => void
 }
 
-export async function streamChat({ messages, params, signal, onToken }: StreamChatOptions) {
+interface OpenAIChatResponse {
+  choices?: Array<{ message?: { content?: unknown }; text?: unknown }>
+  usage?: { prompt_tokens?: unknown; completion_tokens?: unknown }
+}
+
+export async function streamChat({ messages, params, signal, onToken }: StreamChatOptions): Promise<PlaygroundMetrics> {
+  const startedAt = performance.now()
+  // Vue 传入的参数对象是响应式的；固定本次模式，避免请求途中切换开关后误读响应格式。
+  const streamed = params.stream
+  let firstTokenAt: number | null = null
+  let inputTokens: number | null = null
+  let outputTokens: number | null = null
+  const emitToken = (token: string) => {
+    if (!token) return
+    firstTokenAt ??= performance.now()
+    onToken(token)
+  }
+
   if (useMocks) {
     const mockText = '这是来自 OpenLLMOps 演示服务的流式响应。当前模型部署健康，您可以通过右侧参数面板继续调整采样策略。'
-    for (const char of mockText) {
-      if (signal.aborted) throw new DOMException('生成已取消', 'AbortError')
-      await new Promise((resolve) => window.setTimeout(resolve, 24))
-      onToken(char)
+    if (streamed) {
+      for (const char of mockText) {
+        await waitWithAbort(24, signal)
+        emitToken(char)
+      }
+    } else {
+      await waitWithAbort(420, signal)
+      emitToken(mockText)
     }
-    return
+    return buildPlaygroundMetrics(startedAt, firstTokenAt, null, null, streamed)
   }
 
   // OpenAI Compatible 网关保留标准根路径，不拼接控制面 /api 前缀。
   const openaiBase = (import.meta.env.VITE_OPENAI_BASE_URL || '').replace(/\/$/, '')
   const apiKey = sessionStorage.getItem('openllmops_api_key')
+  throwIfAborted(signal)
   const response = await fetch(`${openaiBase}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...(apiKey ? { 'X-API-Key': apiKey } : {}) },
@@ -437,21 +513,116 @@ export async function streamChat({ messages, params, signal, onToken }: StreamCh
       max_tokens: params.maxTokens,
       repetition_penalty: params.repetitionPenalty,
       seed: params.seed,
-      stream: true,
+      stream: streamed,
+      ...(streamed ? { stream_options: { include_usage: true } } : {}),
     }),
     signal,
+    // 管理控制面 Cookie 不属于 OpenAI 数据面认证，哪怕同源部署也绝不随请求发送。
+    credentials: 'omit',
   })
 
-  if (!response.ok || !response.body) throw new Error(`请求失败：HTTP ${response.status}`)
+  if (!response.ok) throw new Error(await readOpenAIError(response))
+
+  if (!streamed) {
+    const payload = await response.json() as OpenAIChatResponse
+    throwIfAborted(signal)
+    const content = chatResponseContent(payload)
+    if (content === null) throw new Error('模型响应中缺少 choices[0].message.content')
+    inputTokens = finiteNonNegativeInteger(payload.usage?.prompt_tokens)
+    outputTokens = finiteNonNegativeInteger(payload.usage?.completion_tokens)
+    emitToken(content)
+    return buildPlaygroundMetrics(startedAt, firstTokenAt, inputTokens, outputTokens, false)
+  }
+
+  if (!response.body) throw new Error('模型响应未提供流式数据')
 
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
-  const parser = createOpenAIStreamParser(onToken)
-  while (true) {
-    const { value, done } = await reader.read()
-    if (done) break
-    parser.push(decoder.decode(value, { stream: true }))
+  const parser = createOpenAIStreamParser(emitToken, (usage) => {
+    inputTokens = usage.promptTokens
+    outputTokens = usage.completionTokens
+  })
+  const abortReader = () => {
+    void reader.cancel(new DOMException('生成已取消', 'AbortError')).catch(() => undefined)
   }
-  parser.push(decoder.decode())
-  parser.finish()
+  signal.addEventListener('abort', abortReader, { once: true })
+  try {
+    while (true) {
+      throwIfAborted(signal)
+      const { value, done } = await reader.read()
+      if (done) break
+      parser.push(decoder.decode(value, { stream: true }))
+    }
+    throwIfAborted(signal)
+    parser.push(decoder.decode())
+    parser.finish()
+  } finally {
+    signal.removeEventListener('abort', abortReader)
+  }
+  return buildPlaygroundMetrics(startedAt, firstTokenAt, inputTokens, outputTokens, true)
+}
+
+function chatResponseContent(payload: OpenAIChatResponse): string | null {
+  const choice = payload.choices?.[0]
+  if (typeof choice?.message?.content === 'string') return choice.message.content
+  if (typeof choice?.text === 'string') return choice.text
+  return null
+}
+
+function finiteNonNegativeInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null
+}
+
+async function readOpenAIError(response: Response): Promise<string> {
+  try {
+    const payload = await response.json() as { error?: { message?: unknown } }
+    if (typeof payload.error?.message === 'string' && payload.error.message.trim()) {
+      return payload.error.message
+    }
+  } catch {
+    // 非 JSON 错误响应回退到状态码，避免把网关 HTML 内容展示给管理员。
+  }
+  return `请求失败：HTTP ${response.status}`
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new DOMException('生成已取消', 'AbortError')
+}
+
+function waitWithAbort(delayMs: number, signal: AbortSignal): Promise<void> {
+  throwIfAborted(signal)
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      window.clearTimeout(timer)
+      reject(new DOMException('生成已取消', 'AbortError'))
+    }
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, delayMs)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+function buildPlaygroundMetrics(
+  startedAt: number,
+  firstTokenAt: number | null,
+  inputTokens: number | null,
+  outputTokens: number | null,
+  streamed: boolean,
+): PlaygroundMetrics {
+  const finishedAt = performance.now()
+  const totalDurationMs = Math.max(0, finishedAt - startedAt)
+  const ttftMs = firstTokenAt === null ? null : Math.max(0, firstTokenAt - startedAt)
+  const generationDurationMs = firstTokenAt === null ? 0 : finishedAt - firstTokenAt
+  return {
+    totalDurationMs,
+    ttftMs,
+    inputTokens,
+    outputTokens,
+    // 非流式响应看不到服务端生成区间，因此不展示带有误导性的速度。
+    outputTokensPerSecond: streamed && outputTokens !== null && generationDurationMs > 0
+      ? outputTokens / (generationDurationMs / 1_000)
+      : null,
+  }
 }

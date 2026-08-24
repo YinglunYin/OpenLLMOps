@@ -58,10 +58,10 @@ export interface BackendDeployment extends TimestampedResource {
   actual_state: 'created' | 'queued' | 'starting' | 'running' | 'stopping' | 'stopped' | 'failed'
   gpu_ids: number[]
   tensor_parallel_size: number
-  port: number | null
-  internal_url: string | null
   simplified_config: Record<string, unknown>
   vllm_args: Record<string, unknown>
+  health_status: 'starting' | 'healthy' | 'unhealthy' | null
+  started_at: string | null
   error_message: string | null
 }
 
@@ -123,11 +123,27 @@ export interface BackendEvaluationRun extends TimestampedResource {
   candidate_model_asset_id: string
   custom_dataset_id: string | null
   builtin_datasets: string[]
+  base_template: 'base' | 'instruct'
+  candidate_template: 'base' | 'instruct'
+  output_dir: string
+  tensor_parallel_size: number
+  gpu_memory_utilization: number
+  concurrency: number
+  max_tokens: number
+  desired_state: 'running' | 'terminated'
   actual_state: string
   gpu_ids: number[]
   metrics: Record<string, unknown>
   comparison: Record<string, unknown>
+  result_path: string | null
+  dataset_manifest_path: string | null
+  warnings: string[]
   error_message: string | null
+  queued_at: string | null
+  state_version: number
+  runtime_generation: number
+  started_at: string | null
+  finished_at: string | null
 }
 
 export interface BackendGpuLease {
@@ -150,6 +166,7 @@ export interface BackendGpuStatus {
   power_watts: number | null
   telemetry_available: boolean
   degraded_reason: string | null
+  resource_state: 'idle' | 'leased' | 'unmanaged' | 'unknown'
   owner_type: 'deployment' | 'training' | 'evaluation' | null
   owner_id: string | null
   owner_name: string | null
