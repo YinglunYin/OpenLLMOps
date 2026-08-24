@@ -176,6 +176,21 @@ function normalizeDeployment(payload: Record<string, unknown>) {
   }
 }
 
+function normalizeDeploymentUpdate(payload: Record<string, unknown>) {
+  const gpuCount = Number(payload.gpuCount ?? 1)
+  return {
+    name: payload.name,
+    gpu_ids: Array.from({ length: gpuCount }, (_, index) => index),
+    tensor_parallel_size: gpuCount,
+    simplified_config: {
+      max_model_len: payload.maxModelLen,
+      gpu_memory_utilization: payload.gpuMemoryUtilization,
+      dtype: payload.dtype,
+    },
+    vllm_args: parseAdvancedArgs(String(payload.advancedArgs ?? '')),
+  }
+}
+
 function normalizeTraining(payload: Record<string, unknown>) {
   const name = String(payload.name)
   const gpuCount = Number(payload.gpuCount ?? 1)
@@ -309,7 +324,7 @@ export const api = {
       : (await http.post<BackendDeployment>('/v1/deployments', normalizeDeployment(payload))).data,
     start: async (id: string) => useMocks ? mockMutation(true) : (await http.post(`/v1/deployments/${id}/start`), true),
     stop: async (id: string) => useMocks ? mockMutation(true) : (await http.post(`/v1/deployments/${id}/stop`), true),
-    update: async (id: string, payload: Record<string, unknown>) => useMocks ? mockMutation(payload) : (await http.patch(`/v1/deployments/${id}`, payload)).data,
+    update: async (id: string, payload: Record<string, unknown>) => useMocks ? mockMutation(payload) : (await http.patch(`/v1/deployments/${id}`, normalizeDeploymentUpdate(payload))).data,
     remove: async (id: string) => useMocks ? mockMutation(true) : (await http.delete(`/v1/deployments/${id}`), true),
   },
   datasets: {

@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { CircleCheck, Clock, CloseBold, CopyDocument, Plus, Promotion, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRoute } from 'vue-router'
 
 import BaseChart from '@/components/BaseChart.vue'
 import PageHeader from '@/components/PageHeader.vue'
@@ -13,6 +14,7 @@ import { useMocks } from '@/api/client'
 import type { Deployment, ModelAsset, StatusTone } from '@/types/domain'
 
 const rows = ref<Deployment[]>([])
+const route = useRoute()
 const selected = ref<Deployment | null>(null)
 const trendTimes = ref<string[]>([])
 const modelOptions = ref<ModelAsset[]>([])
@@ -20,9 +22,56 @@ const activeTab = ref('overview')
 const createVisible = ref(false)
 const configMode = ref<'simple' | 'advanced'>('simple')
 const createBusy = ref(false)
+const editingId = ref<string | null>(null)
 const form = reactive({ name: '', servedModelName: '', modelAssetId: '', serviceType: 'generation', gpuCount: 1, maxModelLen: 32768, gpuMemoryUtilization: .9, dtype: 'auto', advancedArgs: '--enable-prefix-caching\n--max-num-seqs 64' })
 
-watch(() => form.serviceType, () => { form.modelAssetId = '' })
+watch(() => form.serviceType, (serviceType) => {
+  const selectedModel = modelOptions.value.find((model) => model.id === form.modelAssetId)
+  if (selectedModel && (serviceType === 'embedding') !== (selectedModel.type === 'embedding')) form.modelAssetId = ''
+})
+
+function resetForm(model?: ModelAsset) {
+  Object.assign(form, {
+    name: '', servedModelName: '', modelAssetId: model?.id ?? '',
+    serviceType: model?.type ?? 'generation', gpuCount: 1, maxModelLen: 32768,
+    gpuMemoryUtilization: .9, dtype: 'auto', advancedArgs: '--enable-prefix-caching\n--max-num-seqs 64',
+  })
+}
+
+function openCreate(model?: ModelAsset) {
+  editingId.value = null
+  resetForm(model)
+  createVisible.value = true
+}
+
+function serializeAdvancedArgs(args: Record<string, unknown>): string {
+  return Object.entries(args).map(([key, value]) => {
+    const flag = `--${key.replaceAll('_', '-')}`
+    if (value === true) return flag
+    if (typeof value === 'string' && !/\s/.test(value)) return `${flag} ${value}`
+    return `${flag} ${JSON.stringify(value)}`
+  }).join('\n')
+}
+
+function openEdit(row: Deployment) {
+  if (!['stopped', 'error'].includes(row.status)) {
+    ElMessage.warning('请先停止部署，再编辑配置')
+    return
+  }
+  editingId.value = row.id
+  Object.assign(form, {
+    name: row.name,
+    servedModelName: row.model,
+    modelAssetId: row.modelAssetId,
+    serviceType: row.serviceType,
+    gpuCount: row.gpuIds.length || 1,
+    maxModelLen: Number(row.simplifiedConfig?.max_model_len ?? 32768),
+    gpuMemoryUtilization: Number(row.simplifiedConfig?.gpu_memory_utilization ?? .9),
+    dtype: String(row.simplifiedConfig?.dtype ?? 'auto'),
+    advancedArgs: serializeAdvancedArgs(row.vllmArgs ?? {}),
+  })
+  createVisible.value = true
+}
 
 const counts = computed(() => ({
   running: rows.value.filter((item) => item.status === 'running').length,
@@ -32,7 +81,7 @@ const counts = computed(() => ({
 }))
 
 const statusMap: Record<Deployment['status'], { text: string; tone: StatusTone }> = {
-  running: { text: '运行中', tone: 'success' }, stopped: { text: '已停止', tone: 'info' }, queued: { text: '等待 GPU', tone: 'warning' }, error: { text: '异常', tone: 'danger' }, starting: { text: '启动中', tone: 'primary' },
+  running: { text: '运行中', tone: 'success' }, stopped: { text: '已停止', tone: 'info' }, queued: { text: '等待 GPU', tone: 'warning' }, error: { text: '异常', tone: 'danger' }, starting: { text: '启动中', tone: 'primary' }, stopping: { text: '停止中', tone: 'info' },
 }
 const statusMeta = (status: Deployment['status']) => statusMap[status]
 
@@ -51,7 +100,8 @@ async function refreshRows(preferredId?: string) {
 }
 
 async function toggleDeployment(row: Deployment) {
-  const nextRunning = row.status !== 'running'
+  if (row.status === 'stopping') return
+  const nextRunning = !['running', 'starting', 'queued'].includes(row.status)
   if (!nextRunning) await ElMessageBox.confirm('停止后将释放整卡资源，现有请求会被中断。', `停止 ${row.name}`, { type: 'warning' })
   try {
     if (useMocks) row.status = nextRunning ? 'starting' : 'stopped'
@@ -65,18 +115,31 @@ async function toggleDeployment(row: Deployment) {
   }
 }
 
-async function createDeployment() {
+async function submitDeployment() {
   if (!form.name || !form.modelAssetId) { ElMessage.warning('请填写部署名称并选择模型'); return }
   createBusy.value = true
   try {
-    await api.deployments.create({ ...form, configMode: configMode.value })
+    if (editingId.value) await api.deployments.update(editingId.value, { ...form, configMode: configMode.value })
+    else await api.deployments.create({ ...form, configMode: configMode.value })
     createVisible.value = false
     if (!useMocks) await refreshRows()
-    ElMessage.success('部署任务已创建，调度器将在有足够整卡资源时启动')
+    ElMessage.success(editingId.value ? '部署配置已更新，可重新启动' : '部署任务已创建，调度器将在有足够整卡资源时启动')
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '部署创建失败')
+    ElMessage.error(error instanceof Error ? error.message : '部署保存失败')
   } finally {
     createBusy.value = false
+  }
+}
+
+async function removeDeployment(row: Deployment) {
+  try {
+    await ElMessageBox.confirm('只能删除已停止或失败的部署；运行中的实例不会被隐式停止。', `删除 ${row.name}`, { type: 'warning' })
+    await api.deployments.remove(row.id)
+    await refreshRows()
+    ElMessage.success('部署已删除')
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    ElMessage.error(error instanceof Error ? error.message : '删除部署失败')
   }
 }
 
@@ -85,6 +148,9 @@ onMounted(async () => {
     if (import.meta.env.VITE_USE_MOCKS === 'true') trendTimes.value = (await import('@/mock/data')).trendTimes
     ;[rows.value, modelOptions.value] = await Promise.all([api.deployments.list(), api.models.list()])
     selected.value = rows.value[0] ?? null
+    const requestedModelId = typeof route.query.model === 'string' ? route.query.model : null
+    const requestedModel = modelOptions.value.find((model) => model.id === requestedModelId && model.status === 'available')
+    if (requestedModel) openCreate(requestedModel)
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '部署数据加载失败')
   }
@@ -94,7 +160,7 @@ onMounted(async () => {
 <template>
   <div>
     <PageHeader title="模型部署" subtitle="基于 vLLM 管理生成与 Embedding 服务，统一提供 OpenAI Compatible 接口">
-      <el-button type="primary" :icon="Plus" @click="createVisible = true">创建部署</el-button>
+      <el-button type="primary" :icon="Plus" @click="openCreate()">创建部署</el-button>
     </PageHeader>
 
     <div class="stats-grid">
@@ -115,7 +181,7 @@ onMounted(async () => {
         <el-table-column label="状态" width="110"><template #default="{ row }"><StatusPill v-bind="statusMeta(row.status)" dot /></template></el-table-column>
         <el-table-column label="访问地址" min-width="210"><template #default="{ row }"><a v-if="row.endpoint" class="table-link">{{ row.endpoint }}</a><span v-else class="empty-dash">—</span></template></el-table-column>
         <el-table-column label="操作" width="220" fixed="right">
-          <template #default="{ row }"><div class="table-actions"><span class="table-link" @click="selected = row">详情</span><span class="table-link" @click="toggleDeployment(row)">{{ row.status === 'running' ? '停止' : '启动' }}</span><span class="table-link">编辑</span><span class="danger-link">删除</span></div></template>
+          <template #default="{ row }"><div class="table-actions"><span class="table-link" @click="selected = row">详情</span><span class="table-link" @click="toggleDeployment(row)">{{ ['running','starting','queued'].includes(row.status) ? '停止' : row.status === 'stopping' ? '停止中' : '启动' }}</span><span class="table-link" @click="openEdit(row)">编辑</span><span class="danger-link" @click="removeDeployment(row)">删除</span></div></template>
         </el-table-column>
       </el-table>
     </PanelCard>
@@ -150,16 +216,16 @@ onMounted(async () => {
     </PanelCard>
     <PanelCard v-else class="section-gap"><el-empty description="暂无部署，请先创建部署" /></PanelCard>
 
-    <el-dialog v-model="createVisible" title="创建模型部署" width="min(720px, 94vw)">
+    <el-dialog v-model="createVisible" :title="editingId ? '编辑模型部署' : '创建模型部署'" width="min(720px, 94vw)">
       <div class="mode-switch"><span>配置模式</span><el-segmented v-model="configMode" :options="[{ label: '简化配置', value: 'simple' }, { label: '详细参数', value: 'advanced' }]" /></div>
       <el-form label-position="top">
         <div class="two-column-form">
           <el-form-item label="部署名称" required><el-input v-model="form.name" placeholder="例如 qwen2-7b-chat" /></el-form-item>
-          <el-form-item label="服务类型"><el-select v-model="form.serviceType" style="width:100%"><el-option label="文本生成" value="generation" /><el-option label="Embedding" value="embedding" /></el-select></el-form-item>
+          <el-form-item label="服务类型"><el-select v-model="form.serviceType" :disabled="Boolean(editingId)" style="width:100%"><el-option label="文本生成" value="generation" /><el-option label="Embedding" value="embedding" /></el-select></el-form-item>
         </div>
         <div class="two-column-form">
-          <el-form-item label="模型资产" required><el-select v-model="form.modelAssetId" filterable placeholder="选择已校验且类型匹配的模型" style="width:100%"><el-option v-for="model in modelOptions.filter((item) => item.status === 'available' && (form.serviceType === 'embedding' ? item.type === 'embedding' : item.type === 'generation'))" :key="model.id" :label="model.name" :value="model.id" /></el-select></el-form-item>
-          <el-form-item label="对外模型名"><el-input v-model="form.servedModelName" placeholder="留空则使用部署名称" /></el-form-item>
+          <el-form-item label="模型资产" required><el-select v-model="form.modelAssetId" :disabled="Boolean(editingId)" filterable placeholder="选择已校验且类型匹配的模型" style="width:100%"><el-option v-for="model in modelOptions.filter((item) => item.status === 'available' && (form.serviceType === 'embedding' ? item.type === 'embedding' : item.type === 'generation'))" :key="model.id" :label="model.name" :value="model.id" /></el-select></el-form-item>
+          <el-form-item label="对外模型名"><el-input v-model="form.servedModelName" :disabled="Boolean(editingId)" placeholder="留空则使用部署名称" /></el-form-item>
         </div>
         <template v-if="configMode === 'simple'">
           <div class="three-column-form">
@@ -172,7 +238,7 @@ onMounted(async () => {
         <el-form-item v-else label="vLLM 额外参数"><el-input v-model="form.advancedArgs" type="textarea" :rows="8" spellcheck="false" /><p class="form-help">每行一个参数。模型路径、服务端口与 GPU 可见性由系统托管，不能覆盖。</p></el-form-item>
         <el-alert title="资源策略" description="部署使用整卡独占。资源不足时进入非抢占队列，不会自动停止其他推理服务。" type="warning" :closable="false" show-icon />
       </el-form>
-      <template #footer><el-button @click="createVisible = false">取消</el-button><el-button type="primary" :icon="Promotion" :loading="createBusy" @click="createDeployment">创建部署</el-button></template>
+      <template #footer><el-button @click="createVisible = false">取消</el-button><el-button type="primary" :icon="Promotion" :loading="createBusy" @click="submitDeployment">{{ editingId ? '保存配置' : '创建部署' }}</el-button></template>
     </el-dialog>
   </div>
 </template>

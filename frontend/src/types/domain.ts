@@ -33,10 +33,12 @@ export interface Deployment {
   id: string
   name: string
   model: string
+  modelAssetId: string
   serviceType: 'generation' | 'embedding'
+  gpuIds: number[]
   gpuLabel: string
   parallelism: string
-  status: 'running' | 'stopped' | 'queued' | 'error' | 'starting'
+  status: 'running' | 'stopped' | 'queued' | 'error' | 'starting' | 'stopping'
   endpoint?: string
   qps?: number
   ttft?: number

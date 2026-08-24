@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { Box, Connection, Cpu, FolderOpened, Refresh, Search, Upload } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRouter } from 'vue-router'
 
 import PageHeader from '@/components/PageHeader.vue'
 import StatCard from '@/components/StatCard.vue'
@@ -11,6 +12,7 @@ import type { BackendInboxCandidate, BackendModelImport } from '@/api/contracts'
 import type { ModelAsset, StatusTone } from '@/types/domain'
 
 const models = ref<ModelAsset[]>([])
+const router = useRouter()
 const selected = ref<ModelAsset | null>(null)
 const inboxCandidates = ref<BackendInboxCandidate[]>([])
 const importJobs = ref<BackendModelImport[]>([])
@@ -19,6 +21,7 @@ const importVisible = ref(false)
 const importBusy = ref(false)
 const scanBusy = ref(false)
 let importPollTimer: number | undefined
+let importRefreshRunning = false
 
 const filters = reactive({ keyword: '', source: '', type: '', status: '' })
 const importForm = reactive({ source: 'huggingface', repository: '', revision: 'main', sourceDirectory: '', name: '', modelKind: 'instruct' })
@@ -105,10 +108,16 @@ async function submitImport() {
 }
 
 async function refreshImports() {
-  const previousReadyIds = new Set(importJobs.value.filter((job) => job.status === 'ready').map((job) => job.id))
-  importJobs.value = await api.models.imports()
-  const hasNewReadyJob = importJobs.value.some((job) => job.status === 'ready' && !previousReadyIds.has(job.id))
-  if (hasNewReadyJob) models.value = await api.models.list()
+  if (importRefreshRunning) return
+  importRefreshRunning = true
+  try {
+    const previousReadyIds = new Set(importJobs.value.filter((job) => job.status === 'ready').map((job) => job.id))
+    importJobs.value = await api.models.imports()
+    const hasNewReadyJob = importJobs.value.some((job) => job.status === 'ready' && !previousReadyIds.has(job.id))
+    if (hasNewReadyJob) models.value = await api.models.list()
+  } finally {
+    importRefreshRunning = false
+  }
 }
 
 async function cancelImport(job: BackendModelImport) {
@@ -121,12 +130,29 @@ async function cancelImport(job: BackendModelImport) {
   }
 }
 
+function deployModel(model: ModelAsset) {
+  void router.push({ path: '/deployments', query: { model: model.id } })
+}
+
+async function removeModel(model: ModelAsset) {
+  try {
+    await ElMessageBox.confirm('删除资产记录不会自动停止或改写引用它的任务；存在引用时控制面会拒绝。', `删除 ${model.name}`, { type: 'warning' })
+    await api.models.remove(model.id)
+    models.value = await api.models.list()
+    if (selected.value?.id === model.id) selected.value = models.value[0] ?? null
+    ElMessage.success('模型资产已删除')
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    ElMessage.error(error instanceof Error ? error.message : '删除模型资产失败')
+  }
+}
+
 onMounted(async () => {
   try {
     ;[models.value, importJobs.value] = await Promise.all([api.models.list(), api.models.imports()])
     selected.value = models.value[0] ?? null
     // 只轮询轻量任务接口；页面卸载时清理定时器，避免后台继续请求。
-    importPollTimer = window.setInterval(() => { void refreshImports() }, 2_000)
+    importPollTimer = window.setInterval(() => { void refreshImports().catch(() => undefined) }, 2_000)
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '模型资产加载失败')
   }
@@ -186,7 +212,7 @@ onBeforeUnmount(() => {
         <el-table-column label="状态" width="105"><template #default="{ row }"><StatusPill v-bind="statusMeta(row.status)" dot /></template></el-table-column>
         <el-table-column prop="updatedAt" label="更新时间" width="152" />
         <el-table-column label="操作" width="176" fixed="right">
-          <template #default="{ row }"><div class="table-actions"><span class="table-link" @click.stop="showDetails(row)">详情</span><span class="table-link">部署</span><span class="danger-link">删除</span></div></template>
+          <template #default="{ row }"><div class="table-actions"><span class="table-link" @click.stop="showDetails(row)">详情</span><span class="table-link" @click.stop="deployModel(row)">部署</span><span class="danger-link" @click.stop="removeModel(row)">删除</span></div></template>
         </el-table-column>
       </el-table>
       <div class="table-footer"><span>共 {{ filteredModels.length }} 条</span><el-pagination background layout="prev, pager, next" :total="filteredModels.length" :page-size="10" /></div>

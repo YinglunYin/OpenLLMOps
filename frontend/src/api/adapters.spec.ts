@@ -35,7 +35,7 @@ describe('FastAPI 资源适配器', () => {
       task_type: 'embedding', desired_state: 'running', actual_state: 'queued', gpu_ids: [1, 2],
       tensor_parallel_size: 2, port: null, internal_url: null, simplified_config: { max_model_len: 8192 }, vllm_args: { enable_prefix_caching: true }, error_message: null,
     }
-    expect(toDeployment(raw)).toMatchObject({ serviceType: 'embedding', status: 'queued', gpuLabel: 'GPU 1、GPU 2', parallelism: 'TP ×2', simplifiedConfig: { max_model_len: 8192 }, vllmArgs: { enable_prefix_caching: true } })
+    expect(toDeployment(raw)).toMatchObject({ modelAssetId: 'asset', serviceType: 'embedding', gpuIds: [1, 2], status: 'queued', gpuLabel: 'GPU 1、GPU 2', parallelism: 'TP ×2', simplifiedConfig: { max_model_len: 8192 }, vllmArgs: { enable_prefix_caching: true } })
   })
 
   it('映射数据集校验信息与训练状态', () => {

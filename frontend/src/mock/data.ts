@@ -28,16 +28,16 @@ export const modelAssets: ModelAsset[] = [
   { id: 'm-002', name: 'ChineseLM-14B-Base', version: 'v1.0.0', type: 'generation', source: 'ModelScope', format: 'Safetensors', size: '28.7 GB', status: 'available', updatedAt: '2024-05-20 09:12', contextLength: 32768, path: '/models/ChineseLM-14B-Base' },
   { id: 'm-003', name: 'Qwen2-7B-Instruct', version: 'v2.0.1', type: 'generation', source: 'ModelScope', format: 'Safetensors', size: '13.4 GB', status: 'validating', updatedAt: '2024-05-20 08:58' },
   { id: 'm-004', name: 'Baichuan2-13B-Chat', version: 'v1.0.0', type: 'generation', source: 'Hugging Face', format: 'Safetensors', size: '25.1 GB', status: 'available', updatedAt: '2024-05-19 16:20' },
-  { id: 'm-005', name: 'Mixtral-8x7B-Instruct-v0.1', version: 'v1.0.0', type: 'generation', source: 'SFTP', format: 'Safetensors', size: '46.8 GB', status: 'available', updatedAt: '2024-05-19 11:05' },
+  { id: 'm-005', name: 'Mixtral-8x7B-Instruct-v0.1', version: 'v1.0.0', type: 'generation', source: '受控目录', format: 'Safetensors', size: '46.8 GB', status: 'available', updatedAt: '2024-05-19 11:05' },
   { id: 'm-006', name: 'BGE-M3', version: 'v1.1.0', type: 'embedding', source: 'Hugging Face', format: 'Safetensors', size: '2.0 GB', status: 'available', updatedAt: '2024-05-18 15:42' },
   { id: 'm-007', name: 'Embed-ZH-v2', version: 'v2.0.0', type: 'embedding', source: 'ModelScope', format: 'Safetensors', size: '1.1 GB', status: 'available', updatedAt: '2024-05-18 18:03' },
   { id: 'm-008', name: 'Qwen1.5-7B-Chat', version: 'v1.1.0', type: 'generation', source: '受控目录', format: 'Safetensors', size: '14.4 GB', status: 'failed', updatedAt: '2024-05-17 22:47' },
 ]
 
 export const deployments: Deployment[] = [
-  { id: 'd-001', name: 'chatglm3-6b-generation', model: 'chatglm3-6b', serviceType: 'generation', gpuLabel: 'GPU 0', parallelism: '单卡', status: 'running', endpoint: 'http://10.0.0.10:8000', qps: 18.6, ttft: 186, kvHitRate: 92.3 },
-  { id: 'd-002', name: 'bge-large-zh-embedding', model: 'bge-large-zh', serviceType: 'embedding', gpuLabel: 'GPU 1', parallelism: '单卡', status: 'stopped', endpoint: 'http://10.0.0.20:8000' },
-  { id: 'd-003', name: 'qwen2-7b-wait', model: 'qwen2-7b', serviceType: 'generation', gpuLabel: '请求 2 卡', parallelism: 'PP ×2', status: 'queued' },
+  { id: 'd-001', name: 'chatglm3-6b-generation', model: 'chatglm3-6b', modelAssetId: 'm-001', serviceType: 'generation', gpuIds: [0], gpuLabel: 'GPU 0', parallelism: '单卡', status: 'running', endpoint: 'http://10.0.0.10:8000', qps: 18.6, ttft: 186, kvHitRate: 92.3 },
+  { id: 'd-002', name: 'bge-large-zh-embedding', model: 'bge-large-zh', modelAssetId: 'm-006', serviceType: 'embedding', gpuIds: [1], gpuLabel: 'GPU 1', parallelism: '单卡', status: 'stopped', endpoint: 'http://10.0.0.20:8000' },
+  { id: 'd-003', name: 'qwen2-7b-wait', model: 'qwen2-7b', modelAssetId: 'm-003', serviceType: 'generation', gpuIds: [2, 3], gpuLabel: '请求 2 卡', parallelism: 'TP ×2', status: 'queued' },
 ]
 
 export const trainingJobs: TrainingJob[] = [

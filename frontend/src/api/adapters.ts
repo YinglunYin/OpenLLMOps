@@ -53,7 +53,7 @@ export function toDeployment(item: BackendDeployment): Deployment {
     queued: 'queued',
     starting: 'starting',
     running: 'running',
-    stopping: 'stopped',
+    stopping: 'stopping',
     stopped: 'stopped',
     failed: 'error',
   }
@@ -61,7 +61,9 @@ export function toDeployment(item: BackendDeployment): Deployment {
     id: item.id,
     name: item.name,
     model: item.served_model_name,
+    modelAssetId: item.model_asset_id,
     serviceType: item.task_type === 'generate' ? 'generation' : 'embedding',
+    gpuIds: item.gpu_ids,
     gpuLabel: item.gpu_ids.length ? item.gpu_ids.map((gpu) => `GPU ${gpu}`).join('、') : '等待资源',
     parallelism: item.tensor_parallel_size > 1 ? `TP ×${item.tensor_parallel_size}` : '单卡',
     status: stateMap[item.actual_state],

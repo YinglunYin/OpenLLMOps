@@ -70,7 +70,7 @@ onMounted(async () => {
       const deployments = deploymentResult.status === 'fulfilled' ? deploymentResult.value : []
       const trainingJobs = trainingResult.status === 'fulfilled' ? trainingResult.value : []
       const evaluationRuns = evaluationResult.status === 'fulfilled' ? evaluationResult.value : []
-      const deploymentStatus = { running: ['运行中', 'success'], starting: ['启动中', 'primary'], queued: ['等待 GPU', 'warning'], stopped: ['已停止', 'info'], error: ['异常', 'danger'] } as const
+      const deploymentStatus = { running: ['运行中', 'success'], starting: ['启动中', 'primary'], stopping: ['停止中', 'info'], queued: ['等待 GPU', 'warning'], stopped: ['已停止', 'info'], error: ['异常', 'danger'] } as const
       const trainingStatus = { running: ['训练中', 'success'], queued: ['等待 GPU', 'warning'], completed: ['已完成', 'success'], failed: ['失败', 'danger'], stopping: ['终止中', 'info'], terminated: ['已终止', 'info'] } as const
       const evaluationStatus = { running: ['测评中', 'primary'], queued: ['等待 GPU', 'warning'], completed: ['已完成', 'success'], failed: ['失败', 'danger'], stopping: ['取消中', 'info'], terminated: ['已取消', 'info'] } as const
       tasks.value = [
